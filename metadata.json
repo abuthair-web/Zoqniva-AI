@@ -1,0 +1,8 @@
+{
+  "name": "Zoqniva AI",
+  "description": "Intelligent Conversations. Seamless Automation. WhatsApp Business CRM platform developed by Noor Labs.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
