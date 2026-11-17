@@ -37,9 +37,16 @@ export interface AuthSessionUser {
   createdAt: string;
 }
 
+export interface PendingAuthAccount {
+  id: string;
+  email: string;
+  fullName: string;
+}
+
 export type AuthGateStatus =
   | 'loading'
   | 'unauthenticated'
+  | 'awaiting_access'
   | 'unauthorized_access'
   | 'authenticated';
 
@@ -54,12 +61,19 @@ interface AppContextValue {
   profileAccessError: string | null;
   passwordRecoveryActive: boolean;
   currentUser: AuthSessionUser | null;
+  pendingAccount: PendingAuthAccount | null;
 
   // Auth Actions
   signInWithSupabase: (
     email: string,
     password: string
   ) => Promise<{ ok: boolean; emailNotConfirmed?: boolean; error?: string }>;
+  signUpWithSupabase: (input: {
+    fullName: string;
+    email: string;
+    password: string;
+  }) => Promise<{ ok: boolean; requiresEmailConfirmation?: boolean; error?: string }>;
+  refreshWorkspaceAccess: () => Promise<void>;
   resendConfirmationEmail: (email: string) => Promise<{ ok: boolean; error?: string }>;
   requestPasswordReset: (email: string) => Promise<{ ok: boolean; error?: string }>;
   updatePassword: (newPassword: string) => Promise<{ ok: boolean; error?: string }>;
@@ -223,6 +237,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const [profileAccessError, setProfileAccessError] = useState<string | null>(null);
   const [passwordRecoveryActive, setPasswordRecoveryActive] = useState<boolean>(false);
   const [currentUser, setCurrentUser] = useState<AuthSessionUser | null>(null);
+  const [pendingAccount, setPendingAccount] = useState<PendingAuthAccount | null>(null);
 
   // Clean empty workspace state (hydrated exclusively from real Supabase tables when signed in)
   const [business, setBusiness] = useState<BusinessProfile>(EMPTY_BUSINESS_PROFILE);
@@ -299,15 +314,15 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     try {
       let businessId = knownBusinessId;
       if (!businessId) {
-        const { data: memberRow } = await client
+        const { data: memberRows } = await client
           .from('business_members')
-          .select('business_id, status')
-          .eq('user_id', userId)
-          .eq('status', 'active')
-          .limit(1)
-          .maybeSingle();
+          .select('*')
+          .eq('user_id', userId);
 
-        businessId = memberRow?.business_id as string | undefined;
+        const activeRow = ((memberRows ?? []) as Array<Record<string, unknown>>).find(
+          (m) => !m.status || m.status === 'active'
+        );
+        businessId = activeRow?.business_id ? String(activeRow.business_id) : undefined;
       }
 
       if (!businessId) {
@@ -333,7 +348,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         client.from('whatsapp_accounts').select('*').eq('business_id', businessId).limit(1).maybeSingle(),
         client
           .from('business_members')
-          .select('id, user_id, role, status, job_title, profiles(id, full_name, email)')
+          .select('*, profiles(*)')
           .eq('business_id', businessId),
         client.from('tags').select('*').eq('business_id', businessId),
         client.from('contacts').select('*').eq('business_id', businessId).order('created_at', { ascending: false }),
@@ -590,73 +605,87 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       if (!supabase || !isSupabaseConfigured) return;
       const client = supabase;
 
-      // Step 2: Load signed-in user's profile from public.profiles
-      const { data: profile, error: profileErr } = await client
+      const metadataName =
+        typeof authUser.user_metadata?.full_name === 'string'
+          ? authUser.user_metadata.full_name.trim()
+          : '';
+
+      // Step 1: Load signed-in user's profile from public.profiles (schema-tolerant)
+      const { data: profileData } = await client
         .from('profiles')
-        .select('id, email, full_name, created_at')
+        .select('*')
         .eq('id', authUser.id)
         .maybeSingle();
 
-      if (profileErr || !profile) {
-        setCurrentUser(null);
-        resetWorkspaceState();
-        setProfileAccessError(
-          profileErr
-            ? `Unable to verify staff profile: ${profileErr.message}`
-            : 'Access denied: no staff profile was found for your account in public.profiles.'
-        );
-        setAuthStatus('unauthorized_access');
-        return;
-      }
+      const profile = (profileData as Record<string, unknown> | null) ?? null;
 
-      // Step 3 & 5: Find active business membership and authoritative role from business_members
+      const resolvedEmail = String(profile?.email || authUser.email || '');
+      const resolvedName = String(
+        profile?.full_name || metadataName || authUser.email || 'Staff Member'
+      );
+
+      // Step 2: Check business membership and authoritative role from business_members
       const { data: memberRows, error: memberErr } = await client
         .from('business_members')
-        .select('id, business_id, role, status, job_title')
+        .select('*')
         .eq('user_id', authUser.id);
 
       if (memberErr) {
         setCurrentUser(null);
         resetWorkspaceState();
-        setProfileAccessError(
-          `Unable to verify business membership: ${memberErr.message}`
-        );
+        if (memberErr.code === '42501') {
+          setPendingAccount({
+            id: authUser.id,
+            email: resolvedEmail,
+            fullName: resolvedName,
+          });
+          setProfileAccessError(
+            'Database table read permissions for authenticated users are pending setup by your project administrator.'
+          );
+          setAuthStatus('awaiting_access');
+          return;
+        }
+        setPendingAccount(null);
+        setProfileAccessError(`Unable to verify business membership: ${memberErr.message}`);
         setAuthStatus('unauthorized_access');
         return;
       }
 
-      const rows = (memberRows ?? []) as Array<{
-        id: string;
-        business_id: string;
-        role: string;
-        status: string;
-        job_title?: string | null;
-      }>;
+      const rows = (memberRows ?? []) as Array<Record<string, unknown>>;
 
-      const activeMember = rows.find((m) => m.status === 'active');
+      const activeMember = rows.find((m) => !m.status || m.status === 'active');
       if (!activeMember) {
         const suspended = rows.some((m) => m.status === 'suspended');
-        const invited = rows.some((m) => m.status === 'invited');
         setCurrentUser(null);
         resetWorkspaceState();
-        setProfileAccessError(
-          suspended
-            ? 'Access denied: your business membership has been suspended by an administrator.'
-            : invited
-            ? 'Access denied: your business membership is pending activation.'
-            : 'Access denied: no active business membership was found for your account.'
-        );
-        setAuthStatus('unauthorized_access');
+
+        if (suspended) {
+          setPendingAccount(null);
+          setProfileAccessError(
+            'Access denied: your business membership has been suspended by an administrator.'
+          );
+          setAuthStatus('unauthorized_access');
+          return;
+        }
+
+        // Newly registered or invited user without an active workspace membership yet
+        setProfileAccessError(null);
+        setPendingAccount({
+          id: authUser.id,
+          email: resolvedEmail,
+          fullName: resolvedName,
+        });
+        setAuthStatus('awaiting_access');
         return;
       }
 
+      const roleValue = String(activeMember.role ?? '');
       const validRole: StaffRole | null =
-        activeMember.role === 'admin' || activeMember.role === 'agent'
-          ? (activeMember.role as StaffRole)
-          : null;
+        roleValue === 'admin' || roleValue === 'agent' ? (roleValue as StaffRole) : null;
 
       if (!validRole) {
         setCurrentUser(null);
+        setPendingAccount(null);
         resetWorkspaceState();
         setProfileAccessError(
           'Access denied: your business membership does not have an authorized CRM role (admin or agent).'
@@ -665,15 +694,20 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         return;
       }
 
-      // Step 4: Verify associated business record is accessible under RLS
-      const { data: bizData, error: bizErr } = await client
+      const activeBusinessId = String(activeMember.business_id ?? '');
+
+      // Step 3: Verify associated business record is accessible under RLS
+      const { data: bizRaw, error: bizErr } = await client
         .from('businesses')
-        .select('id, name, slug, industry, timezone, website')
-        .eq('id', activeMember.business_id)
+        .select('*')
+        .eq('id', activeBusinessId)
         .maybeSingle();
+
+      const bizData = (bizRaw as Record<string, unknown> | null) ?? null;
 
       if (bizErr || !bizData) {
         setCurrentUser(null);
+        setPendingAccount(null);
         resetWorkspaceState();
         setProfileAccessError(
           bizErr
@@ -684,26 +718,27 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         return;
       }
 
-      // Step 6: Set authoritative user profile, role from business_members, and business workspace
+      // Step 4: Set authoritative user profile, role from business_members, and business workspace
+      setPendingAccount(null);
       setProfileAccessError(null);
       setBusiness((prev) => ({
         ...prev,
-        id: String(bizData.id),
-        name: String(bizData.name),
-        slug: String(bizData.slug),
+        id: String(bizData.id ?? activeBusinessId),
+        name: String(bizData.name ?? 'Your Business'),
+        slug: String(bizData.slug ?? 'workspace'),
         industry: String(bizData.industry ?? ''),
         timezone: String(bizData.timezone ?? 'UTC'),
         website: String(bizData.website ?? ''),
       }));
       setCurrentUser({
-        id: String(profile.id),
-        email: String(profile.email || authUser.email || ''),
-        fullName: String(profile.full_name || authUser.email || 'Staff Member'),
+        id: String(profile?.id || authUser.id),
+        email: resolvedEmail,
+        fullName: resolvedName,
         role: validRole,
-        createdAt: String(profile.created_at || new Date().toISOString()),
+        createdAt: String(profile?.created_at || authUser.created_at || new Date().toISOString()),
       });
       setAuthStatus('authenticated');
-      await loadSupabaseWorkspace(authUser.id, activeMember.business_id);
+      await loadSupabaseWorkspace(authUser.id, activeBusinessId);
     },
     [loadSupabaseWorkspace, resetWorkspaceState]
   );
@@ -728,6 +763,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
       if (error || !data.user) {
         setCurrentUser(null);
+        setPendingAccount(null);
         setProfileAccessError(null);
         setAuthStatus('unauthenticated');
         resetWorkspaceState();
@@ -748,6 +784,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
       if (event === 'SIGNED_OUT' || !session?.user) {
         setCurrentUser(null);
+        setPendingAccount(null);
         setProfileAccessError(null);
         setPasswordRecoveryActive(false);
         setAuthStatus('unauthenticated');
@@ -762,6 +799,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           if (!active) return;
           if (userErr || !userRes.user) {
             setCurrentUser(null);
+            setPendingAccount(null);
             setAuthStatus('unauthenticated');
             resetWorkspaceState();
           } else {
@@ -853,6 +891,71 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     return { ok: true };
   };
 
+  const signUpWithSupabase: AppContextValue['signUpWithSupabase'] = async ({
+    fullName,
+    email,
+    password,
+  }) => {
+    if (!supabase || !isSupabaseConfigured) {
+      const msg = supabaseConfigError || 'Supabase configuration is required to create an account.';
+      setAuthError(msg);
+      return { ok: false, error: msg };
+    }
+
+    setAuthError(null);
+    setProfileAccessError(null);
+    setAuthLoading(true);
+
+    const { data, error } = await supabase.auth.signUp({
+      email: email.trim(),
+      password,
+      options: {
+        data: {
+          full_name: fullName.trim(),
+        },
+        emailRedirectTo: `${window.location.origin}/login`,
+      },
+    });
+
+    if (error) {
+      setAuthLoading(false);
+      setAuthError(error.message);
+      return { ok: false, error: error.message };
+    }
+
+    // Retrieve active Supabase session immediately (when email confirmation is disabled)
+    let activeSession = data.session;
+    if (!activeSession) {
+      const { data: sessionRes } = await supabase.auth.getSession();
+      activeSession = sessionRes.session;
+    }
+
+    // Compatible fallback if email confirmation is later enabled in Supabase
+    if (!activeSession?.user) {
+      setAuthLoading(false);
+      return { ok: true, requiresEmailConfirmation: true };
+    }
+
+    await resolveAuthenticatedUser(activeSession.user);
+    setAuthLoading(false);
+    return { ok: true, requiresEmailConfirmation: false };
+  };
+
+  const refreshWorkspaceAccess: AppContextValue['refreshWorkspaceAccess'] = async () => {
+    if (!supabase || !isSupabaseConfigured) return;
+    setAuthLoading(true);
+    const { data, error } = await supabase.auth.getUser();
+    if (error || !data.user) {
+      setCurrentUser(null);
+      setPendingAccount(null);
+      setAuthStatus('unauthenticated');
+      resetWorkspaceState();
+    } else {
+      await resolveAuthenticatedUser(data.user);
+    }
+    setAuthLoading(false);
+  };
+
   const resendConfirmationEmail: AppContextValue['resendConfirmationEmail'] = async (email) => {
     if (!supabase || !isSupabaseConfigured) {
       return { ok: false, error: 'Supabase configuration is required.' };
@@ -908,6 +1011,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       await supabase.auth.signOut();
     }
     setCurrentUser(null);
+    setPendingAccount(null);
     setAuthError(null);
     setProfileAccessError(null);
     setPasswordRecoveryActive(false);
@@ -1616,7 +1720,10 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     profileAccessError,
     passwordRecoveryActive,
     currentUser,
+    pendingAccount,
     signInWithSupabase,
+    signUpWithSupabase,
+    refreshWorkspaceAccess,
     resendConfirmationEmail,
     requestPasswordReset,
     updatePassword,

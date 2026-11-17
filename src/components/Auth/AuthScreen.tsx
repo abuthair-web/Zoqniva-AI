@@ -6,6 +6,8 @@ import {
   ArrowLeft,
   ArrowRight,
   CheckCircle2,
+  Eye,
+  EyeOff,
   KeyRound,
   Lock,
   LogOut,
@@ -13,13 +15,15 @@ import {
   ShieldAlert,
   ShieldCheck,
   Sparkles,
+  User,
+  UserPlus,
 } from 'lucide-react';
 import { BrandLogo } from '@/components/BrandLogo';
 import { useApp } from '@/context/AppContext';
 
 const LOGIN_PRISM_IMG = '/src/assets/images/login_ai_prism_1794684778644.jpg';
 
-type AuthViewMode = 'signin' | 'forgot';
+type AuthViewMode = 'signin' | 'signup' | 'forgot';
 
 export function AuthScreen() {
   const {
@@ -30,6 +34,7 @@ export function AuthScreen() {
     authError,
     profileAccessError,
     signInWithSupabase,
+    signUpWithSupabase,
     resendConfirmationEmail,
     requestPasswordReset,
     logout,
@@ -38,11 +43,21 @@ export function AuthScreen() {
   const navigate = useNavigate();
 
   const [mode, setMode] = useState<AuthViewMode>('signin');
+  const [fullName, setFullName] = useState('');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
+  const [confirmPassword, setConfirmPassword] = useState('');
+  const [showPassword, setShowPassword] = useState(false);
+  const [showConfirmPassword, setShowConfirmPassword] = useState(false);
   const [unconfirmedEmail, setUnconfirmedEmail] = useState<string | null>(null);
   const [localMsg, setLocalMsg] = useState<{ type: 'error' | 'info'; text: string } | null>(null);
   const [imgError, setImgError] = useState(false);
+
+  const switchMode = (nextMode: AuthViewMode) => {
+    setMode(nextMode);
+    setLocalMsg(null);
+    setUnconfirmedEmail(null);
+  };
 
   const handleSignIn = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -65,6 +80,63 @@ export function AuthScreen() {
     }
   };
 
+  const handleSignUp = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setLocalMsg(null);
+    setUnconfirmedEmail(null);
+
+    if (!isSupabaseReady) {
+      setLocalMsg({
+        type: 'error',
+        text: supabaseMissingReason || 'Workspace setup required: connect Supabase before creating an account.',
+      });
+      return;
+    }
+
+    if (fullName.trim().length < 2) {
+      setLocalMsg({
+        type: 'error',
+        text: 'Please enter your full name (at least 2 characters).',
+      });
+      return;
+    }
+
+    if (password.length < 6) {
+      setLocalMsg({
+        type: 'error',
+        text: 'Password must be at least 6 characters long.',
+      });
+      return;
+    }
+
+    if (password !== confirmPassword) {
+      setLocalMsg({
+        type: 'error',
+        text: 'Password and Confirm Password do not match.',
+      });
+      return;
+    }
+
+    const res = await signUpWithSupabase({ fullName, email, password });
+    if (!res.ok) {
+      if (res.error) {
+        setLocalMsg({ type: 'error', text: res.error });
+      }
+      return;
+    }
+
+    if (res.requiresEmailConfirmation) {
+      setLocalMsg({
+        type: 'info',
+        text: 'Account created. Please confirm your email address, then sign in.',
+      });
+      setMode('signin');
+      return;
+    }
+
+    navigate('/app');
+  };
+
   const handleForgotPassword = async (e: React.FormEvent) => {
     e.preventDefault();
     setLocalMsg(null);
@@ -72,7 +144,7 @@ export function AuthScreen() {
     if (res.ok) {
       setLocalMsg({
         type: 'info',
-        text: 'If an account exists for that email, a password reset link has been sent. Open the link to choose a new password.',
+        text: 'If an account exists for that email, a password reset link has been sent.',
       });
     }
   };
@@ -84,12 +156,15 @@ export function AuthScreen() {
     if (res.ok) {
       setLocalMsg({
         type: 'info',
-        text: `Confirmation email resent to ${unconfirmedEmail}. Please check your inbox.`,
+        text: `Confirmation email resent to ${unconfirmedEmail}.`,
       });
     } else if (res.error) {
       setLocalMsg({ type: 'error', text: res.error });
     }
   };
+
+  const activeError = localMsg?.type === 'error' ? localMsg.text : authError;
+  const activeInfo = localMsg?.type === 'info' ? localMsg.text : null;
 
   return (
     <div className="min-h-screen bg-[#F8FAFC] flex flex-col lg:flex-row">
@@ -144,8 +219,8 @@ export function AuthScreen() {
               <span className="text-[#2563EB]">Seamless Automation.</span>
             </h1>
             <p className="text-sm text-slate-600 leading-relaxed">
-              Sign in to access your shared team inbox, customer directory, approved WhatsApp
-              templates, and workflow automation controls.
+              Sign in or create an account to access your shared team inbox, customer directory,
+              approved WhatsApp templates, and workflow automation controls.
             </p>
           </div>
         </motion.div>
@@ -159,7 +234,7 @@ export function AuthScreen() {
         </div>
       </div>
 
-      {/* Right Sign-In Form Surface */}
+      {/* Right Sign-In & Registration Surface */}
       <div className="flex-1 flex items-center justify-center p-6 sm:p-10 lg:p-16 bg-white">
         <motion.div
           initial={{ opacity: 0, y: 12 }}
@@ -178,7 +253,7 @@ export function AuthScreen() {
                 </div>
                 <p className="text-xs text-slate-700 leading-relaxed">
                   {profileAccessError ||
-                    'Your account does not have an active business membership in this workspace.'}
+                    'Your account is not permitted to access this workspace.'}
                 </p>
               </div>
               <button
@@ -192,16 +267,57 @@ export function AuthScreen() {
             </div>
           ) : (
             <>
-              <div className="mb-7">
+              {mode !== 'forgot' && (
+                <div
+                  role="tablist"
+                  aria-label="Authentication mode"
+                  className="grid grid-cols-2 rounded-xl border border-[#E2E8F0] bg-[#F8FAFC] p-1 mb-6"
+                >
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={mode === 'signin'}
+                    onClick={() => switchMode('signin')}
+                    className={`rounded-lg py-2 text-xs font-semibold transition-all cursor-pointer ${
+                      mode === 'signin'
+                        ? 'bg-white text-[#0F172A] shadow-2xs border border-[#E2E8F0]/80'
+                        : 'text-slate-500 hover:text-[#0F172A]'
+                    }`}
+                  >
+                    Sign In
+                  </button>
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={mode === 'signup'}
+                    onClick={() => switchMode('signup')}
+                    className={`rounded-lg py-2 text-xs font-semibold transition-all cursor-pointer ${
+                      mode === 'signup'
+                        ? 'bg-white text-[#2563EB] shadow-2xs border border-[#E2E8F0]/80'
+                        : 'text-slate-500 hover:text-[#0F172A]'
+                    }`}
+                  >
+                    Create Account
+                  </button>
+                </div>
+              )}
+
+              <div className="mb-6">
                 <h2 className="font-display text-2xl font-bold text-[#0F172A] tracking-tight">
-                  {mode === 'forgot' ? 'Reset your password' : 'Sign in to your workspace'}
+                  {mode === 'forgot'
+                    ? 'Reset your password'
+                    : mode === 'signup'
+                    ? 'Create your account'
+                    : 'Sign in to your workspace'}
                 </h2>
                 <p className="mt-1.5 text-sm text-slate-500">
                   {!isSupabaseReady
-                    ? 'Connect your Supabase authentication backend to enable workspace sign-in.'
+                    ? 'Connect your Supabase authentication backend to continue.'
                     : mode === 'forgot'
-                    ? 'Enter your work email and we will send a password reset link.'
-                    : 'Enter your staff credentials to continue to Zoqniva AI.'}
+                    ? 'Enter your email address and we will send a password reset link.'
+                    : mode === 'signup'
+                    ? 'Register a Zoqniva AI account to request workspace access.'
+                    : 'Enter your email and password to continue to Zoqniva AI.'}
                 </p>
               </div>
 
@@ -212,27 +328,27 @@ export function AuthScreen() {
                     <p className="font-bold">Supabase Connection Setup Required</p>
                     <p className="leading-relaxed text-amber-900">
                       {supabaseMissingReason ||
-                        'Configure VITE_SUPABASE_URL and VITE_SUPABASE_PUBLISHABLE_KEY in your environment before signing in.'}
+                        'Configure VITE_SUPABASE_URL and VITE_SUPABASE_PUBLISHABLE_KEY in your environment before continuing.'}
                     </p>
                   </div>
                 </div>
               )}
 
-              {(authError || localMsg) && (
+              {(activeError || activeInfo) && (
                 <div
                   className={`mb-5 rounded-xl border px-4 py-3 text-xs space-y-2 ${
-                    localMsg?.type === 'info' && !authError
+                    activeInfo && !activeError
                       ? 'border-emerald-200 bg-emerald-50 text-emerald-900'
                       : 'border-[#E11D48]/30 bg-rose-50 text-[#E11D48]'
                   }`}
                 >
                   <div className="flex items-start gap-2">
-                    {localMsg?.type === 'info' && !authError ? (
+                    {activeInfo && !activeError ? (
                       <CheckCircle2 className="h-4 w-4 shrink-0 mt-0.5 text-emerald-600" />
                     ) : (
                       <AlertCircle className="h-4 w-4 shrink-0 mt-0.5" />
                     )}
-                    <span>{authError || localMsg?.text}</span>
+                    <span>{activeError || activeInfo}</span>
                   </div>
                   {unconfirmedEmail && (
                     <button
@@ -249,17 +365,22 @@ export function AuthScreen() {
               {mode === 'forgot' ? (
                 <form onSubmit={handleForgotPassword} className="space-y-4">
                   <div>
-                    <label className="block text-xs font-semibold text-[#0F172A] mb-1.5">
-                      Work Email
+                    <label
+                      htmlFor="forgot-email"
+                      className="block text-xs font-semibold text-[#0F172A] mb-1.5"
+                    >
+                      Email Address
                     </label>
                     <div className="relative">
                       <Mail className="h-4 w-4 text-slate-400 absolute left-3.5 top-1/2 -translate-y-1/2" />
                       <input
+                        id="forgot-email"
                         type="email"
                         value={email}
                         onChange={(e) => setEmail(e.target.value)}
                         placeholder="name@company.com"
                         required
+                        autoComplete="email"
                         className="w-full rounded-xl border border-[#E2E8F0] bg-[#F8FAFC] pl-10 pr-3.5 py-2.5 text-sm text-[#0F172A] focus:bg-white focus:border-[#2563EB] focus:outline-none focus:ring-2 focus:ring-[#2563EB]/15"
                       />
                     </div>
@@ -276,24 +397,158 @@ export function AuthScreen() {
 
                   <button
                     type="button"
-                    onClick={() => {
-                      setMode('signin');
-                      setLocalMsg(null);
-                    }}
+                    onClick={() => switchMode('signin')}
                     className="w-full text-center text-xs font-semibold text-slate-600 hover:text-[#2563EB] cursor-pointer pt-1"
                   >
                     Back to Sign In
                   </button>
                 </form>
-              ) : (
-                <form onSubmit={handleSignIn} className="space-y-4">
+              ) : mode === 'signup' ? (
+                <form onSubmit={handleSignUp} className="space-y-4">
                   <div>
-                    <label className="block text-xs font-semibold text-[#0F172A] mb-1.5">
-                      Work Email
+                    <label
+                      htmlFor="signup-fullname"
+                      className="block text-xs font-semibold text-[#0F172A] mb-1.5"
+                    >
+                      Full Name
+                    </label>
+                    <div className="relative">
+                      <User className="h-4 w-4 text-slate-400 absolute left-3.5 top-1/2 -translate-y-1/2" />
+                      <input
+                        id="signup-fullname"
+                        type="text"
+                        value={fullName}
+                        onChange={(e) => setFullName(e.target.value)}
+                        placeholder="Your full name"
+                        required
+                        minLength={2}
+                        autoComplete="name"
+                        className="w-full rounded-xl border border-[#E2E8F0] bg-[#F8FAFC] pl-10 pr-3.5 py-2.5 text-sm text-[#0F172A] focus:bg-white focus:border-[#2563EB] focus:outline-none focus:ring-2 focus:ring-[#2563EB]/15"
+                      />
+                    </div>
+                  </div>
+
+                  <div>
+                    <label
+                      htmlFor="signup-email"
+                      className="block text-xs font-semibold text-[#0F172A] mb-1.5"
+                    >
+                      Email Address
                     </label>
                     <div className="relative">
                       <Mail className="h-4 w-4 text-slate-400 absolute left-3.5 top-1/2 -translate-y-1/2" />
                       <input
+                        id="signup-email"
+                        type="email"
+                        value={email}
+                        onChange={(e) => setEmail(e.target.value)}
+                        placeholder="name@company.com"
+                        required
+                        autoComplete="email"
+                        className="w-full rounded-xl border border-[#E2E8F0] bg-[#F8FAFC] pl-10 pr-3.5 py-2.5 text-sm text-[#0F172A] focus:bg-white focus:border-[#2563EB] focus:outline-none focus:ring-2 focus:ring-[#2563EB]/15"
+                      />
+                    </div>
+                  </div>
+
+                  <div>
+                    <label
+                      htmlFor="signup-password"
+                      className="block text-xs font-semibold text-[#0F172A] mb-1.5"
+                    >
+                      Password
+                    </label>
+                    <div className="relative">
+                      <Lock className="h-4 w-4 text-slate-400 absolute left-3.5 top-1/2 -translate-y-1/2" />
+                      <input
+                        id="signup-password"
+                        type={showPassword ? 'text' : 'password'}
+                        value={password}
+                        onChange={(e) => setPassword(e.target.value)}
+                        placeholder="Create a password (min 6 characters)"
+                        required
+                        minLength={6}
+                        autoComplete="new-password"
+                        className="w-full rounded-xl border border-[#E2E8F0] bg-[#F8FAFC] pl-10 pr-10 py-2.5 text-sm text-[#0F172A] focus:bg-white focus:border-[#2563EB] focus:outline-none focus:ring-2 focus:ring-[#2563EB]/15"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => setShowPassword((v) => !v)}
+                        aria-label={showPassword ? 'Hide password' : 'Show password'}
+                        className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 cursor-pointer"
+                      >
+                        {showPassword ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                      </button>
+                    </div>
+                  </div>
+
+                  <div>
+                    <label
+                      htmlFor="signup-confirm-password"
+                      className="block text-xs font-semibold text-[#0F172A] mb-1.5"
+                    >
+                      Confirm Password
+                    </label>
+                    <div className="relative">
+                      <Lock className="h-4 w-4 text-slate-400 absolute left-3.5 top-1/2 -translate-y-1/2" />
+                      <input
+                        id="signup-confirm-password"
+                        type={showConfirmPassword ? 'text' : 'password'}
+                        value={confirmPassword}
+                        onChange={(e) => setConfirmPassword(e.target.value)}
+                        placeholder="Re-enter your password"
+                        required
+                        minLength={6}
+                        autoComplete="new-password"
+                        className="w-full rounded-xl border border-[#E2E8F0] bg-[#F8FAFC] pl-10 pr-10 py-2.5 text-sm text-[#0F172A] focus:bg-white focus:border-[#2563EB] focus:outline-none focus:ring-2 focus:ring-[#2563EB]/15"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => setShowConfirmPassword((v) => !v)}
+                        aria-label={showConfirmPassword ? 'Hide confirm password' : 'Show confirm password'}
+                        className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 cursor-pointer"
+                      >
+                        {showConfirmPassword ? (
+                          <EyeOff className="h-4 w-4" />
+                        ) : (
+                          <Eye className="h-4 w-4" />
+                        )}
+                      </button>
+                    </div>
+                  </div>
+
+                  <button
+                    type="submit"
+                    disabled={authLoading || !isSupabaseReady}
+                    className="w-full flex items-center justify-center gap-2 rounded-xl bg-[#2563EB] px-4 py-3 text-sm font-semibold text-white hover:bg-[#1D4ED8] transition-colors disabled:opacity-50 cursor-pointer shadow-xs"
+                  >
+                    <UserPlus className="h-4 w-4" />
+                    <span>{authLoading ? 'Creating account...' : 'Create Account'}</span>
+                  </button>
+
+                  <p className="text-center text-xs text-slate-500 pt-1">
+                    Already have an account?{' '}
+                    <button
+                      type="button"
+                      onClick={() => switchMode('signin')}
+                      className="font-semibold text-[#2563EB] hover:underline cursor-pointer"
+                    >
+                      Sign In
+                    </button>
+                  </p>
+                </form>
+              ) : (
+                <form onSubmit={handleSignIn} className="space-y-4">
+                  <div>
+                    <label
+                      htmlFor="signin-email"
+                      className="block text-xs font-semibold text-[#0F172A] mb-1.5"
+                    >
+                      Email Address
+                    </label>
+                    <div className="relative">
+                      <Mail className="h-4 w-4 text-slate-400 absolute left-3.5 top-1/2 -translate-y-1/2" />
+                      <input
+                        id="signin-email"
                         type="email"
                         value={email}
                         onChange={(e) => setEmail(e.target.value)}
@@ -307,16 +562,16 @@ export function AuthScreen() {
 
                   <div>
                     <div className="flex items-center justify-between mb-1.5">
-                      <label className="block text-xs font-semibold text-[#0F172A]">
+                      <label
+                        htmlFor="signin-password"
+                        className="block text-xs font-semibold text-[#0F172A]"
+                      >
                         Password
                       </label>
                       {isSupabaseReady && (
                         <button
                           type="button"
-                          onClick={() => {
-                            setMode('forgot');
-                            setLocalMsg(null);
-                          }}
+                          onClick={() => switchMode('forgot')}
                           className="text-xs font-semibold text-[#2563EB] hover:underline cursor-pointer"
                         >
                           Forgot password?
@@ -326,15 +581,24 @@ export function AuthScreen() {
                     <div className="relative">
                       <Lock className="h-4 w-4 text-slate-400 absolute left-3.5 top-1/2 -translate-y-1/2" />
                       <input
-                        type="password"
+                        id="signin-password"
+                        type={showPassword ? 'text' : 'password'}
                         value={password}
                         onChange={(e) => setPassword(e.target.value)}
                         placeholder="Enter your password"
                         required
                         minLength={6}
                         autoComplete="current-password"
-                        className="w-full rounded-xl border border-[#E2E8F0] bg-[#F8FAFC] pl-10 pr-3.5 py-2.5 text-sm text-[#0F172A] focus:bg-white focus:border-[#2563EB] focus:outline-none focus:ring-2 focus:ring-[#2563EB]/15"
+                        className="w-full rounded-xl border border-[#E2E8F0] bg-[#F8FAFC] pl-10 pr-10 py-2.5 text-sm text-[#0F172A] focus:bg-white focus:border-[#2563EB] focus:outline-none focus:ring-2 focus:ring-[#2563EB]/15"
                       />
+                      <button
+                        type="button"
+                        onClick={() => setShowPassword((v) => !v)}
+                        aria-label={showPassword ? 'Hide password' : 'Show password'}
+                        className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 cursor-pointer"
+                      >
+                        {showPassword ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                      </button>
                     </div>
                   </div>
 
@@ -347,11 +611,16 @@ export function AuthScreen() {
                     <ArrowRight className="h-4 w-4" />
                   </button>
 
-                  {isSupabaseReady && (
-                    <p className="text-center text-[11px] text-slate-500 pt-2">
-                      Invite-only workspace. Contact your administrator for staff account access.
-                    </p>
-                  )}
+                  <p className="text-center text-xs text-slate-500 pt-1">
+                    New to Zoqniva AI?{' '}
+                    <button
+                      type="button"
+                      onClick={() => switchMode('signup')}
+                      className="font-semibold text-[#2563EB] hover:underline cursor-pointer"
+                    >
+                      Create Account
+                    </button>
+                  </p>
                 </form>
               )}
             </>
