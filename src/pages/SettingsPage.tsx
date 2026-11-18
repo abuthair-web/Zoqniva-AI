@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
   AlertTriangle,
@@ -8,6 +8,7 @@ import {
   CheckCircle2,
   ChevronDown,
   Copy,
+  Loader2,
   MessageCircle,
   RefreshCw,
   ShieldCheck,
@@ -19,6 +20,8 @@ import { normalizePhoneE164 } from '@/lib/phone';
 import type { MessagingMode } from '@/types/crm';
 
 type SettingsTab = 'business' | 'whatsapp' | 'team' | 'notifications' | 'advanced';
+
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export function SettingsPage() {
   const navigate = useNavigate();
@@ -33,6 +36,7 @@ export function SettingsPage() {
     updateBusinessProfile,
     verifyMetaConnection,
     saveWhatsAppConfig,
+    refreshWhatsAppAccount,
     refreshWebhookDiagnostics,
     businessHours,
     updateBusinessHours,
@@ -50,13 +54,19 @@ export function SettingsPage() {
   const [wabaId, setWabaId] = useState(business.metaWabaId);
   const [messagingMode, setMessagingMode] = useState<MessagingMode>(business.messagingMode);
   const [allowlistText, setAllowlistText] = useState(business.testAllowlist.join(', '));
+  const [whatsappDirty, setWhatsappDirty] = useState(false);
+
+  const whatsappDirtyRef = useRef(false);
+  const bizDirtyRef = useRef(false);
+  const lastBusinessIdRef = useRef(business.id);
+
   const [verifyMsg, setVerifyMsg] = useState<{
     ok: boolean;
     text: string;
     diagnostic?: string;
   } | null>(null);
   const [verifying, setVerifying] = useState(false);
-  const [savingMode, setSavingMode] = useState(false);
+  const [savingConfig, setSavingConfig] = useState(false);
   const [copiedWebhook, setCopiedWebhook] = useState(false);
   const [showTechnicalApi, setShowTechnicalApi] = useState(false);
 
@@ -67,16 +77,63 @@ export function SettingsPage() {
     campaignDigest: false,
   });
 
+  const markWhatsappDirty = () => {
+    whatsappDirtyRef.current = true;
+    setWhatsappDirty(true);
+  };
+
+  // Sync Business Profile fields only when switching workspace or when not dirty
   useEffect(() => {
-    setBizName(business.name);
-    setBizIndustry(business.industry);
-    setBizTimezone(business.timezone);
-    setBizWebsite(business.website);
-    setPhoneNumberId(business.metaPhoneNumberId);
-    setWabaId(business.metaWabaId);
-    setMessagingMode(business.messagingMode);
-    setAllowlistText(business.testAllowlist.join(', '));
-  }, [business]);
+    const switchedRealWorkspace =
+      lastBusinessIdRef.current !== business.id && UUID_REGEX.test(lastBusinessIdRef.current);
+
+    if (switchedRealWorkspace) {
+      bizDirtyRef.current = false;
+      whatsappDirtyRef.current = false;
+      setWhatsappDirty(false);
+    }
+
+    if (switchedRealWorkspace || !bizDirtyRef.current) {
+      setBizName((prev) => business.name || prev);
+      setBizIndustry((prev) => business.industry || prev);
+      setBizTimezone((prev) => business.timezone || prev);
+      setBizWebsite((prev) => business.website || prev);
+    }
+
+    // Never overwrite unsaved WhatsApp edits or clobber populated inputs with empty server values
+    if (switchedRealWorkspace) {
+      setPhoneNumberId(business.metaPhoneNumberId);
+      setWabaId(business.metaWabaId);
+      setMessagingMode(business.messagingMode);
+      setAllowlistText(business.testAllowlist.join(', '));
+    } else if (!whatsappDirtyRef.current) {
+      setPhoneNumberId((prev) => business.metaPhoneNumberId || prev);
+      setWabaId((prev) => business.metaWabaId || prev);
+      setMessagingMode(business.messagingMode);
+      setAllowlistText((prev) =>
+        business.testAllowlist.length > 0 ? business.testAllowlist.join(', ') : prev
+      );
+    }
+
+    lastBusinessIdRef.current = business.id;
+  }, [
+    business.id,
+    business.name,
+    business.industry,
+    business.timezone,
+    business.website,
+    business.metaPhoneNumberId,
+    business.metaWabaId,
+    business.messagingMode,
+    business.testAllowlist,
+  ]);
+
+  // Reload saved WhatsApp account details when opening Settings (unless user has unsaved edits)
+  useEffect(() => {
+    if (tab === 'whatsapp' && UUID_REGEX.test(business.id) && !whatsappDirtyRef.current) {
+      void refreshWhatsAppAccount();
+    }
+  }, [tab, business.id, refreshWhatsAppAccount]);
 
   const isAdmin = currentUser?.role === 'admin';
 
@@ -88,6 +145,7 @@ export function SettingsPage() {
       timezone: bizTimezone,
       website: bizWebsite,
     });
+    bizDirtyRef.current = false;
     setBizSavedMsg('Business profile saved.');
   };
 
@@ -97,29 +155,53 @@ export function SettingsPage() {
       .map((s) => normalizePhoneE164(s.trim()))
       .filter((v): v is string => Boolean(v));
 
-  const handleVerifyMeta = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setVerifying(true);
+  const handleSaveConfiguration = async (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
+    setSavingConfig(true);
+    setVerifyMsg(null);
     const parsedAllowlist = parseAllowlistInput();
-    const res = await verifyMetaConnection(phoneNumberId, wabaId, {
-      messagingMode,
-      testAllowlist: parsedAllowlist,
-    });
-    setVerifyMsg({ ok: res.ok, text: res.message, diagnostic: res.diagnostic });
-    setVerifying(false);
+    try {
+      const res = await saveWhatsAppConfig({
+        messagingMode,
+        testAllowlist: parsedAllowlist,
+        phoneNumberId: phoneNumberId.trim(),
+        wabaId: wabaId.trim(),
+      });
+      if (res.ok) {
+        whatsappDirtyRef.current = false;
+        setWhatsappDirty(false);
+        setPhoneNumberId(phoneNumberId.trim());
+        setWabaId(wabaId.trim());
+      }
+      setVerifyMsg({ ok: res.ok, text: res.message });
+    } catch (err) {
+      setVerifyMsg({
+        ok: false,
+        text: (err as Error).message || 'Failed to save WhatsApp configuration.',
+      });
+    } finally {
+      setSavingConfig(false);
+    }
   };
 
-  const handleSaveMessagingMode = async () => {
-    setSavingMode(true);
+  const handleVerifyMeta = async () => {
+    setVerifying(true);
+    setVerifyMsg(null);
     const parsedAllowlist = parseAllowlistInput();
-    const res = await saveWhatsAppConfig({
-      messagingMode,
-      testAllowlist: parsedAllowlist,
-      phoneNumberId,
-      wabaId,
-    });
-    setVerifyMsg({ ok: res.ok, text: res.message });
-    setSavingMode(false);
+    try {
+      const res = await verifyMetaConnection(phoneNumberId, wabaId, {
+        messagingMode,
+        testAllowlist: parsedAllowlist,
+      });
+      setVerifyMsg({ ok: res.ok, text: res.message, diagnostic: res.diagnostic });
+    } catch (err) {
+      setVerifyMsg({
+        ok: false,
+        text: (err as Error).message || 'Could not verify WhatsApp connection.',
+      });
+    } finally {
+      setVerifying(false);
+    }
   };
 
   const handleCopyWebhook = async () => {
@@ -229,7 +311,10 @@ export function SettingsPage() {
                   type="text"
                   disabled={!isAdmin}
                   value={bizName}
-                  onChange={(e) => setBizName(e.target.value)}
+                  onChange={(e) => {
+                    bizDirtyRef.current = true;
+                    setBizName(e.target.value);
+                  }}
                   className="w-full rounded-xl border border-[#E2E8F0] px-3 py-2.5 focus:border-[#2563EB] focus:outline-none"
                 />
               </div>
@@ -239,7 +324,10 @@ export function SettingsPage() {
                   type="text"
                   disabled={!isAdmin}
                   value={bizIndustry}
-                  onChange={(e) => setBizIndustry(e.target.value)}
+                  onChange={(e) => {
+                    bizDirtyRef.current = true;
+                    setBizIndustry(e.target.value);
+                  }}
                   className="w-full rounded-xl border border-[#E2E8F0] px-3 py-2.5 focus:border-[#2563EB] focus:outline-none"
                 />
               </div>
@@ -251,7 +339,10 @@ export function SettingsPage() {
                   type="text"
                   disabled={!isAdmin}
                   value={bizTimezone}
-                  onChange={(e) => setBizTimezone(e.target.value)}
+                  onChange={(e) => {
+                    bizDirtyRef.current = true;
+                    setBizTimezone(e.target.value);
+                  }}
                   className="w-full rounded-xl border border-[#E2E8F0] px-3 py-2.5 focus:border-[#2563EB] focus:outline-none"
                 />
               </div>
@@ -261,7 +352,10 @@ export function SettingsPage() {
                   type="url"
                   disabled={!isAdmin}
                   value={bizWebsite}
-                  onChange={(e) => setBizWebsite(e.target.value)}
+                  onChange={(e) => {
+                    bizDirtyRef.current = true;
+                    setBizWebsite(e.target.value);
+                  }}
                   className="w-full rounded-xl border border-[#E2E8F0] px-3 py-2.5 focus:border-[#2563EB] focus:outline-none"
                 />
               </div>
@@ -384,42 +478,78 @@ export function SettingsPage() {
                       </div>
                     )}
 
-                    <form onSubmit={handleVerifyMeta} className="space-y-4 max-w-lg">
+                    <form onSubmit={handleSaveConfiguration} className="space-y-4 max-w-lg">
                       <div>
-                        <label className="block font-semibold text-[#0F172A] mb-1">
+                        <label
+                          htmlFor="meta-phone-number-id"
+                          className="block font-semibold text-[#0F172A] mb-1"
+                        >
                           Meta Phone Number ID
                         </label>
                         <input
+                          id="meta-phone-number-id"
+                          name="phoneNumberId"
                           type="text"
+                          autoComplete="off"
                           disabled={!isAdmin}
                           value={phoneNumberId}
-                          onChange={(e) => setPhoneNumberId(e.target.value)}
+                          onChange={(e) => {
+                            markWhatsappDirty();
+                            setPhoneNumberId(e.target.value);
+                          }}
                           placeholder="e.g., 389104521094821"
-                          className="w-full rounded-xl border border-[#E2E8F0] px-3 py-2 font-mono"
+                          className="w-full rounded-xl border border-[#E2E8F0] px-3 py-2 font-mono focus:border-[#2563EB] focus:outline-none"
                         />
                       </div>
                       <div>
-                        <label className="block font-semibold text-[#0F172A] mb-1">
+                        <label
+                          htmlFor="meta-waba-id"
+                          className="block font-semibold text-[#0F172A] mb-1"
+                        >
                           WhatsApp Business Account (WABA) ID
                         </label>
                         <input
+                          id="meta-waba-id"
+                          name="wabaId"
                           type="text"
+                          autoComplete="off"
                           disabled={!isAdmin}
                           value={wabaId}
-                          onChange={(e) => setWabaId(e.target.value)}
+                          onChange={(e) => {
+                            markWhatsappDirty();
+                            setWabaId(e.target.value);
+                          }}
                           placeholder="e.g., 192837465564738"
-                          className="w-full rounded-xl border border-[#E2E8F0] px-3 py-2 font-mono"
+                          className="w-full rounded-xl border border-[#E2E8F0] px-3 py-2 font-mono focus:border-[#2563EB] focus:outline-none"
                         />
                       </div>
 
+                      {whatsappDirty && (
+                        <p className="text-[11px] font-medium text-amber-700">
+                          Unsaved changes — click Save Configuration to persist to Supabase.
+                        </p>
+                      )}
+
                       {isAdmin && (
-                        <button
-                          type="submit"
-                          disabled={verifying}
-                          className="rounded-xl bg-[#2563EB] px-4 py-2.5 font-semibold text-white hover:bg-[#1D4ED8] disabled:opacity-50 cursor-pointer"
-                        >
-                          {verifying ? 'Checking Connection...' : 'Test WhatsApp Connection'}
-                        </button>
+                        <div className="flex flex-wrap items-center gap-2.5">
+                          <button
+                            type="submit"
+                            disabled={savingConfig || verifying}
+                            className="inline-flex items-center gap-2 rounded-xl bg-[#2563EB] px-4 py-2.5 font-semibold text-white hover:bg-[#1D4ED8] disabled:opacity-50 cursor-pointer"
+                          >
+                            {savingConfig && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+                            <span>{savingConfig ? 'Saving Configuration...' : 'Save Configuration'}</span>
+                          </button>
+                          <button
+                            type="button"
+                            disabled={verifying || savingConfig}
+                            onClick={handleVerifyMeta}
+                            className="inline-flex items-center gap-2 rounded-xl border border-[#E2E8F0] bg-[#F8FAFC] px-4 py-2.5 font-semibold text-[#0F172A] hover:bg-slate-100 disabled:opacity-50 cursor-pointer"
+                          >
+                            {verifying && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+                            <span>{verifying ? 'Verifying Connection...' : 'Verify Connection'}</span>
+                          </button>
+                        </div>
                       )}
                     </form>
 
@@ -452,7 +582,10 @@ export function SettingsPage() {
                             key={opt.value}
                             type="button"
                             disabled={!isAdmin}
-                            onClick={() => setMessagingMode(opt.value)}
+                            onClick={() => {
+                              markWhatsappDirty();
+                              setMessagingMode(opt.value);
+                            }}
                             className={`rounded-xl border p-3 text-left cursor-pointer disabled:opacity-60 ${
                               messagingMode === opt.value
                                 ? 'border-[#2563EB] bg-[#EFF6FF]/60'
@@ -473,20 +606,24 @@ export function SettingsPage() {
                           rows={2}
                           disabled={!isAdmin}
                           value={allowlistText}
-                          onChange={(e) => setAllowlistText(e.target.value)}
+                          onChange={(e) => {
+                            markWhatsappDirty();
+                            setAllowlistText(e.target.value);
+                          }}
                           placeholder="+15551234567, +971501234567"
-                          className="w-full rounded-xl border border-[#E2E8F0] px-3 py-2 font-mono"
+                          className="w-full rounded-xl border border-[#E2E8F0] px-3 py-2 font-mono focus:border-[#2563EB] focus:outline-none"
                         />
                       </div>
 
                       {isAdmin && (
                         <button
                           type="button"
-                          disabled={savingMode}
-                          onClick={handleSaveMessagingMode}
-                          className="rounded-xl border border-[#E2E8F0] bg-[#F8FAFC] px-4 py-2 font-semibold text-[#0F172A] hover:bg-slate-100 disabled:opacity-50 cursor-pointer"
+                          disabled={savingConfig || verifying}
+                          onClick={() => void handleSaveConfiguration()}
+                          className="inline-flex items-center gap-2 rounded-xl border border-[#E2E8F0] bg-[#F8FAFC] px-4 py-2 font-semibold text-[#0F172A] hover:bg-slate-100 disabled:opacity-50 cursor-pointer"
                         >
-                          {savingMode ? 'Saving Mode...' : 'Save Messaging Mode'}
+                          {savingConfig && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+                          <span>{savingConfig ? 'Saving Configuration...' : 'Save Configuration'}</span>
                         </button>
                       )}
                     </div>
@@ -583,8 +720,9 @@ export function SettingsPage() {
                           <code>003_whatsapp_messaging_engine.sql</code>.
                         </li>
                         <li>
-                          Deploy <code>whatsapp-webhook --no-verify-jwt</code>,{' '}
-                          <code>whatsapp-send-message</code>, and <code>whatsapp-connection-check</code>.
+                          Deploy in Supabase Dashboard → Edge Functions: <code>whatsapp-webhook</code>{' '}
+                          (JWT verification OFF), <code>whatsapp-connection-check</code>,{' '}
+                          <code>whatsapp-send-message</code>, and <code>sync-templates</code>.
                         </li>
                         <li>
                           Configure Supabase Secrets: <code>META_ACCESS_TOKEN</code>,{' '}

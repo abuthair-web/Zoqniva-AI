@@ -1,19 +1,267 @@
 // Supabase Edge Function: Send One-to-One Official WhatsApp Cloud API Message
-// Deploy with JWT verification ENABLED (default):
-//   supabase functions deploy whatsapp-send-message
+// Standalone single-file build for Supabase Dashboard -> Edge Functions -> Via Editor.
+// Keep "Enforce JWT Verification" ENABLED (default) when deploying.
 
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
-import { logEvent, maskPhone } from '../_shared/logger.ts';
-import {
-  corsHeaders,
-  getMetaRuntimeConfig,
-  jsonResponse,
-  normalizePhoneToE164,
-  normalizeWaId,
-  sendMetaWhatsAppMessage,
-} from '../_shared/metaCloudApi.ts';
 
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const VALID_GRAPH_VERSION = /^v(1[89]|2[0-3])\.0$/;
+
+const corsHeaders = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
+  'Access-Control-Allow-Methods': 'POST, OPTIONS',
+};
+
+function jsonResponse(body: Record<string, unknown>, status = 200): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+  });
+}
+
+function resolveGraphApiVersion(requested?: string | null): string {
+  const envVer = Deno.env.get('META_GRAPH_API_VERSION')?.trim();
+  const candidate = requested?.trim() || envVer || 'v21.0';
+  return VALID_GRAPH_VERSION.test(candidate) ? candidate : 'v21.0';
+}
+
+function normalizeWaId(raw: string): string | null {
+  const digits = raw.replace(/\D/g, '');
+  if (digits.length < 7 || digits.length > 15 || digits.startsWith('0')) return null;
+  return digits;
+}
+
+function normalizePhoneToE164(raw: string): string | null {
+  const waId = normalizeWaId(raw);
+  return waId ? `+${waId}` : null;
+}
+
+function maskPhone(phone?: string | null): string | undefined {
+  if (!phone) return undefined;
+  const trimmed = phone.trim();
+  return trimmed.length <= 4 ? '****' : `***${trimmed.slice(-4)}`;
+}
+
+const SENSITIVE_KEY_PATTERN =
+  /token|secret|authorization|password|apikey|api_key|signature|verify_token|body|message_text|content/i;
+
+function logEvent(
+  category: 'outgoing_submit' | 'permission_error' | 'meta_api_error' | 'duplicate_event',
+  level: 'info' | 'warn' | 'error',
+  message: string,
+  context: Record<string, unknown> = {}
+): void {
+  const sanitized: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(context)) {
+    sanitized[k] = SENSITIVE_KEY_PATTERN.test(k) ? '[REDACTED]' : v;
+  }
+  const entry = { ts: new Date().toISOString(), category, level, message, ...sanitized };
+  if (level === 'error') console.error(JSON.stringify(entry));
+  else if (level === 'warn') console.warn(JSON.stringify(entry));
+  else console.info(JSON.stringify(entry));
+}
+
+function classifyMetaError(httpStatus: number, metaPayload: Record<string, unknown> | null) {
+  const errObj = (metaPayload?.error as Record<string, unknown> | undefined) ?? {};
+  const numericCode = errObj.code !== undefined ? String(errObj.code) : '';
+  const subcode = errObj.error_subcode !== undefined ? String(errObj.error_subcode) : '';
+  const rawMessage = typeof errObj.message === 'string' ? errObj.message : 'Meta Graph API request failed';
+
+  if (numericCode === '190') {
+    return {
+      code: 'META_TOKEN_EXPIRED',
+      httpStatus: 401,
+      userMessage: 'WhatsApp API token has expired or is invalid. Ask an admin to rotate the server token.',
+      diagnosticMessage: `Meta OAuth error 190${subcode ? `/${subcode}` : ''}: ${rawMessage}`,
+    };
+  }
+  if (numericCode === '10' || numericCode === '200') {
+    return {
+      code: 'META_PERMISSION_DENIED',
+      httpStatus: 403,
+      userMessage: 'Meta app lacks permission for this WhatsApp Business number.',
+      diagnosticMessage: `Meta permission error ${numericCode}: ${rawMessage}`,
+    };
+  }
+  if (numericCode === '100') {
+    return {
+      code: 'META_INVALID_IDENTIFIER',
+      httpStatus: 400,
+      userMessage: 'The Phone Number ID or template parameters are invalid.',
+      diagnosticMessage: `Meta invalid parameter 100: ${rawMessage}`,
+    };
+  }
+  if (numericCode === '131030') {
+    return {
+      code: 'META_TEST_RECIPIENT_NOT_ALLOWED',
+      httpStatus: 400,
+      userMessage: 'Recipient phone number is not in Meta’s allowed test recipient list.',
+      diagnosticMessage: `Meta sandbox error 131030: ${rawMessage}`,
+    };
+  }
+  if (numericCode === '131047') {
+    return {
+      code: 'META_REENGAGEMENT_REQUIRED',
+      httpStatus: 400,
+      userMessage: 'More than 24 hours have passed since the customer replied. Send an approved template instead.',
+      diagnosticMessage: `Meta 24h window error 131047: ${rawMessage}`,
+    };
+  }
+  if (numericCode === '131026') {
+    return {
+      code: 'META_RECIPIENT_UNDELIVERABLE',
+      httpStatus: 400,
+      userMessage: 'This phone number could not receive the WhatsApp message.',
+      diagnosticMessage: `Meta undeliverable 131026: ${rawMessage}`,
+    };
+  }
+  if (numericCode === '130429' || numericCode === '80007') {
+    return {
+      code: 'META_RATE_LIMITED',
+      httpStatus: 429,
+      userMessage: 'WhatsApp rate limit reached temporarily. Wait a moment before trying again.',
+      diagnosticMessage: `Meta rate limit ${numericCode}: ${rawMessage}`,
+    };
+  }
+
+  return {
+    code: numericCode ? `META_${numericCode}` : `META_HTTP_${httpStatus}`,
+    httpStatus: httpStatus >= 400 && httpStatus < 500 ? 400 : 502,
+    userMessage: 'WhatsApp could not accept this message right now.',
+    diagnosticMessage: `Meta HTTP ${httpStatus}: ${rawMessage}`,
+  };
+}
+
+async function dispatchMetaMessage(params: {
+  graphApiVersion: string;
+  phoneNumberId: string;
+  accessToken: string;
+  recipientWaId: string;
+  messageType: 'text' | 'template';
+  body?: string;
+  templateName?: string;
+  language?: string;
+  templateParameters?: string[];
+}) {
+  const {
+    graphApiVersion,
+    phoneNumberId,
+    accessToken,
+    recipientWaId,
+    messageType,
+    body,
+    templateName,
+    language = 'en_US',
+    templateParameters,
+  } = params;
+
+  const metaPayload =
+    messageType === 'template'
+      ? {
+          messaging_product: 'whatsapp',
+          recipient_type: 'individual',
+          to: recipientWaId,
+          type: 'template',
+          template: {
+            name: templateName,
+            language: { code: language },
+            ...(templateParameters && templateParameters.length > 0
+              ? {
+                  components: [
+                    {
+                      type: 'body',
+                      parameters: templateParameters.map((val) => ({
+                        type: 'text',
+                        text: val,
+                      })),
+                    },
+                  ],
+                }
+              : {}),
+          },
+        }
+      : {
+          messaging_product: 'whatsapp',
+          recipient_type: 'individual',
+          to: recipientWaId,
+          type: 'text',
+          text: {
+            preview_url: false,
+            body: body ?? '',
+          },
+        };
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 12000);
+
+  try {
+    const res = await fetch(
+      `https://graph.facebook.com/${graphApiVersion}/${encodeURIComponent(phoneNumberId)}/messages`,
+      {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(metaPayload),
+        signal: controller.signal,
+      }
+    );
+
+    const json = (await res.json().catch(() => ({}))) as Record<string, unknown>;
+    const messagesArr = Array.isArray(json.messages) ? (json.messages as Array<Record<string, unknown>>) : [];
+    const metaMessageId = typeof messagesArr[0]?.id === 'string' ? messagesArr[0].id : undefined;
+
+    if (!res.ok || !metaMessageId) {
+      const classified = classifyMetaError(res.status, json);
+      logEvent('meta_api_error', 'error', 'Meta send rejected', {
+        code: classified.code,
+        recipient: maskPhone(recipientWaId),
+        messageType,
+      });
+      return {
+        ok: false,
+        httpStatus: classified.httpStatus,
+        errorCode: classified.code,
+        userMessage: classified.userMessage,
+        diagnosticMessage: classified.diagnosticMessage,
+        rawResponse: json,
+      };
+    }
+
+    logEvent('outgoing_submit', 'info', 'Message accepted by Meta Cloud API', {
+      metaMessageId,
+      recipient: maskPhone(recipientWaId),
+      messageType,
+    });
+
+    return {
+      ok: true,
+      httpStatus: 200,
+      metaMessageId,
+      rawResponse: json,
+    };
+  } catch (err) {
+    // NEVER blindly retry a timed-out POST to Meta to avoid duplicate WhatsApp messages
+    const isAbort = err instanceof DOMException && err.name === 'AbortError';
+    logEvent('meta_api_error', 'error', 'Meta send network failure/timeout', {
+      isAbort,
+      recipient: maskPhone(recipientWaId),
+    });
+    return {
+      ok: false,
+      httpStatus: 504,
+      errorCode: isAbort ? 'META_REQUEST_TIMEOUT' : 'META_NETWORK_ERROR',
+      userMessage: isAbort
+        ? 'Timed out waiting for WhatsApp confirmation. Check status before retrying to avoid duplicates.'
+        : 'Network error communicating with WhatsApp Cloud API.',
+      diagnosticMessage: (err as Error).message,
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 Deno.serve(async (req: Request) => {
   if (req.method === 'OPTIONS') {
@@ -50,7 +298,7 @@ Deno.serve(async (req: Request) => {
     }
     const callerId = userRes.user.id;
 
-    // 2. Parse and validate request payload
+    // 2. Parse & validate request payload (strictly 1-to-1 text or template; no bulk/campaigns)
     const payload = (await req.json().catch(() => ({}))) as {
       conversationId?: string;
       messageType?: string;
@@ -93,6 +341,10 @@ Deno.serve(async (req: Request) => {
       );
     }
 
+    if (clientRequestId && clientRequestId.length > 128) {
+      return jsonResponse({ ok: false, code: 'INVALID_CLIENT_REQUEST_ID', error: 'Invalid client request ID.' }, 400);
+    }
+
     if (messageType === 'template' && !templateName) {
       return jsonResponse(
         { ok: false, code: 'TEMPLATE_REQUIRED', error: 'Template name is required for template messages.' },
@@ -128,11 +380,7 @@ Deno.serve(async (req: Request) => {
       return jsonResponse({ ok: false, code: 'FORBIDDEN', error: 'You are not authorized for this workspace.' }, 403);
     }
 
-    if (
-      membership.role === 'agent' &&
-      conversation.assigned_to !== null &&
-      conversation.assigned_to !== callerId
-    ) {
+    if (membership.role === 'agent' && conversation.assigned_to !== null && conversation.assigned_to !== callerId) {
       logEvent('permission_error', 'warn', 'Agent attempted send on conversation assigned to another user', {
         callerId,
         conversationId,
@@ -143,7 +391,7 @@ Deno.serve(async (req: Request) => {
       );
     }
 
-    // 5. Idempotency check (prevent duplicate sends on double-clicks / retries)
+    // 5. Idempotency check (prevent double sends)
     if (clientRequestId) {
       const { data: existingMsg } = await serviceClient
         .from('messages')
@@ -168,7 +416,7 @@ Deno.serve(async (req: Request) => {
       }
     }
 
-    // 6. Load business WhatsApp account & runtime Meta config
+    // 6. Load business WhatsApp account & runtime Meta credentials
     const { data: waAccount } = await serviceClient
       .from('whatsapp_accounts')
       .select('*')
@@ -177,13 +425,22 @@ Deno.serve(async (req: Request) => {
       .limit(1)
       .maybeSingle();
 
-    const metaConfig = getMetaRuntimeConfig({
-      phoneNumberId: waAccount?.meta_phone_number_id ? String(waAccount.meta_phone_number_id) : undefined,
-      wabaId: waAccount?.meta_waba_id ? String(waAccount.meta_waba_id) : undefined,
-      graphApiVersion: waAccount?.graph_api_version ? String(waAccount.graph_api_version) : undefined,
-    });
+    const accessToken =
+      Deno.env.get('META_ACCESS_TOKEN')?.trim() ||
+      Deno.env.get('META_WHATSAPP_ACCESS_TOKEN')?.trim() ||
+      '';
+    const rawAccountPhoneId = String(
+      waAccount?.phone_number_id ?? waAccount?.meta_phone_number_id ?? ''
+    ).trim();
+    const phoneNumberId =
+      (rawAccountPhoneId && rawAccountPhoneId !== 'unconfigured' ? rawAccountPhoneId : '') ||
+      Deno.env.get('META_PHONE_NUMBER_ID')?.trim() ||
+      '';
+    const graphApiVersion = resolveGraphApiVersion(
+      waAccount?.graph_api_version ? String(waAccount.graph_api_version) : undefined
+    );
 
-    if (!metaConfig.accessToken || !metaConfig.phoneNumberId) {
+    if (!accessToken || !phoneNumberId) {
       return jsonResponse(
         {
           ok: false,
@@ -194,7 +451,8 @@ Deno.serve(async (req: Request) => {
       );
     }
 
-    if (waAccount && waAccount.connection_status !== 'connected') {
+    const accountConnStatus = waAccount?.connection_status ?? waAccount?.status;
+    if (!waAccount || accountConnStatus !== 'connected') {
       return jsonResponse(
         {
           ok: false,
@@ -221,9 +479,9 @@ Deno.serve(async (req: Request) => {
     }
 
     // 8. Enforce Test Mode Allowlist server-side
-    const messagingMode = waAccount?.messaging_mode === 'live' ? 'live' : 'test';
+    const messagingMode = waAccount.messaging_mode === 'live' ? 'live' : 'test';
     if (messagingMode === 'test') {
-      const allowlist = Array.isArray(waAccount?.test_allowlist)
+      const allowlist = Array.isArray(waAccount.test_allowlist)
         ? waAccount.test_allowlist
             .map((p) => normalizePhoneToE164(String(p)))
             .filter((p): p is string => Boolean(p))
@@ -300,22 +558,20 @@ Deno.serve(async (req: Request) => {
     }
 
     // 11. Create pending message record before calling Meta Graph API
-    const pendingInsert = {
-      business_id: businessId,
-      conversation_id: conversationId,
-      sender_type: 'agent',
-      sender_profile_id: callerId,
-      direction: 'outbound',
-      message_type: messageType,
-      body: trimmedBody,
-      template_name: messageType === 'template' ? templateName : null,
-      client_request_id: clientRequestId ?? null,
-      delivery_status: 'pending',
-    };
-
     const { data: createdMsg, error: insErr } = await serviceClient
       .from('messages')
-      .insert(pendingInsert)
+      .insert({
+        business_id: businessId,
+        conversation_id: conversationId,
+        sender_type: 'agent',
+        sender_profile_id: callerId,
+        direction: 'outbound',
+        message_type: messageType,
+        body: trimmedBody,
+        template_name: messageType === 'template' ? templateName : null,
+        client_request_id: clientRequestId ?? null,
+        delivery_status: 'pending',
+      })
       .select('*')
       .single();
 
@@ -348,8 +604,10 @@ Deno.serve(async (req: Request) => {
     });
 
     // 12. Dispatch to Official Meta WhatsApp Cloud API
-    const metaResult = await sendMetaWhatsAppMessage({
-      config: metaConfig,
+    const metaResult = await dispatchMetaMessage({
+      graphApiVersion,
+      phoneNumberId,
+      accessToken,
       recipientWaId,
       messageType: messageType as 'text' | 'template',
       body: trimmedBody,
@@ -398,7 +656,7 @@ Deno.serve(async (req: Request) => {
       );
     }
 
-    // 13. Meta accepted message -> mark strictly as 'submitted' (wait for real webhook for sent/delivered/read)
+    // 13. Meta accepted message -> mark strictly as 'submitted' (real webhooks advance sent/delivered/read)
     const { data: submittedMsg } = await serviceClient
       .from('messages')
       .update({

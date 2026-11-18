@@ -247,3 +247,368 @@ export async function fetchRecentWebhookEvents(
     receivedAt: String(row.received_at ?? new Date().toISOString()),
   }));
 }
+
+export async function invokeSyncTemplates(): Promise<{
+  ok: boolean;
+  templatesCount: number;
+  error?: string;
+}> {
+  if (!supabase) {
+    return { ok: false, templatesCount: 0, error: 'Supabase client is not configured.' };
+  }
+
+  const { data, error } = await supabase.functions.invoke('sync-templates', {
+    method: 'POST',
+  });
+
+  if (error) {
+    const errBody = await extractFunctionErrorPayload(error);
+    return {
+      ok: false,
+      templatesCount: 0,
+      error: errBody?.error
+        ? String(errBody.error)
+        : (error as Error).message || 'Could not sync WhatsApp templates from Meta.',
+    };
+  }
+
+  const payload = (data ?? {}) as Record<string, unknown>;
+  return {
+    ok: Boolean(payload.ok),
+    templatesCount: Number(payload.templatesCount ?? 0),
+    error: payload.error ? String(payload.error) : undefined,
+  };
+}
+
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+const PHONE_ID_COLUMN_CANDIDATES = ['phone_number_id', 'meta_phone_number_id'] as const;
+const WABA_ID_COLUMN_CANDIDATES = [
+  'waba_id',
+  'meta_waba_id',
+  'whatsapp_business_account_id',
+  'business_account_id',
+] as const;
+
+const METADATA_COLUMN_CANDIDATES = [
+  'id',
+  'business_id',
+  'display_name',
+  'phone_number_e164',
+  'phone_number',
+  'connection_status',
+  'status',
+  'messaging_mode',
+  'test_allowlist',
+  'graph_api_version',
+  'verified_name',
+  'quality_rating',
+  'webhook_verified_at',
+  'last_sync_at',
+  'last_error_message',
+  'app_id',
+  'created_at',
+  'updated_at',
+] as const;
+
+let cachedWhatsAppColumns: Set<string> | null = null;
+
+function cleanCredentialString(raw: unknown): string {
+  if (typeof raw !== 'string' && typeof raw !== 'number') return '';
+  const trimmed = String(raw).trim();
+  if (!trimmed || trimmed === 'unconfigured') return '';
+  return trimmed;
+}
+
+export function extractWhatsAppPhoneNumberId(row?: Record<string, unknown> | null): string {
+  if (!row) return '';
+  for (const col of PHONE_ID_COLUMN_CANDIDATES) {
+    const val = cleanCredentialString(row[col]);
+    if (val) return val;
+  }
+  return '';
+}
+
+export function extractWhatsAppWabaId(row?: Record<string, unknown> | null): string {
+  if (!row) return '';
+  for (const col of WABA_ID_COLUMN_CANDIDATES) {
+    const val = cleanCredentialString(row[col]);
+    if (val) return val;
+  }
+  return '';
+}
+
+export async function detectWhatsAppAccountColumns(
+  seedRow?: Record<string, unknown> | null
+): Promise<Set<string>> {
+  if (cachedWhatsAppColumns && cachedWhatsAppColumns.size > 0) {
+    if (seedRow) {
+      for (const k of Object.keys(seedRow)) cachedWhatsAppColumns.add(k);
+    }
+    return cachedWhatsAppColumns;
+  }
+
+  const detected = new Set<string>();
+  if (seedRow) {
+    for (const k of Object.keys(seedRow)) detected.add(k);
+  }
+
+  if (!supabase) return detected;
+  const client = supabase;
+
+  const probeList = [
+    ...PHONE_ID_COLUMN_CANDIDATES,
+    ...WABA_ID_COLUMN_CANDIDATES,
+    ...METADATA_COLUMN_CANDIDATES,
+  ].filter((col) => !detected.has(col));
+
+  await Promise.all(
+    probeList.map(async (col) => {
+      try {
+        const { error } = await client.from('whatsapp_accounts').select(col).limit(0);
+        if (!error) {
+          detected.add(col);
+        }
+      } catch {
+        // Ignore probe network errors cleanly
+      }
+    })
+  );
+
+  if (detected.size > 0) {
+    cachedWhatsAppColumns = detected;
+  }
+  return detected;
+}
+
+export async function fetchBusinessWhatsAppAccount(businessId: string): Promise<{
+  ok: boolean;
+  row: Record<string, unknown> | null;
+  error?: string;
+}> {
+  if (!supabase || !UUID_REGEX.test(businessId)) {
+    return { ok: false, row: null, error: 'Supabase workspace is not configured.' };
+  }
+
+  const { data, error } = await supabase
+    .from('whatsapp_accounts')
+    .select('*')
+    .eq('business_id', businessId)
+    .order('created_at', { ascending: true })
+    .limit(1)
+    .maybeSingle();
+
+  if (error) {
+    return { ok: false, row: null, error: error.message };
+  }
+
+  const row = (data as Record<string, unknown> | null) ?? null;
+  if (row) {
+    if (!cachedWhatsAppColumns) cachedWhatsAppColumns = new Set<string>();
+    for (const k of Object.keys(row)) cachedWhatsAppColumns.add(k);
+  }
+
+  return { ok: true, row };
+}
+
+export interface SaveWhatsAppConfigurationResult {
+  ok: boolean;
+  message: string;
+  phoneNumberId?: string;
+  wabaId?: string;
+  messagingMode?: MessagingMode;
+  testAllowlist?: string[];
+  graphApiVersion?: string;
+  row?: Record<string, unknown>;
+}
+
+export async function saveBusinessWhatsAppConfiguration(params: {
+  businessId: string;
+  phoneNumberId: string;
+  wabaId: string;
+  messagingMode: MessagingMode;
+  testAllowlist: string[];
+  graphApiVersion?: string;
+}): Promise<SaveWhatsAppConfigurationResult> {
+  if (!supabase) {
+    return { ok: false, message: 'Supabase client is not configured.' };
+  }
+
+  const cleanBusinessId = params.businessId.trim();
+  const cleanPhoneId = params.phoneNumberId.trim();
+  const cleanWabaId = params.wabaId.trim();
+  const cleanGraphVersion = params.graphApiVersion?.trim() || 'v21.0';
+
+  if (!UUID_REGEX.test(cleanBusinessId)) {
+    return { ok: false, message: 'Active business workspace could not be resolved.' };
+  }
+
+  if (!cleanPhoneId || !cleanWabaId) {
+    return {
+      ok: false,
+      message: 'Both Meta Phone Number ID and WhatsApp Business Account (WABA) ID are required.',
+    };
+  }
+
+  // 1. Verify authenticated user & active admin role for this exact business (RLS compliant)
+  const { data: userRes, error: userErr } = await supabase.auth.getUser();
+  if (userErr || !userRes.user) {
+    return { ok: false, message: 'Your session has expired. Sign in again and retry.' };
+  }
+
+  const { data: memberRow, error: memberErr } = await supabase
+    .from('business_members')
+    .select('role, status')
+    .eq('business_id', cleanBusinessId)
+    .eq('user_id', userRes.user.id)
+    .maybeSingle();
+
+  if (memberErr) {
+    return { ok: false, message: `Unable to verify administrator permissions: ${memberErr.message}` };
+  }
+
+  const memberStatus = memberRow?.status ? String(memberRow.status) : 'active';
+  if (!memberRow || memberStatus !== 'active' || memberRow.role !== 'admin') {
+    return {
+      ok: false,
+      message: 'Only active business administrators can save WhatsApp configuration.',
+    };
+  }
+
+  // 2. Load existing row for this business (prevents duplicate records)
+  const existingRes = await fetchBusinessWhatsAppAccount(cleanBusinessId);
+  if (!existingRes.ok) {
+    return { ok: false, message: existingRes.error || 'Failed to read existing WhatsApp settings.' };
+  }
+
+  const existingRow = existingRes.row;
+  const cols = await detectWhatsAppAccountColumns(existingRow);
+
+  const phoneCols = PHONE_ID_COLUMN_CANDIDATES.filter((c) => cols.has(c));
+  const wabaCols = WABA_ID_COLUMN_CANDIDATES.filter((c) => cols.has(c));
+
+  if (phoneCols.length === 0 || wabaCols.length === 0) {
+    return {
+      ok: false,
+      message:
+        'Could not locate Phone Number ID or WABA ID columns in public.whatsapp_accounts. Check database schema permissions.',
+    };
+  }
+
+  const writePayload: Record<string, unknown> = {};
+  for (const c of phoneCols) writePayload[c] = cleanPhoneId;
+  for (const c of wabaCols) writePayload[c] = cleanWabaId;
+
+  if (cols.has('messaging_mode')) writePayload.messaging_mode = params.messagingMode;
+  if (cols.has('test_allowlist')) writePayload.test_allowlist = params.testAllowlist;
+  if (cols.has('graph_api_version')) writePayload.graph_api_version = cleanGraphVersion;
+
+  let savedRowId: string | null = existingRow?.id ? String(existingRow.id) : null;
+
+  if (existingRow && savedRowId) {
+    const { error: updErr } = await supabase
+      .from('whatsapp_accounts')
+      .update(writePayload)
+      .eq('id', savedRowId)
+      .eq('business_id', cleanBusinessId);
+
+    if (updErr) {
+      cachedWhatsAppColumns = null;
+      return { ok: false, message: `Failed to save WhatsApp configuration: ${updErr.message}` };
+    }
+  } else {
+    const insertPayload: Record<string, unknown> = {
+      business_id: cleanBusinessId,
+      ...writePayload,
+    };
+    if (cols.has('display_name')) insertPayload.display_name = 'WhatsApp Business';
+    if (cols.has('phone_number_e164')) insertPayload.phone_number_e164 = '+10000000000';
+    if (cols.has('phone_number')) insertPayload.phone_number = '+10000000000';
+    if (cols.has('connection_status')) insertPayload.connection_status = 'configuration_required';
+    if (cols.has('status') && !cols.has('connection_status')) {
+      insertPayload.status = 'configuration_required';
+    }
+
+    const { data: insertedRow, error: insErr } = await supabase
+      .from('whatsapp_accounts')
+      .insert(insertPayload)
+      .select('*')
+      .maybeSingle();
+
+    if (insErr) {
+      cachedWhatsAppColumns = null;
+      return { ok: false, message: `Failed to create WhatsApp configuration: ${insErr.message}` };
+    }
+    savedRowId = insertedRow?.id ? String((insertedRow as Record<string, unknown>).id) : null;
+  }
+
+  // 3. Re-fetch directly from Supabase and verify values persisted accurately
+  const verifyQuery = savedRowId
+    ? supabase
+        .from('whatsapp_accounts')
+        .select('*')
+        .eq('id', savedRowId)
+        .eq('business_id', cleanBusinessId)
+        .maybeSingle()
+    : supabase
+        .from('whatsapp_accounts')
+        .select('*')
+        .eq('business_id', cleanBusinessId)
+        .order('created_at', { ascending: true })
+        .limit(1)
+        .maybeSingle();
+
+  const { data: verifiedData, error: verifyErr } = await verifyQuery;
+  if (verifyErr || !verifiedData) {
+    return {
+      ok: false,
+      message: verifyErr
+        ? `Saved record could not be verified: ${verifyErr.message}`
+        : 'Saved record could not be read back from Supabase to confirm persistence.',
+    };
+  }
+
+  const verifiedRow = verifiedData as Record<string, unknown>;
+  const persistedPhoneId = extractWhatsAppPhoneNumberId(verifiedRow);
+  const persistedWabaId = extractWhatsAppWabaId(verifiedRow);
+
+  if (persistedPhoneId !== cleanPhoneId || persistedWabaId !== cleanWabaId) {
+    return {
+      ok: false,
+      message: 'Supabase read-back check failed: saved IDs did not match entered values.',
+    };
+  }
+
+  // Best-effort audit log (non-blocking)
+  void supabase.from('audit_logs').insert({
+    business_id: cleanBusinessId,
+    actor_id: userRes.user.id,
+    action: 'Saved WhatsApp Configuration',
+    entity_type: 'whatsapp_account',
+    details: {
+      summary: `Saved Phone ID ${cleanPhoneId} and WABA ID ${cleanWabaId} (${params.messagingMode} mode)`,
+    },
+  });
+
+  return {
+    ok: true,
+    message: 'WhatsApp configuration saved and verified in Supabase.',
+    phoneNumberId: persistedPhoneId,
+    wabaId: persistedWabaId,
+    messagingMode:
+      verifiedRow.messaging_mode === 'live'
+        ? 'live'
+        : verifiedRow.messaging_mode === 'test'
+        ? 'test'
+        : params.messagingMode,
+    testAllowlist: Array.isArray(verifiedRow.test_allowlist)
+      ? verifiedRow.test_allowlist.map(String)
+      : params.testAllowlist,
+    graphApiVersion: verifiedRow.graph_api_version
+      ? String(verifiedRow.graph_api_version)
+      : cleanGraphVersion,
+    row: verifiedRow,
+  };
+}
+
+

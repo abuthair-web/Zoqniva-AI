@@ -15,12 +15,17 @@ import {
   supabaseConfigError,
 } from '@/lib/supabase';
 import {
+  extractWhatsAppPhoneNumberId,
+  extractWhatsAppWabaId,
+  fetchBusinessWhatsAppAccount,
   fetchOlderMessagesPage,
   fetchRecentWebhookEvents,
   getWebhookCallbackUrl,
   invokeConnectionCheck,
   invokeSendWhatsAppMessage,
+  invokeSyncTemplates,
   mapDbMessageRow,
+  saveBusinessWhatsAppConfiguration,
 } from '@/services/whatsappService';
 import type { User } from '@supabase/supabase-js';
 import type {
@@ -247,6 +252,7 @@ interface AppContextValue {
     wabaId?: string;
     graphApiVersion?: string;
   }) => Promise<{ ok: boolean; message: string }>;
+  refreshWhatsAppAccount: () => Promise<void>;
   refreshWebhookDiagnostics: () => Promise<void>;
   updateBusinessHours: (hours: BusinessHoursDay[]) => void;
   markNotificationRead: (id: string) => void;
@@ -333,6 +339,15 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     teamMembersRef.current = teamMembers;
   }, [teamMembers]);
 
+  const currentUserIdRef = useRef<string | null>(null);
+  const authStatusRef = useRef<AuthGateStatus>('loading');
+  useEffect(() => {
+    currentUserIdRef.current = currentUser?.id ?? null;
+  }, [currentUser]);
+  useEffect(() => {
+    authStatusRef.current = authStatus;
+  }, [authStatus]);
+
   const webhookCallbackUrl = useMemo(() => getWebhookCallbackUrl(), []);
 
   const resetWorkspaceState = useCallback(() => {
@@ -398,7 +413,13 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         auditRes,
       ] = await Promise.all([
         client.from('businesses').select('*').eq('id', businessId).maybeSingle(),
-        client.from('whatsapp_accounts').select('*').eq('business_id', businessId).limit(1).maybeSingle(),
+        client
+          .from('whatsapp_accounts')
+          .select('*')
+          .eq('business_id', businessId)
+          .order('created_at', { ascending: true })
+          .limit(1)
+          .maybeSingle(),
         client
           .from('business_members')
           .select('*, profiles(*)')
@@ -432,6 +453,12 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       const waData = waRes.data as Record<string, unknown> | null;
 
       if (bizData) {
+        const loadedPhoneId = extractWhatsAppPhoneNumberId(waData);
+        const loadedWabaId = extractWhatsAppWabaId(waData);
+        const loadedStatus = (waData?.connection_status ??
+          waData?.status ??
+          'not_connected') as MetaConnectionState;
+
         setBusiness({
           id: String(bizData.id ?? ''),
           name: String(bizData.name ?? 'Your Business'),
@@ -440,10 +467,10 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           timezone: String(bizData.timezone ?? 'UTC'),
           website: String(bizData.website ?? ''),
           whatsappDisplayName: String(waData?.display_name ?? ''),
-          whatsappPhoneE164: String(waData?.phone_number_e164 ?? ''),
-          metaPhoneNumberId: String(waData?.meta_phone_number_id ?? ''),
-          metaWabaId: String(waData?.meta_waba_id ?? ''),
-          metaConnectionState: (waData?.connection_status as MetaConnectionState) ?? 'not_connected',
+          whatsappPhoneE164: String(waData?.phone_number_e164 ?? waData?.phone_number ?? ''),
+          metaPhoneNumberId: loadedPhoneId,
+          metaWabaId: loadedWabaId,
+          metaConnectionState: loadedStatus,
           metaLastError: waData?.last_error_message ? String(waData.last_error_message) : undefined,
           messagingMode: waData?.messaging_mode === 'live' ? 'live' : 'test',
           testAllowlist: Array.isArray(waData?.test_allowlist)
@@ -856,6 +883,18 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       }
 
       if (event === 'SIGNED_IN' || event === 'TOKEN_REFRESHED' || event === 'USER_UPDATED') {
+        const sameAuthenticatedUser =
+          currentUserIdRef.current === session.user.id &&
+          authStatusRef.current === 'authenticated';
+
+        // Avoid blowing away active form inputs on routine background token refreshes or tab focus
+        if (event === 'TOKEN_REFRESHED' && sameAuthenticatedUser) {
+          return;
+        }
+        if (event === 'SIGNED_IN' && sameAuthenticatedUser) {
+          return;
+        }
+
         void (async () => {
           const { data: userRes, error: userErr } = await client.auth.getUser();
           if (!active) return;
@@ -1006,16 +1045,18 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         (payload) => {
           const wa = (payload.new as Record<string, unknown> | null) ?? null;
           if (!wa) return;
+          const nextPhone = extractWhatsAppPhoneNumberId(wa);
+          const nextWaba = extractWhatsAppWabaId(wa);
           setBusiness((prev) => ({
             ...prev,
             whatsappDisplayName: String(wa.display_name ?? prev.whatsappDisplayName),
-            whatsappPhoneE164: String(wa.phone_number_e164 ?? prev.whatsappPhoneE164),
-            metaPhoneNumberId: String(wa.meta_phone_number_id ?? prev.metaPhoneNumberId),
-            metaWabaId: String(wa.meta_waba_id ?? prev.metaWabaId),
+            whatsappPhoneE164: String(wa.phone_number_e164 ?? wa.phone_number ?? prev.whatsappPhoneE164),
+            metaPhoneNumberId: nextPhone || prev.metaPhoneNumberId,
+            metaWabaId: nextWaba || prev.metaWabaId,
             metaConnectionState:
-              (wa.connection_status as MetaConnectionState) ?? prev.metaConnectionState,
+              ((wa.connection_status ?? wa.status) as MetaConnectionState) ?? prev.metaConnectionState,
             metaLastError: wa.last_error_message ? String(wa.last_error_message) : undefined,
-            messagingMode: wa.messaging_mode === 'live' ? 'live' : 'test',
+            messagingMode: wa.messaging_mode === 'live' ? 'live' : wa.messaging_mode === 'test' ? 'test' : prev.messagingMode,
             testAllowlist: Array.isArray(wa.test_allowlist)
               ? wa.test_allowlist.map(String)
               : prev.testAllowlist,
@@ -1934,12 +1975,14 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       };
     }
     if (supabase && isSupabaseConfigured) {
-      const { data, error } = await supabase.functions.invoke('sync-templates');
-      if (error) return { ok: false, message: error.message };
+      const res = await invokeSyncTemplates();
+      if (!res.ok) {
+        return { ok: false, message: res.error || 'Could not sync templates from Meta.' };
+      }
       if (currentUser?.id) {
         await loadSupabaseWorkspace(currentUser.id);
       }
-      return { ok: true, message: `Synced ${data?.templatesCount ?? 0} templates from Meta.` };
+      return { ok: true, message: `Synced ${res.templatesCount} template(s) from Meta.` };
     }
     return {
       ok: false,
@@ -2105,6 +2148,44 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     appendAudit('Updated Business Settings', 'business', 'Modified business profile configuration');
   };
 
+  const refreshWhatsAppAccount = useCallback(async () => {
+    if (!isSupabaseConfigured || !supabase || !UUID_REGEX.test(business.id)) return;
+    const res = await fetchBusinessWhatsAppAccount(business.id);
+    if (!res.ok || !res.row) return;
+    const waData = res.row;
+    const nextPhone = extractWhatsAppPhoneNumberId(waData);
+    const nextWaba = extractWhatsAppWabaId(waData);
+    setBusiness((prev) => ({
+      ...prev,
+      whatsappDisplayName: String(waData.display_name ?? prev.whatsappDisplayName),
+      whatsappPhoneE164: String(
+        waData.phone_number_e164 ?? waData.phone_number ?? prev.whatsappPhoneE164
+      ),
+      metaPhoneNumberId: nextPhone || prev.metaPhoneNumberId,
+      metaWabaId: nextWaba || prev.metaWabaId,
+      metaConnectionState:
+        ((waData.connection_status ?? waData.status) as MetaConnectionState) ??
+        prev.metaConnectionState,
+      metaLastError: waData.last_error_message ? String(waData.last_error_message) : prev.metaLastError,
+      messagingMode:
+        waData.messaging_mode === 'live'
+          ? 'live'
+          : waData.messaging_mode === 'test'
+          ? 'test'
+          : prev.messagingMode,
+      testAllowlist: Array.isArray(waData.test_allowlist)
+        ? waData.test_allowlist.map(String)
+        : prev.testAllowlist,
+      graphApiVersion: String(waData.graph_api_version ?? prev.graphApiVersion),
+      verifiedName: waData.verified_name ? String(waData.verified_name) : prev.verifiedName,
+      qualityRating:
+        (waData.quality_rating as BusinessProfile['qualityRating']) ?? prev.qualityRating,
+      webhookVerifiedAt: waData.webhook_verified_at
+        ? String(waData.webhook_verified_at)
+        : prev.webhookVerifiedAt,
+    }));
+  }, [business.id]);
+
   const verifyMetaConnection: AppContextValue['verifyMetaConnection'] = async (
     phoneNumberId,
     wabaId,
@@ -2114,24 +2195,10 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     const cleanWabaId = wabaId.trim();
 
     if (!cleanPhoneId || !cleanWabaId) {
-      setBusiness((prev) => ({
-        ...prev,
-        metaPhoneNumberId: cleanPhoneId,
-        metaWabaId: cleanWabaId,
-        metaConnectionState: 'configuration_required',
-        metaLastError: 'Both Meta Phone Number ID and WABA ID are required.',
-      }));
       return { ok: false, message: 'Phone Number ID and WABA ID are required.' };
     }
 
     if (!isSupabaseConfigured || !supabase) {
-      setBusiness((prev) => ({
-        ...prev,
-        metaPhoneNumberId: cleanPhoneId,
-        metaWabaId: cleanWabaId,
-        metaConnectionState: 'configuration_required',
-        metaLastError: 'Supabase backend configuration is required to verify Meta Cloud API.',
-      }));
       return {
         ok: false,
         message: 'Supabase configuration is required before checking Meta Cloud API.',
@@ -2154,8 +2221,8 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     if (res.ok) {
       setBusiness((prev) => ({
         ...prev,
-        metaPhoneNumberId: res.phoneNumberId || cleanPhoneId,
-        metaWabaId: res.wabaId || cleanWabaId,
+        metaPhoneNumberId: res.phoneNumberId?.trim() || cleanPhoneId || prev.metaPhoneNumberId,
+        metaWabaId: res.wabaId?.trim() || cleanWabaId || prev.metaWabaId,
         whatsappPhoneE164: res.displayPhoneNumber || prev.whatsappPhoneE164,
         whatsappDisplayName: res.verifiedName || prev.whatsappDisplayName,
         verifiedName: res.verifiedName || prev.verifiedName,
@@ -2166,19 +2233,18 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         metaConnectionState: 'connected',
         metaLastError: undefined,
       }));
-      if (currentUser?.id) {
-        await loadSupabaseWorkspace(currentUser.id, business.id || undefined);
-      }
+      await refreshWhatsAppAccount();
       return {
         ok: true,
         message: res.message || 'Meta WhatsApp Cloud API connection verified.',
       };
     }
 
+    // Preserve saved credentials on verification failure (never overwrite with empty fields)
     setBusiness((prev) => ({
       ...prev,
-      metaPhoneNumberId: cleanPhoneId,
-      metaWabaId: cleanWabaId,
+      metaPhoneNumberId: prev.metaPhoneNumberId || cleanPhoneId,
+      metaWabaId: prev.metaWabaId || cleanWabaId,
       metaConnectionState: res.connectionStatus ?? 'connection_error',
       metaLastError: res.error || 'Meta WhatsApp connection check failed.',
       messagingMode: res.messagingMode ?? prev.messagingMode,
@@ -2197,29 +2263,38 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     if (!isSupabaseConfigured || !supabase) {
       return { ok: false, message: 'Supabase configuration is required.' };
     }
-    const res = await invokeConnectionCheck({
-      action: 'save_config',
-      phoneNumberId: options.phoneNumberId ?? business.metaPhoneNumberId,
-      wabaId: options.wabaId ?? business.metaWabaId,
+
+    const cleanPhoneId = (options.phoneNumberId ?? business.metaPhoneNumberId).trim();
+    const cleanWabaId = (options.wabaId ?? business.metaWabaId).trim();
+
+    const saveRes = await saveBusinessWhatsAppConfiguration({
+      businessId: business.id,
+      phoneNumberId: cleanPhoneId,
+      wabaId: cleanWabaId,
       messagingMode: options.messagingMode,
       testAllowlist: options.testAllowlist,
       graphApiVersion: options.graphApiVersion ?? business.graphApiVersion,
     });
 
-    if (typeof res.webhookSecretsReady === 'boolean') {
-      setWebhookSecretsReady(res.webhookSecretsReady);
+    if (!saveRes.ok) {
+      return { ok: false, message: saveRes.message };
     }
 
-    if (res.ok) {
-      setBusiness((prev) => ({
-        ...prev,
-        messagingMode: res.messagingMode ?? options.messagingMode,
-        testAllowlist: res.testAllowlist ?? options.testAllowlist,
-        graphApiVersion: res.graphApiVersion ?? prev.graphApiVersion,
-      }));
-      return { ok: true, message: res.message || 'WhatsApp messaging mode updated.' };
-    }
-    return { ok: false, message: res.error || 'Could not save WhatsApp mode settings.' };
+    setBusiness((prev) => ({
+      ...prev,
+      metaPhoneNumberId: saveRes.phoneNumberId || cleanPhoneId,
+      metaWabaId: saveRes.wabaId || cleanWabaId,
+      messagingMode: saveRes.messagingMode ?? options.messagingMode,
+      testAllowlist: saveRes.testAllowlist ?? options.testAllowlist,
+      graphApiVersion: saveRes.graphApiVersion ?? prev.graphApiVersion,
+      metaConnectionState:
+        prev.metaConnectionState === 'not_connected'
+          ? 'configuration_required'
+          : prev.metaConnectionState,
+      metaLastError: undefined,
+    }));
+
+    return { ok: true, message: saveRes.message };
   };
 
   const refreshWebhookDiagnostics = async () => {
@@ -2323,6 +2398,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     updateBusinessProfile,
     verifyMetaConnection,
     saveWhatsAppConfig,
+    refreshWhatsAppAccount,
     refreshWebhookDiagnostics,
     updateBusinessHours,
     markNotificationRead,
