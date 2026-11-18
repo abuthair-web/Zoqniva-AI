@@ -17,6 +17,12 @@ import {
 } from 'lucide-react';
 import { useApp } from '@/context/AppContext';
 import { formatRelativeTime } from '@/lib/phone';
+import {
+  countTemplateVariables,
+  parseTemplateComponents,
+  renderTemplateBodyWithPlaceholders,
+  renderTemplateHeaderTextWithPlaceholders,
+} from '@/lib/templates';
 import type { MessageTemplate, TemplateApprovalStatus, TemplateCategory } from '@/types/crm';
 
 const CATEGORY_LABELS: Record<TemplateCategory, string> = {
@@ -53,6 +59,11 @@ const STATUS_META: Record<
     label: 'Paused',
     textClass: 'text-amber-700',
     note: 'Paused by Meta quality controls.',
+  },
+  DISABLED: {
+    label: 'Disabled',
+    textClass: 'text-slate-500',
+    note: 'Disabled by Meta. This template cannot be sent to customers.',
   },
 };
 
@@ -146,6 +157,12 @@ export function TemplatesPage() {
 
   const isAdmin = currentUser?.role === 'admin';
   const isMetaConnected = business.metaConnectionState === 'connected';
+  const [savingDraft, setSavingDraft] = useState(false);
+
+  const activePreview = useMemo(() => {
+    if (!previewTemplate) return null;
+    return templates.find((t) => t.id === previewTemplate.id) ?? previewTemplate;
+  }, [previewTemplate, templates]);
 
   const statusCounts = useMemo(
     () => ({
@@ -153,6 +170,8 @@ export function TemplatesPage() {
       APPROVED: templates.filter((t) => t.approvalStatus === 'APPROVED').length,
       PENDING: templates.filter((t) => t.approvalStatus === 'PENDING').length,
       REJECTED: templates.filter((t) => t.approvalStatus === 'REJECTED').length,
+      PAUSED: templates.filter((t) => t.approvalStatus === 'PAUSED').length,
+      DISABLED: templates.filter((t) => t.approvalStatus === 'DISABLED').length,
       DRAFT: templates.filter((t) => t.approvalStatus === 'DRAFT').length,
     }),
     [templates]
@@ -194,6 +213,7 @@ export function TemplatesPage() {
   };
 
   const openEditDrawer = (tpl: MessageTemplate) => {
+    if (tpl.approvalStatus !== 'DRAFT' || tpl.metaTemplateId) return;
     setEditingDraft(tpl);
     setDisplayTitle(formatReadableName(tpl.name));
     setTechnicalSlug(tpl.name);
@@ -221,7 +241,7 @@ export function TemplatesPage() {
     setBodyText((prev) => `${prev}${prev.endsWith(' ') || prev === '' ? '' : ' '}${token}`);
   };
 
-  const handleSaveTemplate = (e: React.FormEvent) => {
+  const handleSaveTemplate = async (e: React.FormEvent) => {
     e.preventDefault();
     setFormError(null);
     const cleanName = slugifyTemplateName(technicalSlug || displayTitle);
@@ -233,55 +253,63 @@ export function TemplatesPage() {
       setFormError('Please write the message text customers will see.');
       return;
     }
-    const matches = bodyText.match(/\{\{\d+\}\}/g) ?? [];
-    const variablesCount = new Set(matches).size;
+    const variablesCount = countTemplateVariables(bodyText);
+    setSavingDraft(true);
 
-    if (editingDraft) {
-      updateTemplateDraft(editingDraft.id, {
-        name: cleanName,
-        category,
-        language,
-        headerType: headerText.trim() ? 'TEXT' : 'NONE',
-        headerText: headerText.trim() || undefined,
-        bodyText: bodyText.trim(),
-        footerText: footerText.trim() || undefined,
-        variablesCount,
-      });
-      setPreviewTemplate({
-        ...editingDraft,
-        name: cleanName,
-        category,
-        language,
-        headerType: headerText.trim() ? 'TEXT' : 'NONE',
-        headerText: headerText.trim() || undefined,
-        bodyText: bodyText.trim(),
-        footerText: footerText.trim() || undefined,
-        variablesCount,
-      });
-    } else {
-      const created = createTemplateDraft({
-        name: cleanName,
-        category,
-        language,
-        headerType: headerText.trim() ? 'TEXT' : 'NONE',
-        headerText: headerText.trim() || undefined,
-        bodyText: bodyText.trim(),
-        footerText: footerText.trim() || undefined,
-        buttons: [],
-        variablesCount,
-      });
-      setPreviewTemplate(created);
+    try {
+      if (editingDraft) {
+        const res = await updateTemplateDraft(editingDraft.id, {
+          name: cleanName,
+          category,
+          language,
+          headerType: headerText.trim() ? 'TEXT' : 'NONE',
+          headerText: headerText.trim() || undefined,
+          bodyText: bodyText.trim(),
+          footerText: footerText.trim() || undefined,
+          variablesCount,
+        });
+        if (!res.ok) {
+          setFormError(res.error || 'Could not update template draft.');
+          return;
+        }
+        setPreviewTemplate({
+          ...editingDraft,
+          name: cleanName,
+          category,
+          language,
+          headerType: headerText.trim() ? 'TEXT' : 'NONE',
+          headerText: headerText.trim() || undefined,
+          bodyText: bodyText.trim(),
+          footerText: footerText.trim() || undefined,
+          variablesCount,
+        });
+      } else {
+        const res = await createTemplateDraft({
+          name: cleanName,
+          category,
+          language,
+          headerType: headerText.trim() ? 'TEXT' : 'NONE',
+          headerText: headerText.trim() || undefined,
+          bodyText: bodyText.trim(),
+          footerText: footerText.trim() || undefined,
+          buttons: [],
+          variablesCount,
+        });
+        if (!res.ok || !res.template) {
+          setFormError(res.error || 'Could not save template draft.');
+          return;
+        }
+        setPreviewTemplate(res.template);
+      }
+
+      setDrawerOpen(false);
+    } finally {
+      setSavingDraft(false);
     }
-
-    setDrawerOpen(false);
   };
 
-  const previewBodyWithSamples = (text: string) =>
-    text
-      .replace(/\{\{1\}\}/g, '[Customer Name]')
-      .replace(/\{\{2\}\}/g, '[Order / Reference]')
-      .replace(/\{\{3\}\}/g, '[Courier / Service]')
-      .replace(/\{\{4\}\}/g, '[Date / Time]');
+  const previewBodyWithSamples = (text: string, tpl?: MessageTemplate | null) =>
+    renderTemplateBodyWithPlaceholders(text, tpl?.components);
 
   return (
     <div className="p-4 sm:p-6 pb-20 lg:pb-8 max-w-[1520px] mx-auto space-y-5">
@@ -401,6 +429,12 @@ export function TemplatesPage() {
                   { id: 'APPROVED', label: `Approved (${statusCounts.APPROVED})` },
                   { id: 'PENDING', label: `Pending (${statusCounts.PENDING})` },
                   { id: 'REJECTED', label: `Rejected (${statusCounts.REJECTED})` },
+                  ...(statusCounts.PAUSED > 0
+                    ? [{ id: 'PAUSED' as const, label: `Paused (${statusCounts.PAUSED})` }]
+                    : []),
+                  ...(statusCounts.DISABLED > 0
+                    ? [{ id: 'DISABLED' as const, label: `Disabled (${statusCounts.DISABLED})` }]
+                    : []),
                   { id: 'DRAFT', label: `Drafts (${statusCounts.DRAFT})` },
                 ] as const
               ).map((tab) => (
@@ -464,7 +498,9 @@ export function TemplatesPage() {
                     </div>
                     <span className={`font-semibold shrink-0 ${st.textClass}`}>{st.label}</span>
                   </div>
-                  <p className="text-slate-600 line-clamp-2">{tpl.bodyText}</p>
+                  <p className={tpl.bodyText.trim() ? 'text-slate-600 line-clamp-2' : 'text-slate-400 italic'}>
+                    {tpl.bodyText.trim() || 'Message content has not been synchronized'}
+                  </p>
                   <div className="flex items-center justify-between text-[11px] text-slate-500 pt-2 border-t border-[#E2E8F0]">
                     <span>
                       {CATEGORY_LABELS[tpl.category]} · {tpl.language}
@@ -501,7 +537,16 @@ export function TemplatesPage() {
                   ) : (
                     filteredTemplates.map((tpl) => {
                       const st = STATUS_META[tpl.approvalStatus];
-                      const active = previewTemplate?.id === tpl.id;
+                      const active = activePreview?.id === tpl.id;
+                      const isGenuineDraft = tpl.approvalStatus === 'DRAFT' && !tpl.metaTemplateId;
+                      const syncLabel = tpl.lastSyncedAt
+                        ? formatRelativeTime(tpl.lastSyncedAt)
+                        : isGenuineDraft
+                        ? 'Local draft'
+                        : tpl.updatedAt
+                        ? formatRelativeTime(tpl.updatedAt)
+                        : 'Not synced';
+
                       return (
                         <tr
                           key={tpl.id}
@@ -526,8 +571,17 @@ export function TemplatesPage() {
                           <td className="py-3 px-4 tabular-nums text-slate-600">
                             {tpl.variablesCount}
                           </td>
-                          <td className="py-3 px-4 text-slate-500 tabular-nums">
-                            {tpl.lastSyncedAt ? formatRelativeTime(tpl.lastSyncedAt) : 'Local draft'}
+                          <td
+                            className="py-3 px-4 text-slate-500 tabular-nums"
+                            title={
+                              tpl.lastSyncedAt
+                                ? new Date(tpl.lastSyncedAt).toLocaleString()
+                                : tpl.updatedAt
+                                ? new Date(tpl.updatedAt).toLocaleString()
+                                : undefined
+                            }
+                          >
+                            {syncLabel}
                           </td>
                           <td className="py-3 px-4 text-right whitespace-nowrap">
                             <div className="inline-flex items-center gap-1.5">
@@ -542,7 +596,7 @@ export function TemplatesPage() {
                                 <Eye className="h-3 w-3 text-[#2563EB]" />
                                 Preview
                               </button>
-                              {isAdmin && tpl.approvalStatus === 'DRAFT' && (
+                              {isAdmin && isGenuineDraft && (
                                 <button
                                   type="button"
                                   onClick={(e) => {
@@ -569,142 +623,221 @@ export function TemplatesPage() {
       )}
 
       {/* Right Slide-Over Template Preview Drawer */}
-      {previewTemplate && (
-        <div
-          className="fixed inset-0 z-50 bg-[#0F172A]/40 flex justify-end"
-          onClick={() => setPreviewTemplate(null)}
-        >
-          <div
-            className="w-full max-w-md h-full bg-white border-l border-[#E2E8F0] shadow-2xl flex flex-col"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <div className="px-5 py-4 border-b border-[#E2E8F0] flex items-center justify-between">
-              <div className="min-w-0">
-                <h3 className="font-display text-base font-bold text-[#0F172A] truncate">
-                  {formatReadableName(previewTemplate.name)}
-                </h3>
-                <p className="text-[11px] font-mono text-slate-500 truncate">
-                  {previewTemplate.name}
-                </p>
-              </div>
-              <button
-                type="button"
-                onClick={() => setPreviewTemplate(null)}
-                className="p-1.5 rounded-md text-slate-500 hover:bg-[#F1F5F9] cursor-pointer"
-              >
-                <X className="h-4 w-4" />
-              </button>
-            </div>
+      {activePreview && (() => {
+        const parsedPreview = parseTemplateComponents(activePreview.components, {
+          headerType: activePreview.headerType,
+          headerText: activePreview.headerText,
+          bodyText: activePreview.bodyText,
+          footerText: activePreview.footerText,
+          buttons: activePreview.buttons,
+          variablesCount: activePreview.variablesCount,
+        });
+        const isMetaRecord = Boolean(activePreview.metaTemplateId) || activePreview.approvalStatus !== 'DRAFT';
+        const hasBodyContent = parsedPreview.bodyText.trim().length > 0;
+        const renderedHeader = parsedPreview.headerText
+          ? renderTemplateHeaderTextWithPlaceholders(parsedPreview.headerText, parsedPreview.components)
+          : '';
+        const renderedBody = hasBodyContent
+          ? renderTemplateBodyWithPlaceholders(parsedPreview.bodyText, parsedPreview.components)
+          : '';
+        const syncTimestamp = activePreview.lastSyncedAt || (isMetaRecord ? activePreview.updatedAt : undefined);
 
-            <div className="flex-1 overflow-y-auto p-5 space-y-4 text-xs">
-              <div
-                className={`rounded-lg border px-3.5 py-2.5 flex items-start gap-2.5 ${
-                  previewTemplate.approvalStatus === 'APPROVED'
-                    ? 'border-emerald-200 bg-emerald-50/70 text-emerald-900'
-                    : previewTemplate.approvalStatus === 'PENDING'
-                    ? 'border-amber-200 bg-amber-50/70 text-amber-950'
-                    : previewTemplate.approvalStatus === 'REJECTED'
-                    ? 'border-rose-200 bg-rose-50 text-[#E11D48]'
-                    : 'border-[#E2E8F0] bg-[#F8FAFC] text-slate-700'
-                }`}
-              >
-                {previewTemplate.approvalStatus === 'APPROVED' ? (
-                  <CheckCircle2 className="h-4 w-4 shrink-0 mt-0.5 text-emerald-600" />
-                ) : previewTemplate.approvalStatus === 'PENDING' ? (
-                  <Clock className="h-4 w-4 shrink-0 mt-0.5 text-amber-600" />
-                ) : (
-                  <AlertCircle className="h-4 w-4 shrink-0 mt-0.5" />
-                )}
-                <div>
-                  <p className="font-semibold">
-                    {STATUS_META[previewTemplate.approvalStatus].label}
-                  </p>
-                  <p className="text-[11px] mt-0.5">
-                    {previewTemplate.rejectionReason ||
-                      STATUS_META[previewTemplate.approvalStatus].note}
+        return (
+          <div
+            className="fixed inset-0 z-50 bg-[#0F172A]/40 flex justify-end"
+            onClick={() => setPreviewTemplate(null)}
+          >
+            <div
+              className="w-full max-w-md h-full bg-white border-l border-[#E2E8F0] shadow-2xl flex flex-col"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <div className="px-5 py-4 border-b border-[#E2E8F0] flex items-center justify-between">
+                <div className="min-w-0">
+                  <h3 className="font-display text-base font-bold text-[#0F172A] truncate">
+                    {formatReadableName(activePreview.name)}
+                  </h3>
+                  <p className="text-[11px] font-mono text-slate-500 truncate">
+                    {activePreview.name}
                   </p>
                 </div>
+                <button
+                  type="button"
+                  onClick={() => setPreviewTemplate(null)}
+                  className="p-1.5 rounded-md text-slate-500 hover:bg-[#F1F5F9] cursor-pointer"
+                >
+                  <X className="h-4 w-4" />
+                </button>
               </div>
 
-              <div className="rounded-xl border border-[#E2E8F0] bg-[#F8FAFC] p-4">
-                <p className="text-[11px] font-semibold text-slate-500 mb-2">
-                  WhatsApp Message Preview
-                </p>
-                <div className="rounded-xl border border-[#E2E8F0] bg-white p-4 space-y-2">
-                  {previewTemplate.headerText && (
-                    <p className="font-bold text-[#0F172A]">{previewTemplate.headerText}</p>
+              <div className="flex-1 overflow-y-auto p-5 space-y-4 text-xs">
+                <div
+                  className={`rounded-lg border px-3.5 py-2.5 flex items-start gap-2.5 ${
+                    activePreview.approvalStatus === 'APPROVED'
+                      ? 'border-emerald-200 bg-emerald-50/70 text-emerald-900'
+                      : activePreview.approvalStatus === 'PENDING'
+                      ? 'border-amber-200 bg-amber-50/70 text-amber-950'
+                      : activePreview.approvalStatus === 'REJECTED'
+                      ? 'border-rose-200 bg-rose-50 text-[#E11D48]'
+                      : 'border-[#E2E8F0] bg-[#F8FAFC] text-slate-700'
+                  }`}
+                >
+                  {activePreview.approvalStatus === 'APPROVED' ? (
+                    <CheckCircle2 className="h-4 w-4 shrink-0 mt-0.5 text-emerald-600" />
+                  ) : activePreview.approvalStatus === 'PENDING' ? (
+                    <Clock className="h-4 w-4 shrink-0 mt-0.5 text-amber-600" />
+                  ) : (
+                    <AlertCircle className="h-4 w-4 shrink-0 mt-0.5" />
                   )}
-                  <p className="text-slate-800 whitespace-pre-wrap leading-relaxed">
-                    {previewBodyWithSamples(previewTemplate.bodyText)}
+                  <div>
+                    <p className="font-semibold">
+                      {STATUS_META[activePreview.approvalStatus].label}
+                      <span className="font-normal opacity-80">
+                        {' · '}
+                        {isMetaRecord ? 'Synchronized Meta Template' : 'Local Draft'}
+                      </span>
+                    </p>
+                    <p className="text-[11px] mt-0.5">
+                      {activePreview.rejectionReason ||
+                        STATUS_META[activePreview.approvalStatus].note}
+                    </p>
+                  </div>
+                </div>
+
+                <div className="rounded-xl border border-[#E2E8F0] bg-[#F8FAFC] p-4">
+                  <p className="text-[11px] font-semibold text-slate-500 mb-2">
+                    WhatsApp Message Preview
                   </p>
-                  {previewTemplate.footerText && (
-                    <p className="text-[11px] text-slate-400">{previewTemplate.footerText}</p>
-                  )}
-                  {previewTemplate.buttons.length > 0 && (
-                    <div className="pt-2 border-t border-[#E2E8F0] space-y-1.5">
-                      {previewTemplate.buttons.map((b, i) => (
-                        <div
-                          key={i}
-                          className="text-center py-1.5 rounded-lg bg-[#EFF6FF] font-semibold text-[#2563EB]"
-                        >
-                          {b.text}
+                  <div className="rounded-xl border border-[#E2E8F0] bg-white p-4 space-y-2.5">
+                    {parsedPreview.headerType !== 'NONE' && (
+                      parsedPreview.headerType === 'TEXT' && renderedHeader ? (
+                        <p className="font-bold text-[#0F172A] whitespace-pre-wrap">{renderedHeader}</p>
+                      ) : parsedPreview.headerType !== 'TEXT' ? (
+                        <div className="rounded-lg border border-dashed border-[#E2E8F0] bg-[#F8FAFC] px-3 py-2 text-[11px] font-medium text-slate-600">
+                          {parsedPreview.headerType === 'IMAGE'
+                            ? 'Media Header: Image attachment'
+                            : parsedPreview.headerType === 'DOCUMENT'
+                            ? 'Media Header: Document attachment'
+                            : parsedPreview.headerType === 'VIDEO'
+                            ? 'Media Header: Video attachment'
+                            : 'Header: Location attachment'}
                         </div>
-                      ))}
+                      ) : null
+                    )}
+
+                    {hasBodyContent ? (
+                      <p className="text-slate-800 whitespace-pre-wrap leading-relaxed">
+                        {renderedBody}
+                      </p>
+                    ) : (
+                      <div className="rounded-lg border border-dashed border-amber-200 bg-amber-50/60 p-3 space-y-2 text-center">
+                        <p className="text-slate-700 font-medium">
+                          Message content has not been synchronized
+                        </p>
+                        {isMetaConnected && (
+                          <button
+                            type="button"
+                            disabled={syncing}
+                            onClick={() => void handleMetaSync()}
+                            className="inline-flex items-center gap-1.5 rounded-md border border-[#E2E8F0] bg-white px-3 py-1.5 text-[11px] font-semibold text-[#2563EB] hover:bg-[#EFF6FF] disabled:opacity-50 cursor-pointer"
+                          >
+                            <RefreshCw className={`h-3 w-3 ${syncing ? 'animate-spin' : ''}`} />
+                            <span>{syncing ? 'Syncing...' : 'Sync from Meta'}</span>
+                          </button>
+                        )}
+                      </div>
+                    )}
+
+                    {parsedPreview.footerText && (
+                      <p className="text-[11px] text-slate-400 whitespace-pre-wrap">
+                        {parsedPreview.footerText}
+                      </p>
+                    )}
+
+                    {parsedPreview.buttons.length > 0 && (
+                      <div className="pt-2 border-t border-[#E2E8F0] space-y-1.5">
+                        {parsedPreview.buttons.map((b, i) => (
+                          <div
+                            key={i}
+                            className="text-center py-1.5 px-3 rounded-lg bg-[#EFF6FF] font-semibold text-[#2563EB] flex items-center justify-center gap-1.5"
+                          >
+                            <span>{b.text}</span>
+                            {b.type !== 'QUICK_REPLY' && b.value && (
+                              <span className="text-[10px] font-normal text-slate-500 truncate max-w-[160px]">
+                                ({b.value})
+                              </span>
+                            )}
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                </div>
+
+                <div className="rounded-xl border border-[#E2E8F0] bg-[#F8FAFC] p-3.5 space-y-2 text-[11px]">
+                  <p className="font-bold text-xs text-[#0F172A]">Metadata</p>
+                  <div className="flex justify-between gap-2">
+                    <span className="text-slate-500">Origin</span>
+                    <span className="font-semibold text-[#0F172A]">
+                      {isMetaRecord ? 'Meta WhatsApp Manager' : 'Local Draft (Not on Meta)'}
+                    </span>
+                  </div>
+                  {activePreview.metaTemplateId && (
+                    <div className="flex justify-between gap-2">
+                      <span className="text-slate-500">Meta Template ID</span>
+                      <span className="font-mono text-[#0F172A]">{activePreview.metaTemplateId}</span>
+                    </div>
+                  )}
+                  <div className="flex justify-between gap-2">
+                    <span className="text-slate-500">Category</span>
+                    <span className="font-mono text-[#0F172A]">{activePreview.category}</span>
+                  </div>
+                  <div className="flex justify-between gap-2">
+                    <span className="text-slate-500">Language</span>
+                    <span className="font-mono text-[#0F172A]">{activePreview.language}</span>
+                  </div>
+                  <div className="flex justify-between gap-2">
+                    <span className="text-slate-500">Variables</span>
+                    <span className="tabular-nums text-[#0F172A]">
+                      {parsedPreview.variablesCount}
+                    </span>
+                  </div>
+                  {syncTimestamp && (
+                    <div className="flex justify-between gap-2">
+                      <span className="text-slate-500">Last Synced</span>
+                      <span title={new Date(syncTimestamp).toLocaleString()}>
+                        {formatRelativeTime(syncTimestamp)}
+                      </span>
                     </div>
                   )}
                 </div>
               </div>
 
-              <div className="rounded-xl border border-[#E2E8F0] bg-[#F8FAFC] p-3.5 space-y-2 text-[11px]">
-                <p className="font-bold text-xs text-[#0F172A]">Metadata</p>
-                <div className="flex justify-between">
-                  <span className="text-slate-500">Category</span>
-                  <span className="font-mono text-[#0F172A]">{previewTemplate.category}</span>
-                </div>
-                <div className="flex justify-between">
-                  <span className="text-slate-500">Language</span>
-                  <span className="font-mono text-[#0F172A]">{previewTemplate.language}</span>
-                </div>
-                <div className="flex justify-between">
-                  <span className="text-slate-500">Variables</span>
-                  <span className="tabular-nums text-[#0F172A]">
-                    {previewTemplate.variablesCount}
-                  </span>
-                </div>
-                {previewTemplate.lastSyncedAt && (
-                  <div className="flex justify-between">
-                    <span className="text-slate-500">Last Synced</span>
-                    <span>{formatRelativeTime(previewTemplate.lastSyncedAt)}</span>
-                  </div>
+              <div className="px-5 py-3.5 border-t border-[#E2E8F0] flex items-center justify-end gap-2 bg-[#F8FAFC]">
+                {isAdmin && activePreview.approvalStatus === 'DRAFT' && !activePreview.metaTemplateId && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const tpl = activePreview;
+                      setPreviewTemplate(null);
+                      openEditDrawer(tpl);
+                    }}
+                    className="rounded-lg bg-[#2563EB] px-3.5 py-2 text-xs font-semibold text-white hover:bg-[#1D4ED8] cursor-pointer"
+                  >
+                    Edit Draft
+                  </button>
                 )}
-              </div>
-            </div>
-
-            <div className="px-5 py-3.5 border-t border-[#E2E8F0] flex items-center justify-end gap-2 bg-[#F8FAFC]">
-              {isAdmin && previewTemplate.approvalStatus === 'DRAFT' && (
                 <button
                   type="button"
-                  onClick={() => {
-                    const tpl = previewTemplate;
-                    setPreviewTemplate(null);
-                    openEditDrawer(tpl);
-                  }}
-                  className="rounded-lg bg-[#2563EB] px-3.5 py-2 text-xs font-semibold text-white hover:bg-[#1D4ED8] cursor-pointer"
+                  onClick={() => setPreviewTemplate(null)}
+                  className="rounded-lg border border-[#E2E8F0] bg-white px-3.5 py-2 text-xs font-semibold text-slate-700 cursor-pointer"
                 >
-                  Edit Draft
+                  Close
                 </button>
-              )}
-              <button
-                type="button"
-                onClick={() => setPreviewTemplate(null)}
-                className="rounded-lg border border-[#E2E8F0] bg-white px-3.5 py-2 text-xs font-semibold text-slate-700 cursor-pointer"
-              >
-                Close
-              </button>
+              </div>
             </div>
           </div>
-        </div>
-      )}
+        );
+      })()}
 
       {/* Create / Edit Local Draft Drawer */}
       {drawerOpen && (
@@ -910,25 +1043,30 @@ export function TemplatesPage() {
                 )}
               </div>
 
-              <div className="pt-2 flex justify-end gap-2">
-                <button
-                  type="button"
-                  onClick={() => setDrawerOpen(false)}
-                  className="rounded-lg border border-[#E2E8F0] px-3.5 py-2 font-semibold text-slate-700 hover:bg-[#F1F5F9] cursor-pointer"
-                >
-                  Cancel
-                </button>
-                <button
-                  type="submit"
-                  className="rounded-lg bg-[#2563EB] px-4 py-2 font-semibold text-white hover:bg-[#1D4ED8] cursor-pointer"
-                >
-                  {editingDraft ? 'Save Draft Changes' : 'Save Local Draft'}
-                </button>
-              </div>
-            </form>
+                <div className="pt-2 flex justify-end gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setDrawerOpen(false)}
+                    className="rounded-lg border border-[#E2E8F0] px-3.5 py-2 font-semibold text-slate-700 hover:bg-[#F1F5F9] cursor-pointer"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="submit"
+                    disabled={savingDraft}
+                    className="rounded-lg bg-[#2563EB] px-4 py-2 font-semibold text-white hover:bg-[#1D4ED8] disabled:opacity-50 cursor-pointer"
+                  >
+                    {savingDraft
+                      ? 'Saving...'
+                      : editingDraft
+                      ? 'Save Draft Changes'
+                      : 'Save Local Draft'}
+                  </button>
+                </div>
+              </form>
+            </div>
           </div>
-        </div>
-      )}
+        )}
     </div>
   );
 }

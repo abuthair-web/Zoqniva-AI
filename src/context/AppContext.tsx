@@ -14,6 +14,7 @@ import {
   supabase,
   supabaseConfigError,
 } from '@/lib/supabase';
+import { buildComponentsFromDraftFields, mapDbTemplateRow } from '@/lib/templates';
 import {
   extractWhatsAppPhoneNumberId,
   extractWhatsAppWabaId,
@@ -27,6 +28,8 @@ import {
   mapDbMessageRow,
   normalizeWhatsAppConnectionStatus,
   saveBusinessWhatsAppConfiguration,
+  saveLocalTemplateDraftToDb,
+  updateLocalTemplateDraftInDb,
 } from '@/services/whatsappService';
 import {
   fetchAdminTeamDirectory,
@@ -203,8 +206,13 @@ interface AppContextValue {
   }) => Campaign;
   duplicateCampaign: (id: string) => Campaign | null;
   updateCampaignStatus: (id: string, status: Campaign['status']) => void;
-  createTemplateDraft: (input: Omit<MessageTemplate, 'id' | 'approvalStatus'>) => MessageTemplate;
-  updateTemplateDraft: (id: string, updates: Partial<MessageTemplate>) => void;
+  createTemplateDraft: (
+    input: Omit<MessageTemplate, 'id' | 'approvalStatus'>
+  ) => Promise<{ ok: boolean; template?: MessageTemplate; error?: string }>;
+  updateTemplateDraft: (
+    id: string,
+    updates: Partial<MessageTemplate>
+  ) => Promise<{ ok: boolean; error?: string }>;
   syncTemplatesFromMeta: () => Promise<{ ok: boolean; message: string }>;
 
   // Automations
@@ -648,21 +656,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       }
 
       setTemplates(
-        (tplsRes.data ?? []).map((t: Record<string, unknown>) => ({
-          id: String(t.id),
-          name: String(t.name),
-          category: (t.category as MessageTemplate['category']) ?? 'UTILITY',
-          language: String(t.language ?? 'en_US'),
-          headerType: (t.header_type as MessageTemplate['headerType']) ?? 'NONE',
-          headerText: t.header_text ? String(t.header_text) : undefined,
-          bodyText: String(t.body_text ?? ''),
-          footerText: t.footer_text ? String(t.footer_text) : undefined,
-          buttons: Array.isArray(t.buttons) ? (t.buttons as MessageTemplate['buttons']) : [],
-          variablesCount: Number(t.variables_count ?? 0),
-          approvalStatus: (t.approval_status as MessageTemplate['approvalStatus']) ?? 'DRAFT',
-          rejectionReason: t.rejection_reason ? String(t.rejection_reason) : undefined,
-          lastSyncedAt: t.last_synced_at ? String(t.last_synced_at) : undefined,
-        }))
+        (tplsRes.data ?? []).map((t) => mapDbTemplateRow(t as Record<string, unknown>))
       );
 
       setCampaigns(
@@ -2013,23 +2007,121 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     setCampaigns((prev) => prev.map((c) => (c.id === id ? { ...c, status } : c)));
   };
 
-  const createTemplateDraft = (
-    input: Omit<MessageTemplate, 'id' | 'approvalStatus'>
-  ): MessageTemplate => {
+  const createTemplateDraft: AppContextValue['createTemplateDraft'] = async (input) => {
+    const duplicate = templates.find(
+      (t) => t.name === input.name && t.language === input.language
+    );
+    if (duplicate) {
+      return {
+        ok: false,
+        error: `A template named "${input.name}" (${input.language}) already exists in this workspace.`,
+      };
+    }
+
+    const components = buildComponentsFromDraftFields({
+      headerType: input.headerType,
+      headerText: input.headerText,
+      bodyText: input.bodyText,
+      footerText: input.footerText,
+      buttons: input.buttons,
+    });
+    const draftId = crypto.randomUUID();
+    const nowIso = new Date().toISOString();
+
     const draft: MessageTemplate = {
       ...input,
-      id: `tpl-${Date.now()}`,
+      id: draftId,
+      metaTemplateId: null,
+      components,
       approvalStatus: 'DRAFT',
+      isLocalDraft: true,
+      updatedAt: nowIso,
     };
+
+    if (supabase && isSupabaseConfigured && UUID_REGEX.test(business.id)) {
+      const saved = await saveLocalTemplateDraftToDb({
+        id: draftId,
+        businessId: business.id,
+        name: draft.name,
+        category: draft.category,
+        language: draft.language,
+        headerType: draft.headerType,
+        headerText: draft.headerText,
+        bodyText: draft.bodyText,
+        footerText: draft.footerText,
+        buttons: draft.buttons,
+        components,
+        variablesCount: draft.variablesCount,
+        createdBy: currentUser?.id ?? null,
+      });
+      if (!saved.ok) {
+        return { ok: false, error: saved.error || 'Could not save template draft to database.' };
+      }
+      const mapped = saved.row ? mapDbTemplateRow(saved.row) : draft;
+      setTemplates((prev) => [mapped, ...prev]);
+      appendAudit('Created Template Draft', 'template', mapped.name);
+      return { ok: true, template: mapped };
+    }
+
     setTemplates((prev) => [draft, ...prev]);
     appendAudit('Created Template Draft', 'template', draft.name);
-    return draft;
+    return { ok: true, template: draft };
   };
 
-  const updateTemplateDraft = (id: string, updates: Partial<MessageTemplate>) => {
+  const updateTemplateDraft: AppContextValue['updateTemplateDraft'] = async (id, updates) => {
+    const target = templates.find((t) => t.id === id);
+    if (!target || target.approvalStatus !== 'DRAFT' || target.metaTemplateId) {
+      return { ok: false, error: 'Only local drafts can be edited here.' };
+    }
+
+    const nextHeaderType = updates.headerType ?? target.headerType;
+    const nextHeaderText =
+      updates.headerText !== undefined ? updates.headerText : target.headerText;
+    const nextBodyText = updates.bodyText !== undefined ? updates.bodyText : target.bodyText;
+    const nextFooterText =
+      updates.footerText !== undefined ? updates.footerText : target.footerText;
+    const nextButtons = updates.buttons ?? target.buttons;
+    const nextComponents = buildComponentsFromDraftFields({
+      headerType: nextHeaderType,
+      headerText: nextHeaderText,
+      bodyText: nextBodyText,
+      footerText: nextFooterText,
+      buttons: nextButtons,
+    });
+
+    if (supabase && isSupabaseConfigured && UUID_REGEX.test(business.id) && UUID_REGEX.test(id)) {
+      const saved = await updateLocalTemplateDraftInDb({
+        id,
+        businessId: business.id,
+        name: updates.name,
+        category: updates.category,
+        language: updates.language,
+        headerType: nextHeaderType,
+        headerText: nextHeaderText,
+        bodyText: nextBodyText,
+        footerText: nextFooterText,
+        buttons: nextButtons,
+        components: nextComponents,
+        variablesCount: updates.variablesCount,
+      });
+      if (!saved.ok) {
+        return { ok: false, error: saved.error || 'Failed to update local draft.' };
+      }
+    }
+
     setTemplates((prev) =>
-      prev.map((t) => (t.id === id && t.approvalStatus === 'DRAFT' ? { ...t, ...updates } : t))
+      prev.map((t) =>
+        t.id === id && t.approvalStatus === 'DRAFT' && !t.metaTemplateId
+          ? {
+              ...t,
+              ...updates,
+              components: nextComponents,
+              updatedAt: new Date().toISOString(),
+            }
+          : t
+      )
     );
+    return { ok: true };
   };
 
   const syncTemplatesFromMeta = async (): Promise<{ ok: boolean; message: string }> => {
@@ -2042,7 +2134,15 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     if (supabase && isSupabaseConfigured) {
       const res = await invokeSyncTemplates();
       if (!res.ok) {
-        return { ok: false, message: res.error || 'Could not sync templates from Meta.' };
+        const detail = res.errors?.length
+          ? ` (${res.errors.map((e) => `${e.name}: ${e.error}`).join('; ')})`
+          : res.diagnostic
+          ? ` (${res.diagnostic})`
+          : '';
+        return {
+          ok: false,
+          message: `${res.error || 'Could not sync templates from Meta.'}${detail}`,
+        };
       }
       if (currentUser?.id) {
         await loadSupabaseWorkspace(currentUser.id, business.id, {
@@ -2051,7 +2151,21 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           fullName: currentUser.fullName,
         });
       }
-      return { ok: true, message: `Synced ${res.templatesCount} template(s) from Meta.` };
+      const parts = [
+        `Synced ${res.synced} of ${res.totalFromMeta} template(s) from Meta.`,
+      ];
+      if (res.skipped > 0) {
+        const skipNotes = res.skippedItems?.map((s) => `${s.name} (${s.language})`).join(', ');
+        parts.push(
+          `${res.skipped} skipped${skipNotes ? `: ${skipNotes}` : ''}.`
+        );
+      }
+      if (res.errors && res.errors.length > 0) {
+        parts.push(
+          `${res.errors.length} failed (${res.errors.map((e) => `${e.name}: ${e.error}`).join('; ')}).`
+        );
+      }
+      return { ok: true, message: parts.join(' ') };
     }
     return {
       ok: false,

@@ -133,22 +133,54 @@ export interface Conversation {
 }
 
 export type TemplateCategory = 'MARKETING' | 'UTILITY' | 'AUTHENTICATION';
-export type TemplateApprovalStatus = 'DRAFT' | 'PENDING' | 'APPROVED' | 'REJECTED' | 'PAUSED';
+export type TemplateApprovalStatus =
+  | 'DRAFT'
+  | 'PENDING'
+  | 'APPROVED'
+  | 'REJECTED'
+  | 'PAUSED'
+  | 'DISABLED';
+
+export interface TemplateComponent {
+  type: string;
+  format?: string;
+  text?: string;
+  example?: {
+    header_text?: string[];
+    header_handle?: string[];
+    body_text?: string[][];
+    body_text_named_params?: Array<{ param_name?: string; example?: string }>;
+    [key: string]: unknown;
+  };
+  buttons?: Array<{
+    type?: string;
+    text?: string;
+    url?: string;
+    phone_number?: string;
+    example?: string[];
+    [key: string]: unknown;
+  }>;
+  [key: string]: unknown;
+}
 
 export interface MessageTemplate {
   id: string;
+  metaTemplateId?: string | null;
   name: string;
   category: TemplateCategory;
   language: string;
-  headerType: 'NONE' | 'TEXT' | 'IMAGE' | 'DOCUMENT';
+  headerType: 'NONE' | 'TEXT' | 'IMAGE' | 'DOCUMENT' | 'VIDEO' | 'LOCATION';
   headerText?: string;
   bodyText: string;
   footerText?: string;
   buttons: Array<{ type: 'QUICK_REPLY' | 'URL' | 'PHONE_NUMBER'; text: string; value?: string }>;
+  components?: TemplateComponent[];
   variablesCount: number;
   approvalStatus: TemplateApprovalStatus;
   rejectionReason?: string;
   lastSyncedAt?: string;
+  updatedAt?: string;
+  isLocalDraft?: boolean;
 }
 
 export type CampaignStatus =

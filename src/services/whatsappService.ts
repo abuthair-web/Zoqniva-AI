@@ -2,10 +2,13 @@ import { supabase } from '@/lib/supabase';
 import type {
   DeliveryStatus,
   Message,
+  MessageTemplate,
   MessageType,
   MessagingMode,
   MetaConnectionState,
   TeamMember,
+  TemplateCategory,
+  TemplateComponent,
   WebhookEventSummary,
 } from '@/types/crm';
 
@@ -264,13 +267,29 @@ export async function fetchRecentWebhookEvents(
   }));
 }
 
-export async function invokeSyncTemplates(): Promise<{
+export interface SyncTemplatesServiceResult {
   ok: boolean;
+  totalFromMeta: number;
+  synced: number;
+  skipped: number;
   templatesCount: number;
+  syncedAt?: string;
+  skippedItems?: Array<{ name: string; language: string; reason: string }>;
+  errors?: Array<{ name: string; language: string; error: string }>;
   error?: string;
-}> {
+  diagnostic?: string;
+}
+
+export async function invokeSyncTemplates(): Promise<SyncTemplatesServiceResult> {
   if (!supabase) {
-    return { ok: false, templatesCount: 0, error: 'Supabase client is not configured.' };
+    return {
+      ok: false,
+      totalFromMeta: 0,
+      synced: 0,
+      skipped: 0,
+      templatesCount: 0,
+      error: 'Supabase client is not configured.',
+    };
   }
 
   const { data, error } = await supabase.functions.invoke('sync-templates', {
@@ -281,19 +300,223 @@ export async function invokeSyncTemplates(): Promise<{
     const errBody = await extractFunctionErrorPayload(error);
     return {
       ok: false,
+      totalFromMeta: Number(errBody?.totalFromMeta ?? 0),
+      synced: Number(errBody?.synced ?? 0),
+      skipped: Number(errBody?.skipped ?? 0),
       templatesCount: 0,
+      skippedItems: Array.isArray(errBody?.skippedItems)
+        ? (errBody.skippedItems as Array<{ name: string; language: string; reason: string }>)
+        : undefined,
+      errors: Array.isArray(errBody?.errors)
+        ? (errBody.errors as Array<{ name: string; language: string; error: string }>)
+        : undefined,
       error: errBody?.error
         ? String(errBody.error)
         : (error as Error).message || 'Could not sync WhatsApp templates from Meta.',
+      diagnostic: errBody?.diagnostic ? String(errBody.diagnostic) : undefined,
     };
   }
 
   const payload = (data ?? {}) as Record<string, unknown>;
+  const synced = Number(payload.synced ?? payload.templatesCount ?? 0);
+  const totalFromMeta = Number(payload.totalFromMeta ?? synced);
+  const skipped = Number(payload.skipped ?? 0);
+
   return {
     ok: Boolean(payload.ok),
-    templatesCount: Number(payload.templatesCount ?? 0),
+    totalFromMeta,
+    synced,
+    skipped,
+    templatesCount: synced,
+    syncedAt: payload.syncedAt ? String(payload.syncedAt) : undefined,
+    skippedItems: Array.isArray(payload.skippedItems)
+      ? (payload.skippedItems as Array<{ name: string; language: string; reason: string }>)
+      : undefined,
+    errors: Array.isArray(payload.errors)
+      ? (payload.errors as Array<{ name: string; language: string; error: string }>)
+      : undefined,
     error: payload.error ? String(payload.error) : undefined,
+    diagnostic: payload.diagnostic ? String(payload.diagnostic) : undefined,
   };
+}
+
+let cachedTemplateColumns: Set<string> | null = null;
+
+const TEMPLATE_COL_CANDIDATES = [
+  'id',
+  'business_id',
+  'meta_template_id',
+  'name',
+  'language',
+  'category',
+  'status',
+  'approval_status',
+  'components',
+  'header_type',
+  'header_text',
+  'body_text',
+  'footer_text',
+  'buttons',
+  'variables_count',
+  'rejection_reason',
+  'last_synced_at',
+  'created_by',
+  'created_at',
+  'updated_at',
+] as const;
+
+async function detectTemplateTableColumns(): Promise<Set<string>> {
+  if (cachedTemplateColumns && cachedTemplateColumns.size > 0) {
+    return cachedTemplateColumns;
+  }
+  const cols = new Set<string>();
+  if (!supabase) return cols;
+
+  try {
+    const { data: sample } = await supabase.from('templates').select('*').limit(1).maybeSingle();
+    if (sample && typeof sample === 'object') {
+      for (const k of Object.keys(sample as Record<string, unknown>)) {
+        cols.add(k);
+      }
+      if (cols.size > 0) {
+        cachedTemplateColumns = cols;
+        return cols;
+      }
+    }
+  } catch {
+    // Fall through to column probe when table is empty
+  }
+
+  const client = supabase;
+  await Promise.all(
+    TEMPLATE_COL_CANDIDATES.map(async (col) => {
+      try {
+        const { error } = await client.from('templates').select(col).limit(0);
+        if (!error) cols.add(col);
+      } catch {
+        // Ignore probe failures
+      }
+    })
+  );
+  if (cols.size > 0) {
+    cachedTemplateColumns = cols;
+  }
+  return cols;
+}
+
+export async function saveLocalTemplateDraftToDb(params: {
+  id: string;
+  businessId: string;
+  name: string;
+  category: TemplateCategory;
+  language: string;
+  headerType: MessageTemplate['headerType'];
+  headerText?: string;
+  bodyText: string;
+  footerText?: string;
+  buttons: MessageTemplate['buttons'];
+  components: TemplateComponent[];
+  variablesCount: number;
+  createdBy?: string | null;
+}): Promise<{ ok: boolean; row?: Record<string, unknown>; error?: string }> {
+  if (!supabase || !UUID_REGEX.test(params.businessId)) {
+    return { ok: false, error: 'Supabase workspace is not active.' };
+  }
+
+  const cols = await detectTemplateTableColumns();
+  const payload: Record<string, unknown> = {
+    id: params.id,
+    business_id: params.businessId,
+    name: params.name,
+    language: params.language,
+    category: params.category,
+  };
+
+  if (cols.has('meta_template_id')) payload.meta_template_id = null;
+  if (cols.has('status') || cols.size === 0) payload.status = 'draft';
+  if (cols.has('approval_status')) payload.approval_status = 'DRAFT';
+  if (cols.has('components') || cols.size === 0) payload.components = params.components;
+  if (cols.has('header_type')) payload.header_type = params.headerType;
+  if (cols.has('header_text')) payload.header_text = params.headerText ?? null;
+  if (cols.has('body_text')) payload.body_text = params.bodyText;
+  if (cols.has('footer_text')) payload.footer_text = params.footerText ?? null;
+  if (cols.has('buttons')) payload.buttons = params.buttons;
+  if (cols.has('variables_count')) payload.variables_count = params.variablesCount;
+  if (cols.has('created_by') && params.createdBy) payload.created_by = params.createdBy;
+
+  let { data, error } = await supabase
+    .from('templates')
+    .insert(payload)
+    .select('*')
+    .maybeSingle();
+
+  if (error && error.code === '23514' && error.message.includes('category')) {
+    payload.category = params.category.toLowerCase();
+    const retry = await supabase.from('templates').insert(payload).select('*').maybeSingle();
+    data = retry.data;
+    error = retry.error;
+  }
+
+  if (error) {
+    return { ok: false, error: error.message };
+  }
+  return { ok: true, row: (data as Record<string, unknown> | null) ?? undefined };
+}
+
+export async function updateLocalTemplateDraftInDb(params: {
+  id: string;
+  businessId: string;
+  name?: string;
+  category?: TemplateCategory;
+  language?: string;
+  headerType?: MessageTemplate['headerType'];
+  headerText?: string;
+  bodyText?: string;
+  footerText?: string;
+  buttons?: MessageTemplate['buttons'];
+  components?: TemplateComponent[];
+  variablesCount?: number;
+}): Promise<{ ok: boolean; error?: string }> {
+  if (!supabase || !UUID_REGEX.test(params.businessId) || !UUID_REGEX.test(params.id)) {
+    return { ok: false, error: 'Supabase template ID is not active.' };
+  }
+
+  const cols = await detectTemplateTableColumns();
+  const patch: Record<string, unknown> = {};
+  if (params.name !== undefined) patch.name = params.name;
+  if (params.category !== undefined) patch.category = params.category;
+  if (params.language !== undefined) patch.language = params.language;
+  if (cols.has('components') && params.components !== undefined) patch.components = params.components;
+  if (cols.has('header_type') && params.headerType !== undefined) patch.header_type = params.headerType;
+  if (cols.has('header_text') && params.headerText !== undefined) {
+    patch.header_text = params.headerText || null;
+  }
+  if (cols.has('body_text') && params.bodyText !== undefined) patch.body_text = params.bodyText;
+  if (cols.has('footer_text') && params.footerText !== undefined) {
+    patch.footer_text = params.footerText || null;
+  }
+  if (cols.has('buttons') && params.buttons !== undefined) patch.buttons = params.buttons;
+  if (cols.has('variables_count') && params.variablesCount !== undefined) {
+    patch.variables_count = params.variablesCount;
+  }
+
+  if (Object.keys(patch).length === 0) return { ok: true };
+
+  // Never allow updating a non-draft template
+  let query = supabase
+    .from('templates')
+    .update(patch)
+    .eq('id', params.id)
+    .eq('business_id', params.businessId);
+  if (cols.has('meta_template_id')) {
+    query = query.is('meta_template_id', null);
+  }
+
+  const { error } = await query;
+  if (error) {
+    return { ok: false, error: error.message };
+  }
+  return { ok: true };
 }
 
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
