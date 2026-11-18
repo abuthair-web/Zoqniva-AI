@@ -103,16 +103,20 @@ Deno.serve(async (req: Request) => {
       return jsonResponse({ ok: false, error: 'Invalid session' }, 401);
     }
 
-    const { data: member } = await serviceClient
+    const { data: member, error: memberErr } = await serviceClient
       .from('business_members')
-      .select('business_id, role, status')
+      .select('business_id, role, is_active')
       .eq('user_id', userRes.user.id)
-      .eq('status', 'active')
+      .eq('is_active', true)
       .eq('role', 'admin')
       .limit(1)
       .maybeSingle();
 
-    if (!member) {
+    if (memberErr) {
+      return jsonResponse({ ok: false, error: 'Failed to verify administrator membership.' }, 500);
+    }
+
+    if (!member || member.is_active !== true || member.role !== 'admin') {
       return jsonResponse({ ok: false, error: 'Only admins can sync templates.' }, 403);
     }
 

@@ -384,11 +384,12 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       if (!businessId) {
         const { data: memberRows } = await client
           .from('business_members')
-          .select('*')
-          .eq('user_id', userId);
+          .select('business_id, role, is_active')
+          .eq('user_id', userId)
+          .eq('is_active', true);
 
         const activeRow = ((memberRows ?? []) as Array<Record<string, unknown>>).find(
-          (m) => !m.status || m.status === 'active'
+          (m) => m.is_active === true
         );
         businessId = activeRow?.business_id ? String(activeRow.business_id) : undefined;
       }
@@ -537,7 +538,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           fullName: String(prof?.full_name ?? 'Team Member'),
           email: String(prof?.email ?? ''),
           role: (m.role as StaffRole) ?? 'agent',
-          status: (m.status as 'active' | 'invited' | 'suspended') ?? 'active',
+          status: m.is_active === false ? 'suspended' : 'active',
           jobTitle: String(m.job_title ?? ''),
           activeConversations: convList.filter(
             (cv) => cv.assignedToId === profileId && cv.status !== 'resolved'
@@ -742,9 +743,9 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
       const rows = (memberRows ?? []) as Array<Record<string, unknown>>;
 
-      const activeMember = rows.find((m) => !m.status || m.status === 'active');
+      const activeMember = rows.find((m) => m.is_active === true);
       if (!activeMember) {
-        const suspended = rows.some((m) => m.status === 'suspended');
+        const suspended = rows.some((m) => m.is_active === false);
         setCurrentUser(null);
         resetWorkspaceState();
 

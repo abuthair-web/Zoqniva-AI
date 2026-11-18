@@ -458,17 +458,17 @@ export async function saveBusinessWhatsAppConfiguration(params: {
 
   const { data: memberRow, error: memberErr } = await supabase
     .from('business_members')
-    .select('role, status')
+    .select('role, is_active')
     .eq('business_id', cleanBusinessId)
     .eq('user_id', userRes.user.id)
+    .eq('is_active', true)
     .maybeSingle();
 
   if (memberErr) {
     return { ok: false, message: `Unable to verify administrator permissions: ${memberErr.message}` };
   }
 
-  const memberStatus = memberRow?.status ? String(memberRow.status) : 'active';
-  if (!memberRow || memberStatus !== 'active' || memberRow.role !== 'admin') {
+  if (!memberRow || memberRow.is_active !== true || memberRow.role !== 'admin') {
     return {
       ok: false,
       message: 'Only active business administrators can save WhatsApp configuration.',

@@ -368,14 +368,31 @@ Deno.serve(async (req: Request) => {
     const businessId = String(conversation.business_id);
 
     // 4. Verify active business membership & authorization (admin or assigned/unassigned agent)
-    const { data: membership } = await serviceClient
+    const { data: membership, error: membershipErr } = await serviceClient
       .from('business_members')
-      .select('role, status')
+      .select('role, is_active')
       .eq('business_id', businessId)
       .eq('user_id', callerId)
+      .eq('is_active', true)
       .maybeSingle();
 
-    if (!membership || membership.status !== 'active' || (membership.role !== 'admin' && membership.role !== 'agent')) {
+    if (membershipErr) {
+      logEvent('permission_error', 'error', 'Failed to verify business membership', {
+        callerId,
+        businessId,
+        error: membershipErr.message,
+      });
+      return jsonResponse(
+        { ok: false, code: 'MEMBERSHIP_CHECK_FAILED', error: 'Failed to verify workspace permissions.' },
+        500
+      );
+    }
+
+    if (
+      !membership ||
+      membership.is_active !== true ||
+      (membership.role !== 'admin' && membership.role !== 'agent')
+    ) {
       logEvent('permission_error', 'warn', 'Unauthorized send attempt', { callerId, businessId });
       return jsonResponse({ ok: false, code: 'FORBIDDEN', error: 'You are not authorized for this workspace.' }, 403);
     }

@@ -160,14 +160,17 @@ Deno.serve(async (req: Request) => {
     // Strict active Admin authorization check BEFORE accessing/modifying account metadata
     const { data: memberRows, error: memberErr } = await serviceClient
       .from('business_members')
-      .select('business_id, role, status')
-      .eq('user_id', userRes.user.id);
+      .select('business_id, role, is_active')
+      .eq('user_id', userRes.user.id)
+      .eq('is_active', true);
 
     if (memberErr) {
       return jsonResponse({ ok: false, error: 'Failed to verify business membership' }, 500);
     }
 
-    const activeAdmin = (memberRows ?? []).find((m) => m.status === 'active' && m.role === 'admin');
+    const activeAdmin = (memberRows ?? []).find(
+      (m) => m.is_active === true && m.role === 'admin'
+    );
     if (!activeAdmin) {
       logEvent('permission_error', 'warn', 'Non-admin attempted WhatsApp connection check', {
         userId: userRes.user.id,

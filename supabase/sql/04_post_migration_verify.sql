@@ -124,8 +124,8 @@ ORDER BY tablename;
 SELECT
   b.id AS business_id,
   b.name AS business_name,
-  count(bm.id) FILTER (WHERE bm.status = 'active' AND bm.role = 'admin') AS active_admins,
-  count(bm.id) FILTER (WHERE bm.status = 'active') AS total_active_members
+  count(bm.id) FILTER (WHERE bm.is_active = TRUE AND bm.role = 'admin') AS active_admins,
+  count(bm.id) FILTER (WHERE bm.is_active = TRUE) AS total_active_members
 FROM public.businesses b
 LEFT JOIN public.business_members bm ON bm.business_id = b.id
 GROUP BY b.id, b.name

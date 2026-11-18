@@ -148,8 +148,8 @@ ORDER BY schemaname, tablename;
 -- 10. Non-sensitive row counts & active workspace integrity summary
 SELECT
   (SELECT count(*) FROM public.businesses) AS businesses_count,
-  (SELECT count(*) FROM public.business_members WHERE status = 'active' AND role = 'admin') AS active_admins_count,
-  (SELECT count(*) FROM public.business_members WHERE status = 'active') AS active_members_count,
+  (SELECT count(*) FROM public.business_members WHERE is_active = TRUE AND role = 'admin') AS active_admins_count,
+  (SELECT count(*) FROM public.business_members WHERE is_active = TRUE) AS active_members_count,
   (SELECT count(*) FROM public.whatsapp_accounts) AS whatsapp_accounts_count,
   (SELECT count(*) FROM public.contacts) AS contacts_count,
   (SELECT count(*) FROM public.conversations) AS conversations_count,
