@@ -4,7 +4,8 @@
 
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
 
-const VALID_GRAPH_VERSION = /^v(1[89]|2[0-3])\.0$/;
+const VALID_GRAPH_VERSION = /^v(1[89]|2[0-9])\.0$/;
+const DEFAULT_GRAPH_VERSION = 'v25.0';
 const MAX_TEMPLATE_PAGES = 10;
 
 const corsHeaders = {
@@ -22,8 +23,10 @@ function jsonResponse(body: Record<string, unknown>, status = 200): Response {
 
 function resolveGraphApiVersion(requested?: string | null): string {
   const envVer = Deno.env.get('META_GRAPH_API_VERSION')?.trim();
-  const candidate = requested?.trim() || envVer || 'v21.0';
-  return VALID_GRAPH_VERSION.test(candidate) ? candidate : 'v21.0';
+  if (envVer && VALID_GRAPH_VERSION.test(envVer)) return envVer;
+  const candidate = requested?.trim();
+  if (candidate && VALID_GRAPH_VERSION.test(candidate)) return candidate;
+  return DEFAULT_GRAPH_VERSION;
 }
 
 function classifyMetaError(httpStatus: number, metaPayload: Record<string, unknown> | null) {
@@ -81,7 +84,11 @@ Deno.serve(async (req: Request) => {
 
   try {
     const authHeader = req.headers.get('Authorization');
-    if (!authHeader) {
+    if (!authHeader || !authHeader.toLowerCase().startsWith('bearer ')) {
+      return jsonResponse({ ok: false, error: 'Unauthorized' }, 401);
+    }
+    const jwt = authHeader.replace(/^Bearer\s+/i, '').trim();
+    if (!jwt) {
       return jsonResponse({ ok: false, error: 'Unauthorized' }, 401);
     }
 
@@ -98,7 +105,7 @@ Deno.serve(async (req: Request) => {
     });
     const serviceClient = createClient(supabaseUrl, supabaseServiceKey);
 
-    const { data: userRes, error: userErr } = await userClient.auth.getUser();
+    const { data: userRes, error: userErr } = await userClient.auth.getUser(jwt);
     if (userErr || !userRes.user) {
       return jsonResponse({ ok: false, error: 'Invalid session' }, 401);
     }

@@ -15,7 +15,7 @@ export const EMPTY_BUSINESS_PROFILE: BusinessProfile = {
   metaLastError: undefined,
   messagingMode: 'test',
   testAllowlist: [],
-  graphApiVersion: 'v21.0',
+  graphApiVersion: 'v25.0',
   verifiedName: undefined,
   qualityRating: 'unknown',
   webhookVerifiedAt: undefined,

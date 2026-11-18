@@ -2,9 +2,9 @@ export type StaffRole = 'admin' | 'agent';
 
 export type MetaConnectionState =
   | 'not_connected'
-  | 'configuration_required'
+  | 'connecting'
   | 'connected'
-  | 'connection_error';
+  | 'error';
 
 export type MessagingMode = 'test' | 'live';
 

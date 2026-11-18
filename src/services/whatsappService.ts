@@ -93,6 +93,14 @@ export interface ConnectionCheckResponse {
   diagnostic?: string;
 }
 
+export function normalizeWhatsAppConnectionStatus(raw: unknown): MetaConnectionState {
+  const val = typeof raw === 'string' ? raw.trim().toLowerCase() : '';
+  if (val === 'connected') return 'connected';
+  if (val === 'connecting') return 'connecting';
+  if (val === 'error' || val === 'connection_error') return 'error';
+  return 'not_connected';
+}
+
 export async function invokeConnectionCheck(params: {
   action: 'verify' | 'save_config';
   phoneNumberId?: string;
@@ -113,7 +121,9 @@ export async function invokeConnectionCheck(params: {
     const errBody = await extractFunctionErrorPayload(error);
     return {
       ok: false,
-      connectionStatus: (errBody?.connectionStatus as MetaConnectionState) ?? 'connection_error',
+      connectionStatus: errBody?.connectionStatus
+        ? normalizeWhatsAppConnectionStatus(errBody.connectionStatus)
+        : 'error',
       errorCode: errBody?.errorCode ? String(errBody.errorCode) : 'EDGE_FUNCTION_ERROR',
       error: errBody?.error
         ? String(errBody.error)
@@ -129,7 +139,13 @@ export async function invokeConnectionCheck(params: {
     };
   }
 
-  return (data ?? { ok: false, error: 'Empty response from server.' }) as ConnectionCheckResponse;
+  const parsed = (data ?? { ok: false, error: 'Empty response from server.' }) as ConnectionCheckResponse;
+  return {
+    ...parsed,
+    connectionStatus: parsed.connectionStatus
+      ? normalizeWhatsAppConnectionStatus(parsed.connectionStatus)
+      : undefined,
+  };
 }
 
 export interface SendMessageServiceResult {
@@ -341,36 +357,67 @@ export function extractWhatsAppWabaId(row?: Record<string, unknown> | null): str
 export async function detectWhatsAppAccountColumns(
   seedRow?: Record<string, unknown> | null
 ): Promise<Set<string>> {
+  if (seedRow && Object.keys(seedRow).length > 0) {
+    const cols = new Set<string>(Object.keys(seedRow));
+    cachedWhatsAppColumns = cols;
+    return cols;
+  }
+
   if (cachedWhatsAppColumns && cachedWhatsAppColumns.size > 0) {
-    if (seedRow) {
-      for (const k of Object.keys(seedRow)) cachedWhatsAppColumns.add(k);
-    }
     return cachedWhatsAppColumns;
   }
 
   const detected = new Set<string>();
-  if (seedRow) {
-    for (const k of Object.keys(seedRow)) detected.add(k);
-  }
-
   if (!supabase) return detected;
   const client = supabase;
 
-  const probeList = [
-    ...PHONE_ID_COLUMN_CANDIDATES,
-    ...WABA_ID_COLUMN_CANDIDATES,
-    ...METADATA_COLUMN_CANDIDATES,
-  ].filter((col) => !detected.has(col));
+  // Try reading any existing row first to discover columns in 1 clean query (zero 400 probes)
+  try {
+    const { data: sampleRow } = await client
+      .from('whatsapp_accounts')
+      .select('*')
+      .limit(1)
+      .maybeSingle();
+
+    if (sampleRow && typeof sampleRow === 'object') {
+      for (const k of Object.keys(sampleRow as Record<string, unknown>)) {
+        detected.add(k);
+      }
+      if (detected.size > 0) {
+        cachedWhatsAppColumns = detected;
+        return detected;
+      }
+    }
+  } catch {
+    // Fall through to minimal targeted probes only when table is empty
+  }
+
+  // Table is empty: probe candidate columns cleanly, stopping per alias group once found
+  for (const col of PHONE_ID_COLUMN_CANDIDATES) {
+    const { error } = await client.from('whatsapp_accounts').select(col).limit(0);
+    if (!error) {
+      detected.add(col);
+      break;
+    }
+  }
+
+  for (const col of WABA_ID_COLUMN_CANDIDATES) {
+    const { error } = await client.from('whatsapp_accounts').select(col).limit(0);
+    if (!error) {
+      detected.add(col);
+      break;
+    }
+  }
 
   await Promise.all(
-    probeList.map(async (col) => {
+    METADATA_COLUMN_CANDIDATES.map(async (col) => {
       try {
         const { error } = await client.from('whatsapp_accounts').select(col).limit(0);
         if (!error) {
           detected.add(col);
         }
       } catch {
-        // Ignore probe network errors cleanly
+        // Ignore probe errors cleanly
       }
     })
   );
@@ -437,7 +484,7 @@ export async function saveBusinessWhatsAppConfiguration(params: {
   const cleanBusinessId = params.businessId.trim();
   const cleanPhoneId = params.phoneNumberId.trim();
   const cleanWabaId = params.wabaId.trim();
-  const cleanGraphVersion = params.graphApiVersion?.trim() || 'v21.0';
+  const cleanGraphVersion = params.graphApiVersion?.trim() || 'v25.0';
 
   if (!UUID_REGEX.test(cleanBusinessId)) {
     return { ok: false, message: 'Active business workspace could not be resolved.' };
@@ -461,7 +508,6 @@ export async function saveBusinessWhatsAppConfiguration(params: {
     .select('role, is_active')
     .eq('business_id', cleanBusinessId)
     .eq('user_id', userRes.user.id)
-    .eq('is_active', true)
     .maybeSingle();
 
   if (memberErr) {
@@ -521,12 +567,9 @@ export async function saveBusinessWhatsAppConfiguration(params: {
       business_id: cleanBusinessId,
       ...writePayload,
     };
-    if (cols.has('display_name')) insertPayload.display_name = 'WhatsApp Business';
-    if (cols.has('phone_number_e164')) insertPayload.phone_number_e164 = '+10000000000';
-    if (cols.has('phone_number')) insertPayload.phone_number = '+10000000000';
-    if (cols.has('connection_status')) insertPayload.connection_status = 'configuration_required';
+    if (cols.has('connection_status')) insertPayload.connection_status = 'not_connected';
     if (cols.has('status') && !cols.has('connection_status')) {
-      insertPayload.status = 'configuration_required';
+      insertPayload.status = 'not_connected';
     }
 
     const { data: insertedRow, error: insErr } = await supabase
@@ -537,7 +580,13 @@ export async function saveBusinessWhatsAppConfiguration(params: {
 
     if (insErr) {
       cachedWhatsAppColumns = null;
-      return { ok: false, message: `Failed to create WhatsApp configuration: ${insErr.message}` };
+      const missingRequiredMeta = insErr.code === '23502';
+      return {
+        ok: false,
+        message: missingRequiredMeta
+          ? `Could not create WhatsApp record before Meta verification because the database requires verified phone metadata (${insErr.message}). Click "Verify Connection" so real account details can be fetched from Meta.`
+          : `Failed to create WhatsApp configuration: ${insErr.message}`,
+      };
     }
     savedRowId = insertedRow?.id ? String((insertedRow as Record<string, unknown>).id) : null;
   }

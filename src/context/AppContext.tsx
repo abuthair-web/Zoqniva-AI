@@ -25,6 +25,7 @@ import {
   invokeSendWhatsAppMessage,
   invokeSyncTemplates,
   mapDbMessageRow,
+  normalizeWhatsAppConnectionStatus,
   saveBusinessWhatsAppConfiguration,
 } from '@/services/whatsappService';
 import type { User } from '@supabase/supabase-js';
@@ -341,6 +342,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
   const currentUserIdRef = useRef<string | null>(null);
   const authStatusRef = useRef<AuthGateStatus>('loading');
+  const resolvingUserPromiseRef = useRef<{ userId: string; promise: Promise<void> } | null>(null);
   useEffect(() => {
     currentUserIdRef.current = currentUser?.id ?? null;
   }, [currentUser]);
@@ -423,7 +425,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           .maybeSingle(),
         client
           .from('business_members')
-          .select('*, profiles(*)')
+          .select('business_id, user_id, role, is_active, created_at, profiles(id, email, full_name)')
           .eq('business_id', businessId),
         client.from('tags').select('*').eq('business_id', businessId),
         client.from('contacts').select('*').eq('business_id', businessId).order('created_at', { ascending: false }),
@@ -456,9 +458,9 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       if (bizData) {
         const loadedPhoneId = extractWhatsAppPhoneNumberId(waData);
         const loadedWabaId = extractWhatsAppWabaId(waData);
-        const loadedStatus = (waData?.connection_status ??
-          waData?.status ??
-          'not_connected') as MetaConnectionState;
+        const loadedStatus = normalizeWhatsAppConnectionStatus(
+          waData?.connection_status ?? waData?.status
+        );
 
         setBusiness({
           id: String(bizData.id ?? ''),
@@ -477,7 +479,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           testAllowlist: Array.isArray(waData?.test_allowlist)
             ? waData.test_allowlist.map(String)
             : [],
-          graphApiVersion: String(waData?.graph_api_version ?? 'v21.0'),
+          graphApiVersion: String(waData?.graph_api_version ?? 'v25.0'),
           verifiedName: waData?.verified_name ? String(waData.verified_name) : undefined,
           qualityRating:
             (waData?.quality_rating as BusinessProfile['qualityRating']) ?? 'unknown',
@@ -693,53 +695,59 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const resolveAuthenticatedUser = useCallback(
     async (authUser: User) => {
       if (!supabase || !isSupabaseConfigured) return;
+
+      if (resolvingUserPromiseRef.current?.userId === authUser.id) {
+        return resolvingUserPromiseRef.current.promise;
+      }
+
       const client = supabase;
 
-      const metadataName =
-        typeof authUser.user_metadata?.full_name === 'string'
-          ? authUser.user_metadata.full_name.trim()
-          : '';
+      const task = (async () => {
+        const metadataName =
+          typeof authUser.user_metadata?.full_name === 'string'
+            ? authUser.user_metadata.full_name.trim()
+            : '';
 
-      // Step 1: Load signed-in user's profile from public.profiles (schema-tolerant)
-      const { data: profileData } = await client
-        .from('profiles')
-        .select('*')
-        .eq('id', authUser.id)
-        .maybeSingle();
+        // Step 1: Load signed-in user's profile from public.profiles (schema-tolerant)
+        const { data: profileData } = await client
+          .from('profiles')
+          .select('*')
+          .eq('id', authUser.id)
+          .maybeSingle();
 
-      const profile = (profileData as Record<string, unknown> | null) ?? null;
+        const profile = (profileData as Record<string, unknown> | null) ?? null;
 
-      const resolvedEmail = String(profile?.email || authUser.email || '');
-      const resolvedName = String(
-        profile?.full_name || metadataName || authUser.email || 'Staff Member'
-      );
+        const resolvedEmail = String(profile?.email || authUser.email || '');
+        const resolvedName = String(
+          profile?.full_name || metadataName || authUser.email || 'Staff Member'
+        );
 
-      // Step 2: Check business membership and authoritative role from business_members
-      const { data: memberRows, error: memberErr } = await client
-        .from('business_members')
-        .select('*')
-        .eq('user_id', authUser.id);
+        // Step 2: Check business membership and authoritative role from business_members
+        const { data: memberRows, error: memberErr } = await client
+          .from('business_members')
+          .select('business_id, user_id, role, is_active, created_at')
+          .eq('user_id', authUser.id);
 
-      if (memberErr) {
-        setCurrentUser(null);
-        resetWorkspaceState();
-        if (memberErr.code === '42501') {
-          setPendingAccount({
-            id: authUser.id,
-            email: resolvedEmail,
-            fullName: resolvedName,
-          });
-          setProfileAccessError(
-            'Database table read permissions for authenticated users are pending setup by your project administrator.'
-          );
-          setAuthStatus('awaiting_access');
+        if (memberErr) {
+          setCurrentUser(null);
+          resetWorkspaceState();
+          if (memberErr.code === '42501') {
+            setPendingAccount({
+              id: authUser.id,
+              email: resolvedEmail,
+              fullName: resolvedName,
+            });
+            setProfileAccessError(
+              'Database table read permissions for authenticated users are pending setup by your project administrator.'
+            );
+            setAuthStatus('awaiting_access');
+            return;
+          }
+          setPendingAccount(null);
+          setProfileAccessError(`Unable to verify business membership: ${memberErr.message}`);
+          setAuthStatus('unauthorized_access');
           return;
         }
-        setPendingAccount(null);
-        setProfileAccessError(`Unable to verify business membership: ${memberErr.message}`);
-        setAuthStatus('unauthorized_access');
-        return;
-      }
 
       const rows = (memberRows ?? []) as Array<Record<string, unknown>>;
 
@@ -829,6 +837,16 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       });
       setAuthStatus('authenticated');
       await loadSupabaseWorkspace(authUser.id, activeBusinessId);
+      })();
+
+      resolvingUserPromiseRef.current = { userId: authUser.id, promise: task };
+      try {
+        await task;
+      } finally {
+        if (resolvingUserPromiseRef.current?.promise === task) {
+          resolvingUserPromiseRef.current = null;
+        }
+      }
     },
     [loadSupabaseWorkspace, resetWorkspaceState]
   );
@@ -888,11 +906,11 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           currentUserIdRef.current === session.user.id &&
           authStatusRef.current === 'authenticated';
 
-        // Avoid blowing away active form inputs on routine background token refreshes or tab focus
-        if (event === 'TOKEN_REFRESHED' && sameAuthenticatedUser) {
+        // Avoid blowing away active form inputs or duplicating queries on background refreshes / concurrent sign-in
+        if (resolvingUserPromiseRef.current?.userId === session.user.id) {
           return;
         }
-        if (event === 'SIGNED_IN' && sameAuthenticatedUser) {
+        if ((event === 'TOKEN_REFRESHED' || event === 'SIGNED_IN') && sameAuthenticatedUser) {
           return;
         }
 
@@ -1055,7 +1073,9 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             metaPhoneNumberId: nextPhone || prev.metaPhoneNumberId,
             metaWabaId: nextWaba || prev.metaWabaId,
             metaConnectionState:
-              ((wa.connection_status ?? wa.status) as MetaConnectionState) ?? prev.metaConnectionState,
+              wa.connection_status !== undefined || wa.status !== undefined
+                ? normalizeWhatsAppConnectionStatus(wa.connection_status ?? wa.status)
+                : prev.metaConnectionState,
             metaLastError: wa.last_error_message ? String(wa.last_error_message) : undefined,
             messagingMode: wa.messaging_mode === 'live' ? 'live' : wa.messaging_mode === 'test' ? 'test' : prev.messagingMode,
             testAllowlist: Array.isArray(wa.test_allowlist)
@@ -2165,8 +2185,9 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       metaPhoneNumberId: nextPhone || prev.metaPhoneNumberId,
       metaWabaId: nextWaba || prev.metaWabaId,
       metaConnectionState:
-        ((waData.connection_status ?? waData.status) as MetaConnectionState) ??
-        prev.metaConnectionState,
+        waData.connection_status !== undefined || waData.status !== undefined
+          ? normalizeWhatsAppConnectionStatus(waData.connection_status ?? waData.status)
+          : prev.metaConnectionState,
       metaLastError: waData.last_error_message ? String(waData.last_error_message) : prev.metaLastError,
       messagingMode:
         waData.messaging_mode === 'live'
@@ -2212,7 +2233,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       wabaId: cleanWabaId,
       messagingMode: options?.messagingMode ?? business.messagingMode,
       testAllowlist: options?.testAllowlist ?? business.testAllowlist,
-      graphApiVersion: options?.graphApiVersion ?? business.graphApiVersion,
+      graphApiVersion: options?.graphApiVersion,
     });
 
     if (typeof res.webhookSecretsReady === 'boolean') {
@@ -2241,12 +2262,12 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       };
     }
 
-    // Preserve saved credentials on verification failure (never overwrite with empty fields)
+    // Preserve entered/saved credentials on verification failure
     setBusiness((prev) => ({
       ...prev,
-      metaPhoneNumberId: prev.metaPhoneNumberId || cleanPhoneId,
-      metaWabaId: prev.metaWabaId || cleanWabaId,
-      metaConnectionState: res.connectionStatus ?? 'connection_error',
+      metaPhoneNumberId: cleanPhoneId || prev.metaPhoneNumberId,
+      metaWabaId: cleanWabaId || prev.metaWabaId,
+      metaConnectionState: res.connectionStatus ?? 'error',
       metaLastError: res.error || 'Meta WhatsApp connection check failed.',
       messagingMode: res.messagingMode ?? prev.messagingMode,
       testAllowlist: res.testAllowlist ?? prev.testAllowlist,
@@ -2289,9 +2310,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       testAllowlist: saveRes.testAllowlist ?? options.testAllowlist,
       graphApiVersion: saveRes.graphApiVersion ?? prev.graphApiVersion,
       metaConnectionState:
-        prev.metaConnectionState === 'not_connected'
-          ? 'configuration_required'
-          : prev.metaConnectionState,
+        prev.metaConnectionState === 'connected' ? 'connected' : 'not_connected',
       metaLastError: undefined,
     }));
 

@@ -26,12 +26,15 @@ export interface MetaRuntimeConfig {
   graphApiVersion: string;
 }
 
-const VALID_GRAPH_VERSION = /^v(1[89]|2[0-3])\.0$/;
+const VALID_GRAPH_VERSION = /^v(1[89]|2[0-9])\.0$/;
+const DEFAULT_GRAPH_VERSION = 'v25.0';
 
 export function resolveGraphApiVersion(requested?: string | null): string {
   const envVer = Deno.env.get('META_GRAPH_API_VERSION')?.trim();
-  const candidate = requested?.trim() || envVer || 'v21.0';
-  return VALID_GRAPH_VERSION.test(candidate) ? candidate : 'v21.0';
+  if (envVer && VALID_GRAPH_VERSION.test(envVer)) return envVer;
+  const candidate = requested?.trim();
+  if (candidate && VALID_GRAPH_VERSION.test(candidate)) return candidate;
+  return DEFAULT_GRAPH_VERSION;
 }
 
 export function getMetaRuntimeConfig(overrides?: {
@@ -249,7 +252,7 @@ async function fetchMetaWithTimeout(
 
 export interface MetaConnectionCheckResult {
   ok: boolean;
-  status: 'connected' | 'configuration_required' | 'connection_error';
+  status: 'not_connected' | 'connecting' | 'connected' | 'error';
   phoneNumberId?: string;
   wabaId?: string;
   displayPhoneNumber?: string;
@@ -273,7 +276,7 @@ export async function verifyMetaConnection(
   if (!config.accessToken || !config.phoneNumberId || !config.wabaId) {
     return {
       ok: false,
-      status: 'configuration_required',
+      status: 'not_connected',
       errorCode: 'META_SECRETS_MISSING',
       userMessage:
         'Meta access token, Phone Number ID, and WABA ID must all be configured before verifying.',
@@ -302,7 +305,7 @@ export async function verifyMetaConnection(
       });
       return {
         ok: false,
-        status: 'connection_error',
+        status: 'error',
         errorCode: classified.code,
         userMessage: classified.userMessage,
         diagnosticMessage: classified.diagnosticMessage,
@@ -328,7 +331,7 @@ export async function verifyMetaConnection(
       });
       return {
         ok: false,
-        status: 'connection_error',
+        status: 'error',
         errorCode: classified.code,
         userMessage: classified.userMessage,
         diagnosticMessage: classified.diagnosticMessage,
@@ -367,7 +370,7 @@ export async function verifyMetaConnection(
     const isAbort = err instanceof DOMException && err.name === 'AbortError';
     return {
       ok: false,
-      status: 'connection_error',
+      status: 'error',
       errorCode: isAbort ? 'META_TIMEOUT' : 'META_NETWORK_ERROR',
       userMessage: isAbort
         ? 'Timed out waiting for Meta Cloud API. Please try again.'

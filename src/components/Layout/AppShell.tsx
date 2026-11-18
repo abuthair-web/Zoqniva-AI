@@ -141,15 +141,15 @@ export function AppShell() {
           dotClass: 'bg-emerald-500',
           boxClass: 'border-emerald-200 bg-emerald-50 text-emerald-800',
         };
-      case 'connection_error':
+      case 'error':
         return {
           label: 'Connection Error',
           dotClass: 'bg-[#E11D48]',
           boxClass: 'border-rose-200 bg-rose-50 text-[#E11D48]',
         };
-      case 'configuration_required':
+      case 'connecting':
         return {
-          label: 'WhatsApp Setup Needed',
+          label: 'Connecting WhatsApp',
           dotClass: 'bg-[#F4B942]',
           boxClass: 'border-amber-200 bg-amber-50 text-amber-900',
         };

@@ -1,4 +1,4 @@
-// Supabase Edge Function: Verify Meta WhatsApp Cloud API Connection & Update Messaging Mode
+// Supabase Edge Function: Verify Meta WhatsApp Cloud API Connection & Update Configuration
 // Standalone single-file build for Supabase Dashboard -> Edge Functions -> Via Editor.
 // Keep "Enforce JWT Verification" ENABLED (default) when deploying.
 
@@ -10,6 +10,8 @@ const corsHeaders = {
   'Access-Control-Allow-Methods': 'POST, OPTIONS',
 };
 
+type AllowedConnectionStatus = 'not_connected' | 'connecting' | 'connected' | 'error';
+
 function jsonResponse(body: Record<string, unknown>, status = 200): Response {
   return new Response(JSON.stringify(body), {
     status,
@@ -17,12 +19,19 @@ function jsonResponse(body: Record<string, unknown>, status = 200): Response {
   });
 }
 
-const VALID_GRAPH_VERSION = /^v(1[89]|2[0-3])\.0$/;
+const VALID_GRAPH_VERSION = /^v(1[89]|2[0-9])\.0$/;
+const DEFAULT_GRAPH_VERSION = 'v25.0';
 
 function resolveGraphApiVersion(requested?: string | null): string {
   const envVer = Deno.env.get('META_GRAPH_API_VERSION')?.trim();
-  const candidate = requested?.trim() || envVer || 'v21.0';
-  return VALID_GRAPH_VERSION.test(candidate) ? candidate : 'v21.0';
+  if (envVer && VALID_GRAPH_VERSION.test(envVer)) {
+    return envVer;
+  }
+  const candidate = requested?.trim();
+  if (candidate && VALID_GRAPH_VERSION.test(candidate)) {
+    return candidate;
+  }
+  return DEFAULT_GRAPH_VERSION;
 }
 
 function normalizeWaId(raw: string): string | null {
@@ -46,7 +55,7 @@ const SENSITIVE_KEY_PATTERN =
   /token|secret|authorization|password|apikey|api_key|signature|verify_token/i;
 
 function logEvent(
-  category: 'connection_check' | 'permission_error' | 'meta_api_error',
+  category: 'connection_check' | 'permission_error' | 'meta_api_error' | 'db_error',
   level: 'info' | 'warn' | 'error',
   message: string,
   context: Record<string, unknown> = {}
@@ -65,13 +74,15 @@ function classifyMetaError(httpStatus: number, metaPayload: Record<string, unkno
   const errObj = (metaPayload?.error as Record<string, unknown> | undefined) ?? {};
   const numericCode = errObj.code !== undefined ? String(errObj.code) : '';
   const subcode = errObj.error_subcode !== undefined ? String(errObj.error_subcode) : '';
-  const rawMessage = typeof errObj.message === 'string' ? errObj.message : 'Meta Graph API request failed';
+  const rawMessage =
+    typeof errObj.message === 'string' ? errObj.message : 'Meta Graph API request failed';
 
   if (numericCode === '190') {
     return {
       code: 'META_TOKEN_EXPIRED',
       httpStatus: 401,
-      userMessage: 'WhatsApp API token has expired or is invalid. Ask an admin to rotate the server token.',
+      userMessage:
+        'WhatsApp API token has expired or is invalid. Ask an admin to rotate the server token.',
       diagnosticMessage: `Meta OAuth error 190${subcode ? `/${subcode}` : ''}: ${rawMessage}`,
     };
   }
@@ -99,7 +110,11 @@ function classifyMetaError(httpStatus: number, metaPayload: Record<string, unkno
   };
 }
 
-async function fetchMetaWithTimeout(url: string, accessToken: string, timeoutMs = 12000): Promise<Response> {
+async function fetchMetaWithTimeout(
+  url: string,
+  accessToken: string,
+  timeoutMs = 12000
+): Promise<Response> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
@@ -124,8 +139,13 @@ Deno.serve(async (req: Request) => {
 
   try {
     const authHeader = req.headers.get('Authorization');
-    if (!authHeader) {
+    if (!authHeader || !authHeader.toLowerCase().startsWith('bearer ')) {
       return jsonResponse({ ok: false, error: 'Missing Authorization header' }, 401);
+    }
+
+    const jwt = authHeader.replace(/^Bearer\s+/i, '').trim();
+    if (!jwt) {
+      return jsonResponse({ ok: false, error: 'Invalid Authorization token' }, 401);
     }
 
     const supabaseUrl = Deno.env.get('SUPABASE_URL') ?? '';
@@ -141,7 +161,7 @@ Deno.serve(async (req: Request) => {
     });
     const serviceClient = createClient(supabaseUrl, supabaseServiceKey);
 
-    const { data: userRes, error: userErr } = await userClient.auth.getUser();
+    const { data: userRes, error: userErr } = await userClient.auth.getUser(jwt);
     if (userErr || !userRes.user) {
       return jsonResponse({ ok: false, error: 'Unauthorized session' }, 401);
     }
@@ -157,7 +177,7 @@ Deno.serve(async (req: Request) => {
 
     const action = payload.action === 'save_config' ? 'save_config' : 'verify';
 
-    // Strict active Admin authorization check BEFORE accessing/modifying account metadata
+    // Strict active Admin authorization check using business_members(business_id, user_id, role, is_active, created_at)
     const { data: memberRows, error: memberErr } = await serviceClient
       .from('business_members')
       .select('business_id, role, is_active')
@@ -165,7 +185,19 @@ Deno.serve(async (req: Request) => {
       .eq('is_active', true);
 
     if (memberErr) {
-      return jsonResponse({ ok: false, error: 'Failed to verify business membership' }, 500);
+      logEvent('db_error', 'error', 'Failed to query business_members', {
+        userId: userRes.user.id,
+        errorCode: memberErr.code,
+        error: memberErr.message,
+      });
+      return jsonResponse(
+        {
+          ok: false,
+          errorCode: 'MEMBERSHIP_QUERY_FAILED',
+          error: `Failed to verify business membership: ${memberErr.message}`,
+        },
+        500
+      );
     }
 
     const activeAdmin = (memberRows ?? []).find(
@@ -183,13 +215,30 @@ Deno.serve(async (req: Request) => {
 
     const businessId = String(activeAdmin.business_id);
 
-    const { data: existingAccount } = await serviceClient
+    // Load existing account for this business and inspect actual whatsapp_accounts columns before writing
+    const { data: existingAccount, error: existingAccErr } = await serviceClient
       .from('whatsapp_accounts')
       .select('*')
       .eq('business_id', businessId)
       .order('created_at', { ascending: true })
       .limit(1)
       .maybeSingle();
+
+    if (existingAccErr) {
+      logEvent('db_error', 'error', 'Failed to load whatsapp_accounts', {
+        businessId,
+        errorCode: existingAccErr.code,
+        error: existingAccErr.message,
+      });
+      return jsonResponse(
+        {
+          ok: false,
+          errorCode: 'DB_READ_FAILED',
+          error: `Unable to read existing WhatsApp account settings: ${existingAccErr.message}`,
+        },
+        500
+      );
+    }
 
     const phoneColCandidates = ['phone_number_id', 'meta_phone_number_id'] as const;
     const wabaColCandidates = [
@@ -200,33 +249,71 @@ Deno.serve(async (req: Request) => {
     ] as const;
 
     const detectedCols = new Set<string>();
-    if (existingAccount) {
+    if (existingAccount && typeof existingAccount === 'object') {
       for (const k of Object.keys(existingAccount)) detectedCols.add(k);
-    }
-    const probeCols = [
-      ...phoneColCandidates,
-      ...wabaColCandidates,
-      'display_name',
-      'verified_name',
-      'phone_number_e164',
-      'phone_number',
-      'connection_status',
-      'status',
-      'quality_rating',
-      'last_sync_at',
-      'last_error_message',
-      'messaging_mode',
-      'test_allowlist',
-      'graph_api_version',
-      'app_id',
-    ].filter((c) => !detectedCols.has(c));
+    } else {
+      // Table may have rows for other businesses; inspect 1 row first to discover columns without 400 probes
+      const { data: sampleRow } = await serviceClient
+        .from('whatsapp_accounts')
+        .select('*')
+        .limit(1)
+        .maybeSingle();
 
-    await Promise.all(
-      probeCols.map(async (col) => {
-        const { error } = await serviceClient.from('whatsapp_accounts').select(col).limit(0);
-        if (!error) detectedCols.add(col);
-      })
-    );
+      if (sampleRow && typeof sampleRow === 'object') {
+        for (const k of Object.keys(sampleRow)) detectedCols.add(k);
+      } else {
+        // Table is completely empty: probe required/optional columns cleanly, stopping per alias group once matched
+        for (const col of phoneColCandidates) {
+          const { error } = await serviceClient.from('whatsapp_accounts').select(col).limit(0);
+          if (!error) {
+            detectedCols.add(col);
+            break;
+          }
+        }
+        for (const col of wabaColCandidates) {
+          const { error } = await serviceClient.from('whatsapp_accounts').select(col).limit(0);
+          if (!error) {
+            detectedCols.add(col);
+            break;
+          }
+        }
+        const optionalCols = [
+          'display_name',
+          'verified_name',
+          'phone_number_e164',
+          'phone_number',
+          'connection_status',
+          'status',
+          'quality_rating',
+          'last_sync_at',
+          'last_error_message',
+          'messaging_mode',
+          'test_allowlist',
+          'graph_api_version',
+          'app_id',
+        ];
+        await Promise.all(
+          optionalCols.map(async (col) => {
+            const { error } = await serviceClient.from('whatsapp_accounts').select(col).limit(0);
+            if (!error) detectedCols.add(col);
+          })
+        );
+      }
+    }
+
+    const hasPhoneCol = phoneColCandidates.some((c) => detectedCols.has(c));
+    const hasWabaCol = wabaColCandidates.some((c) => detectedCols.has(c));
+    if (!hasPhoneCol || !hasWabaCol) {
+      return jsonResponse(
+        {
+          ok: false,
+          errorCode: 'SCHEMA_MISMATCH',
+          error:
+            'Could not locate Phone Number ID or WABA ID columns on public.whatsapp_accounts.',
+        },
+        500
+      );
+    }
 
     const readCol = (candidates: readonly string[]) => {
       if (!existingAccount) return '';
@@ -295,10 +382,10 @@ Deno.serve(async (req: Request) => {
     const buildAccountPatch = (fields: {
       phoneId?: string;
       wabaId?: string;
-      connStatus?: string;
-      displayName?: string;
+      connStatus?: AllowedConnectionStatus;
+      displayName?: string | null;
       verifiedName?: string | null;
-      phoneE164?: string;
+      phoneE164?: string | null;
       qualityRating?: string;
       lastSyncAt?: string;
       lastError?: string | null;
@@ -319,15 +406,24 @@ Deno.serve(async (req: Request) => {
       if (detectedCols.has('messaging_mode')) patch.messaging_mode = nextMode;
       if (detectedCols.has('test_allowlist')) patch.test_allowlist = normalizedAllowlist;
       if (detectedCols.has('graph_api_version')) patch.graph_api_version = cleanGraphVersion;
-      if (fields.displayName !== undefined && detectedCols.has('display_name')) {
-        patch.display_name = fields.displayName;
+
+      if (
+        fields.displayName !== undefined &&
+        fields.displayName !== null &&
+        fields.displayName.trim() !== '' &&
+        detectedCols.has('display_name')
+      ) {
+        patch.display_name = fields.displayName.trim();
       }
       if (fields.verifiedName !== undefined && detectedCols.has('verified_name')) {
         patch.verified_name = fields.verifiedName;
       }
-      if (fields.phoneE164 !== undefined) {
-        if (detectedCols.has('phone_number_e164')) patch.phone_number_e164 = fields.phoneE164;
-        if (detectedCols.has('phone_number')) patch.phone_number = fields.phoneE164;
+      if (fields.phoneE164 !== undefined && fields.phoneE164 !== null) {
+        const cleanPhoneE164 = normalizePhoneToE164(fields.phoneE164);
+        if (cleanPhoneE164) {
+          if (detectedCols.has('phone_number_e164')) patch.phone_number_e164 = cleanPhoneE164;
+          if (detectedCols.has('phone_number')) patch.phone_number = cleanPhoneE164;
+        }
       }
       if (fields.connStatus !== undefined) {
         if (detectedCols.has('connection_status')) patch.connection_status = fields.connStatus;
@@ -349,48 +445,88 @@ Deno.serve(async (req: Request) => {
     };
 
     if (action === 'save_config') {
+      if (!resolvedPhoneNumberId || !resolvedWabaId) {
+        return jsonResponse(
+          {
+            ok: false,
+            error: 'Both Meta Phone Number ID and WABA ID are required before saving.',
+          },
+          400
+        );
+      }
+
       if (existingAccount) {
         const updatePatch = buildAccountPatch({
-          phoneId: resolvedPhoneNumberId || undefined,
-          wabaId: resolvedWabaId || undefined,
+          phoneId: resolvedPhoneNumberId,
+          wabaId: resolvedWabaId,
         });
         const { error: updErr } = await serviceClient
           .from('whatsapp_accounts')
           .update(updatePatch)
           .eq('id', existingAccount.id);
 
-        if (updErr) return jsonResponse({ ok: false, error: updErr.message }, 500);
-      } else {
-        if (!resolvedPhoneNumberId || !resolvedWabaId) {
+        if (updErr) {
+          logEvent('db_error', 'error', 'Failed to update whatsapp_accounts in save_config', {
+            businessId,
+            errorCode: updErr.code,
+            error: updErr.message,
+          });
           return jsonResponse(
             {
               ok: false,
-              error: 'Save your Meta Phone Number ID and WABA ID first before updating mode.',
+              errorCode: 'DB_WRITE_FAILED',
+              error: `Failed to save WhatsApp configuration: ${updErr.message}`,
             },
             400
           );
         }
+      } else {
         const insertPatch = buildAccountPatch({
           isInsert: true,
           phoneId: resolvedPhoneNumberId,
           wabaId: resolvedWabaId,
-          displayName: 'WhatsApp Business',
-          phoneE164: '+10000000000',
-          connStatus: 'configuration_required',
+          connStatus: 'not_connected',
         });
         const { error: insErr } = await serviceClient.from('whatsapp_accounts').insert(insertPatch);
-        if (insErr) return jsonResponse({ ok: false, error: insErr.message }, 500);
+        if (insErr) {
+          logEvent('db_error', 'error', 'Failed to insert whatsapp_accounts in save_config', {
+            businessId,
+            errorCode: insErr.code,
+            error: insErr.message,
+          });
+          const needsMetaFirst = insErr.code === '23502';
+          return jsonResponse(
+            {
+              ok: false,
+              errorCode: needsMetaFirst ? 'WHATSAPP_METADATA_REQUIRED' : 'DB_WRITE_FAILED',
+              error: needsMetaFirst
+                ? `Database requires verified WhatsApp phone details before creating a new row (${insErr.message}). Click "Verify Connection" so real details can be fetched from Meta.`
+                : `Failed to create WhatsApp configuration: ${insErr.message}`,
+            },
+            needsMetaFirst ? 422 : 400
+          );
+        }
       }
 
-      await serviceClient.from('audit_logs').insert({
-        business_id: businessId,
-        actor_id: userRes.user.id,
-        action: 'Updated WhatsApp Messaging Config',
-        entity_type: 'whatsapp_account',
-        details: {
-          summary: `Mode set to ${nextMode}; allowlist count: ${normalizedAllowlist.length}`,
-        },
-      });
+      await serviceClient
+        .from('audit_logs')
+        .insert({
+          business_id: businessId,
+          actor_id: userRes.user.id,
+          action: 'Updated WhatsApp Messaging Config',
+          entity_type: 'whatsapp_account',
+          details: {
+            summary: `Mode set to ${nextMode}; allowlist count: ${normalizedAllowlist.length}`,
+          },
+        })
+        .then(({ error: audErr }) => {
+          if (audErr) {
+            logEvent('db_error', 'warn', 'Non-fatal audit_logs insert failure', {
+              businessId,
+              error: audErr.message,
+            });
+          }
+        });
 
       return jsonResponse({
         ok: true,
@@ -410,7 +546,7 @@ Deno.serve(async (req: Request) => {
       return jsonResponse(
         {
           ok: false,
-          connectionStatus: 'configuration_required',
+          connectionStatus: 'not_connected',
           errorCode: 'META_SECRETS_MISSING',
           error:
             'META_ACCESS_TOKEN secret, Phone Number ID, and WABA ID must all be configured before verifying.',
@@ -426,7 +562,7 @@ Deno.serve(async (req: Request) => {
     }
 
     let checkOk = false;
-    let connStatus: 'connected' | 'configuration_required' | 'connection_error' = 'connection_error';
+    let connStatus: AllowedConnectionStatus = 'error';
     let errorCode: string | undefined;
     let userMessage: string | undefined;
     let diagnosticMessage: string | undefined;
@@ -466,7 +602,10 @@ Deno.serve(async (req: Request) => {
             `https://graph.facebook.com/${cleanGraphVersion}/${encodeURIComponent(resolvedWabaId)}/phone_numbers` +
             `?fields=id,display_phone_number,verified_name,quality_rating&limit=100`;
           const wabaPhonesRes = await fetchMetaWithTimeout(wabaPhonesUrl, accessToken);
-          const wabaPhonesJson = (await wabaPhonesRes.json().catch(() => ({}))) as Record<string, unknown>;
+          const wabaPhonesJson = (await wabaPhonesRes.json().catch(() => ({}))) as Record<
+            string,
+            unknown
+          >;
 
           if (!wabaPhonesRes.ok) {
             const classified = classifyMetaError(wabaPhonesRes.status, wabaPhonesJson);
@@ -477,7 +616,9 @@ Deno.serve(async (req: Request) => {
             const wabaPhones = Array.isArray(wabaPhonesJson.data)
               ? (wabaPhonesJson.data as Array<Record<string, unknown>>)
               : [];
-            const matchedPhone = wabaPhones.find((p) => String(p.id ?? '') === resolvedPhoneNumberId);
+            const matchedPhone = wabaPhones.find(
+              (p) => String(p.id ?? '') === resolvedPhoneNumberId
+            );
 
             if (!matchedPhone) {
               errorCode = 'META_PHONE_WABA_MISMATCH';
@@ -490,15 +631,24 @@ Deno.serve(async (req: Request) => {
               verifiedPhoneId = String(phoneJson.id ?? resolvedPhoneNumberId);
               verifiedWabaId = String(wabaJson.id ?? resolvedWabaId);
               displayPhoneNumber =
-                normalizePhoneToE164(String(phoneJson.display_phone_number ?? '')) ?? undefined;
+                normalizePhoneToE164(
+                  String(phoneJson.display_phone_number ?? matchedPhone.display_phone_number ?? '')
+                ) ?? undefined;
               verifiedName =
-                typeof phoneJson.verified_name === 'string'
-                  ? phoneJson.verified_name
-                  : typeof wabaJson.name === 'string'
-                  ? wabaJson.name
+                typeof phoneJson.verified_name === 'string' && phoneJson.verified_name.trim()
+                  ? phoneJson.verified_name.trim()
+                  : typeof matchedPhone.verified_name === 'string' &&
+                    matchedPhone.verified_name.trim()
+                  ? matchedPhone.verified_name.trim()
+                  : typeof wabaJson.name === 'string' && wabaJson.name.trim()
+                  ? wabaJson.name.trim()
                   : undefined;
               qualityRating = normalizeQualityRating(
-                typeof phoneJson.quality_rating === 'string' ? phoneJson.quality_rating : null
+                typeof phoneJson.quality_rating === 'string'
+                  ? phoneJson.quality_rating
+                  : typeof matchedPhone.quality_rating === 'string'
+                  ? matchedPhone.quality_rating
+                  : null
               );
               codeVerificationStatus =
                 typeof phoneJson.code_verification_status === 'string'
@@ -518,46 +668,113 @@ Deno.serve(async (req: Request) => {
     }
 
     const nowIso = new Date().toISOString();
-    const phoneE164 =
-      displayPhoneNumber ||
-      (existingAccount?.phone_number_e164
-        ? String(existingAccount.phone_number_e164)
+    const existingPhoneE164 =
+      existingAccount?.phone_number_e164
+        ? normalizePhoneToE164(String(existingAccount.phone_number_e164))
         : existingAccount?.phone_number
-        ? String(existingAccount.phone_number)
-        : '+10000000000');
+        ? normalizePhoneToE164(String(existingAccount.phone_number))
+        : null;
+    const realPhoneE164 = displayPhoneNumber ?? existingPhoneE164;
+    const realDisplayName =
+      verifiedName ??
+      (typeof existingAccount?.display_name === 'string' && existingAccount.display_name.trim()
+        ? existingAccount.display_name.trim()
+        : null);
 
-    const upsertFields = buildAccountPatch({
-      isInsert: !existingAccount,
-      phoneId: verifiedPhoneId,
-      wabaId: verifiedWabaId,
-      connStatus,
-      displayName:
-        verifiedName ||
-        (existingAccount?.display_name ? String(existingAccount.display_name) : 'WhatsApp Business'),
-      verifiedName: verifiedName ?? (existingAccount?.verified_name ? String(existingAccount.verified_name) : null),
-      phoneE164,
-      qualityRating,
-      lastSyncAt: nowIso,
-      lastError: checkOk ? null : (userMessage ?? diagnosticMessage ?? 'Connection check failed'),
-    });
+    let dbWriteError: { code?: string; message: string } | null = null;
 
     if (existingAccount) {
-      await serviceClient.from('whatsapp_accounts').update(upsertFields).eq('id', existingAccount.id);
-    } else {
-      await serviceClient.from('whatsapp_accounts').insert(upsertFields);
+      const updateFields = buildAccountPatch({
+        phoneId: verifiedPhoneId,
+        wabaId: verifiedWabaId,
+        connStatus,
+        displayName: realDisplayName,
+        verifiedName: verifiedName ?? undefined,
+        phoneE164: realPhoneE164,
+        qualityRating,
+        lastSyncAt: nowIso,
+        lastError: checkOk ? null : (userMessage ?? diagnosticMessage ?? 'Connection check failed'),
+      });
+      const { error: updErr } = await serviceClient
+        .from('whatsapp_accounts')
+        .update(updateFields)
+        .eq('id', existingAccount.id);
+
+      if (updErr) {
+        dbWriteError = { code: updErr.code, message: updErr.message };
+      }
+    } else if (checkOk) {
+      // Only create a new whatsapp_accounts row when we have real verified metadata from Meta
+      const insertFields = buildAccountPatch({
+        isInsert: true,
+        phoneId: verifiedPhoneId,
+        wabaId: verifiedWabaId,
+        connStatus: 'connected',
+        displayName: realDisplayName,
+        verifiedName: verifiedName ?? undefined,
+        phoneE164: realPhoneE164,
+        qualityRating,
+        lastSyncAt: nowIso,
+        lastError: null,
+      });
+      const { error: insErr } = await serviceClient
+        .from('whatsapp_accounts')
+        .insert(insertFields);
+
+      if (insErr) {
+        dbWriteError = { code: insErr.code, message: insErr.message };
+      }
     }
 
-    await serviceClient.from('audit_logs').insert({
-      business_id: businessId,
-      actor_id: userRes.user.id,
-      action: checkOk ? 'Verified Meta WhatsApp Connection' : 'Meta Connection Check Failed',
-      entity_type: 'whatsapp_account',
-      details: {
-        summary: checkOk
-          ? `Connected phone ${displayPhoneNumber ?? verifiedPhoneId} (${nextMode} mode)`
-          : `${errorCode ?? 'ERROR'}: ${userMessage ?? 'Verification failed'}`,
-      },
-    });
+    if (dbWriteError) {
+      logEvent('db_error', 'error', 'Failed persisting whatsapp_accounts verification result', {
+        businessId,
+        errorCode: dbWriteError.code,
+        error: dbWriteError.message,
+      });
+      if (checkOk) {
+        return jsonResponse(
+          {
+            ok: false,
+            connectionStatus: 'error',
+            errorCode: 'DB_WRITE_FAILED',
+            error:
+              'Meta Graph API verification succeeded, but saving the WhatsApp account to Supabase failed.',
+            diagnostic: dbWriteError.message,
+            phoneNumberId: verifiedPhoneId,
+            wabaId: verifiedWabaId,
+            messagingMode: nextMode,
+            testAllowlist: normalizedAllowlist,
+            graphApiVersion: cleanGraphVersion,
+            webhookCallbackUrl,
+            webhookSecretsReady,
+          },
+          500
+        );
+      }
+    }
+
+    await serviceClient
+      .from('audit_logs')
+      .insert({
+        business_id: businessId,
+        actor_id: userRes.user.id,
+        action: checkOk ? 'Verified Meta WhatsApp Connection' : 'Meta Connection Check Failed',
+        entity_type: 'whatsapp_account',
+        details: {
+          summary: checkOk
+            ? `Connected phone ${displayPhoneNumber ?? verifiedPhoneId} (${nextMode} mode)`
+            : `${errorCode ?? 'ERROR'}: ${userMessage ?? 'Verification failed'}`,
+        },
+      })
+      .then(({ error: audErr }) => {
+        if (audErr) {
+          logEvent('db_error', 'warn', 'Non-fatal audit_logs insert failure', {
+            businessId,
+            error: audErr.message,
+          });
+        }
+      });
 
     if (!checkOk) {
       logEvent('meta_api_error', 'error', 'Meta WhatsApp connection check failed', {
@@ -567,10 +784,12 @@ Deno.serve(async (req: Request) => {
       return jsonResponse(
         {
           ok: false,
-          connectionStatus: connStatus,
+          connectionStatus: 'error',
           errorCode,
           error: userMessage,
           diagnostic: diagnosticMessage,
+          phoneNumberId: resolvedPhoneNumberId,
+          wabaId: resolvedWabaId,
           messagingMode: nextMode,
           testAllowlist: normalizedAllowlist,
           graphApiVersion: cleanGraphVersion,
@@ -585,6 +804,7 @@ Deno.serve(async (req: Request) => {
       businessId,
       phoneNumberId: verifiedPhoneId,
       wabaId: verifiedWabaId,
+      graphApiVersion: cleanGraphVersion,
       qualityRating,
     });
 

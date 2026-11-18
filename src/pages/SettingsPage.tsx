@@ -59,6 +59,7 @@ export function SettingsPage() {
   const whatsappDirtyRef = useRef(false);
   const bizDirtyRef = useRef(false);
   const lastBusinessIdRef = useRef(business.id);
+  const lastLoadedWaBizRef = useRef<string | null>(null);
 
   const [verifyMsg, setVerifyMsg] = useState<{
     ok: boolean;
@@ -128,9 +129,15 @@ export function SettingsPage() {
     business.testAllowlist,
   ]);
 
-  // Reload saved WhatsApp account details when opening Settings (unless user has unsaved edits)
+  // Reload saved WhatsApp account details once per business when opening WhatsApp Settings
   useEffect(() => {
-    if (tab === 'whatsapp' && UUID_REGEX.test(business.id) && !whatsappDirtyRef.current) {
+    if (
+      tab === 'whatsapp' &&
+      UUID_REGEX.test(business.id) &&
+      !whatsappDirtyRef.current &&
+      lastLoadedWaBizRef.current !== business.id
+    ) {
+      lastLoadedWaBizRef.current = business.id;
       void refreshWhatsAppAccount();
     }
   }, [tab, business.id, refreshWhatsAppAccount]);
@@ -218,12 +225,12 @@ export function SettingsPage() {
   const metaStatusMeta = {
     not_connected: {
       label: 'Not Connected Yet',
-      desc: 'Your WhatsApp Business number is not connected yet. Follow the quick setup guide below when you are ready to send live messages.',
+      desc: 'Enter your Meta Phone Number ID and WABA ID below, save them, and verify your connection when ready to send live messages.',
       color: 'text-slate-700 border-[#E2E8F0] bg-[#F8FAFC]',
     },
-    configuration_required: {
-      label: 'Setup Needed Before Live Messaging',
-      desc: 'You can browse and test everything safely right now. To send real WhatsApp messages to customers, connect your Meta Business account in Technical / API Settings below.',
+    connecting: {
+      label: 'Connecting to Meta Cloud API',
+      desc: 'Verification is currently in progress. Please wait a moment for Meta Cloud API confirmation.',
       color: 'text-amber-900 border-amber-200 bg-amber-50',
     },
     connected: {
@@ -231,7 +238,7 @@ export function SettingsPage() {
       desc: 'Your official WhatsApp Business account is verified and ready to send and receive customer messages.',
       color: 'text-emerald-900 border-emerald-200 bg-emerald-50',
     },
-    connection_error: {
+    error: {
       label: 'Connection Needs Attention',
       desc: business.metaLastError || 'There was a problem checking your WhatsApp connection.',
       color: 'text-[#E11D48] border-rose-200 bg-rose-50',
@@ -405,7 +412,7 @@ export function SettingsPage() {
                 <p className="mt-1.5 leading-relaxed">{metaStatusMeta.desc}</p>
                 {business.metaConnectionState === 'connected' && (
                   <div className="mt-3 pt-2.5 border-t border-emerald-200/70 flex flex-wrap gap-x-5 gap-y-1 text-[11px] text-emerald-900">
-                    {business.whatsappPhoneE164 && business.whatsappPhoneE164 !== '+10000000000' && (
+                    {business.whatsappPhoneE164 && (
                       <span>
                         Number: <strong className="font-mono">{business.whatsappPhoneE164}</strong>
                       </span>
