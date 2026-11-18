@@ -1,4 +1,12 @@
-import React, { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react';
+import React, {
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react';
 import { DEFAULT_BUSINESS_HOURS, EMPTY_BUSINESS_PROFILE } from '@/data/workspaceDefaults';
 import { getWindowStatus, normalizePhoneE164 } from '@/lib/phone';
 import {
@@ -6,6 +14,14 @@ import {
   supabase,
   supabaseConfigError,
 } from '@/lib/supabase';
+import {
+  fetchOlderMessagesPage,
+  fetchRecentWebhookEvents,
+  getWebhookCallbackUrl,
+  invokeConnectionCheck,
+  invokeSendWhatsAppMessage,
+  mapDbMessageRow,
+} from '@/services/whatsappService';
 import type { User } from '@supabase/supabase-js';
 import type {
   AIAutomationLog,
@@ -23,10 +39,12 @@ import type {
   Message,
   MessageTemplate,
   MessageType,
+  MessagingMode,
   MetaConnectionState,
   StaffRole,
   Tag,
   TeamMember,
+  WebhookEventSummary,
 } from '@/types/crm';
 
 export interface AuthSessionUser {
@@ -94,6 +112,9 @@ interface AppContextValue {
   businessHours: BusinessHoursDay[];
   auditLogs: AuditLogEntry[];
   notifications: AppNotification[];
+  webhookEvents: WebhookEventSummary[];
+  webhookCallbackUrl: string | null;
+  webhookSecretsReady: boolean | null;
 
   // Derived Totals & Global Filters / Smart Defaults
   totalUnreadCount: number;
@@ -113,8 +134,11 @@ interface AppContextValue {
     messageType: MessageType;
     templateName?: string;
     mediaFilename?: string;
-  }) => Promise<{ ok: boolean; error?: string }>;
-  retryFailedMessage: (messageId: string) => Promise<void>;
+    clientRequestId?: string;
+  }) => Promise<{ ok: boolean; error?: string; code?: string }>;
+  retryFailedMessage: (messageId: string) => Promise<{ ok: boolean; error?: string }>;
+  loadOlderMessages: (conversationId: string) => Promise<{ loaded: number; hasMore: boolean }>;
+  hasMoreMessagesMap: Record<string, boolean>;
   markConversationRead: (conversationId: string) => void;
   assignConversation: (conversationId: string, memberId: string | null) => void;
   updateConversationStatus: (conversationId: string, status: ConversationStatus) => void;
@@ -207,7 +231,23 @@ interface AppContextValue {
   toggleTeamMemberStatus: (memberId: string) => void;
   removeTeamMember: (memberId: string) => void;
   updateBusinessProfile: (updates: Partial<BusinessProfile>) => void;
-  verifyMetaConnection: (phoneNumberId: string, wabaId: string) => Promise<{ ok: boolean; message: string }>;
+  verifyMetaConnection: (
+    phoneNumberId: string,
+    wabaId: string,
+    options?: {
+      messagingMode?: MessagingMode;
+      testAllowlist?: string[];
+      graphApiVersion?: string;
+    }
+  ) => Promise<{ ok: boolean; message: string; diagnostic?: string }>;
+  saveWhatsAppConfig: (options: {
+    messagingMode: MessagingMode;
+    testAllowlist: string[];
+    phoneNumberId?: string;
+    wabaId?: string;
+    graphApiVersion?: string;
+  }) => Promise<{ ok: boolean; message: string }>;
+  refreshWebhookDiagnostics: () => Promise<void>;
   updateBusinessHours: (hours: BusinessHoursDay[]) => void;
   markNotificationRead: (id: string) => void;
   markAllNotificationsRead: () => void;
@@ -254,6 +294,9 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const [businessHours, setBusinessHours] = useState<BusinessHoursDay[]>(DEFAULT_BUSINESS_HOURS);
   const [auditLogs, setAuditLogs] = useState<AuditLogEntry[]>([]);
   const [notifications, setNotifications] = useState<AppNotification[]>([]);
+  const [webhookEvents, setWebhookEvents] = useState<WebhookEventSummary[]>([]);
+  const [webhookSecretsReady, setWebhookSecretsReady] = useState<boolean | null>(null);
+  const [hasMoreMessagesMap, setHasMoreMessagesMap] = useState<Record<string, boolean>>({});
   const [selectedConversationId, setSelectedConversationId] = useState<string | null>(null);
   const [dateRange, setDateRange] = useState<'today' | '7d' | '30d'>('7d');
   const [recentTemplateIds, setRecentTemplateIds] = useState<string[]>([]);
@@ -285,6 +328,13 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     handoffKeywords: ['agent', 'human', 'manager', 'refund'],
   });
 
+  const teamMembersRef = useRef<TeamMember[]>([]);
+  useEffect(() => {
+    teamMembersRef.current = teamMembers;
+  }, [teamMembers]);
+
+  const webhookCallbackUrl = useMemo(() => getWebhookCallbackUrl(), []);
+
   const resetWorkspaceState = useCallback(() => {
     setBusiness(EMPTY_BUSINESS_PROFILE);
     setTeamMembers([]);
@@ -300,6 +350,9 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     setBusinessHours(DEFAULT_BUSINESS_HOURS);
     setAuditLogs([]);
     setNotifications([]);
+    setWebhookEvents([]);
+    setWebhookSecretsReady(null);
+    setHasMoreMessagesMap({});
     setSelectedConversationId(null);
     setRecentTemplateIds([]);
     setLastAssignedMemberId(null);
@@ -362,7 +415,8 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           .from('messages')
           .select('*')
           .eq('business_id', businessId)
-          .order('created_at', { ascending: true }),
+          .order('created_at', { ascending: false })
+          .limit(300),
         client.from('templates').select('*').eq('business_id', businessId).order('created_at', { ascending: false }),
         client.from('campaigns').select('*').eq('business_id', businessId).order('created_at', { ascending: false }),
         client.from('automation_rules').select('*').eq('business_id', businessId).order('created_at', { ascending: false }),
@@ -391,6 +445,17 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           metaWabaId: String(waData?.meta_waba_id ?? ''),
           metaConnectionState: (waData?.connection_status as MetaConnectionState) ?? 'not_connected',
           metaLastError: waData?.last_error_message ? String(waData.last_error_message) : undefined,
+          messagingMode: waData?.messaging_mode === 'live' ? 'live' : 'test',
+          testAllowlist: Array.isArray(waData?.test_allowlist)
+            ? waData.test_allowlist.map(String)
+            : [],
+          graphApiVersion: String(waData?.graph_api_version ?? 'v21.0'),
+          verifiedName: waData?.verified_name ? String(waData.verified_name) : undefined,
+          qualityRating:
+            (waData?.quality_rating as BusinessProfile['qualityRating']) ?? 'unknown',
+          webhookVerifiedAt: waData?.webhook_verified_at
+            ? String(waData.webhook_verified_at)
+            : undefined,
         });
 
         const hoursJson = bizData.business_hours as Record<string, { enabled?: boolean; open?: string; close?: string }> | null;
@@ -477,6 +542,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           id: String(c.id),
           fullName: String(c.full_name),
           phoneE164: String(c.phone_e164),
+          waId: c.wa_id ? String(c.wa_id) : undefined,
           email: String(c.email ?? ''),
           company: String(c.company ?? ''),
           city: String(c.city ?? ''),
@@ -490,31 +556,27 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         }))
       );
 
-      setMessages(
-        (msgsRes.data ?? []).map((m: Record<string, unknown>) => {
-          const senderId = m.sender_profile_id ? String(m.sender_profile_id) : undefined;
-          const senderMember = memberList.find((tm) => tm.id === senderId);
-          return {
-            id: String(m.id),
-            conversationId: String(m.conversation_id),
-            senderType: (m.sender_type as Message['senderType']) ?? 'contact',
-            senderName:
-              senderMember?.fullName ??
-              (m.sender_type === 'contact' ? 'Customer' : m.sender_type === 'ai' ? 'AI Assistant' : 'Team'),
-            senderId,
-            direction: (m.direction as Message['direction']) ?? 'inbound',
-            messageType: (m.message_type as MessageType) ?? 'text',
-            body: String(m.body ?? ''),
-            mediaUrl: m.media_url ? String(m.media_url) : undefined,
-            mediaFilename: m.media_filename ? String(m.media_filename) : undefined,
-            templateName: m.template_name ? String(m.template_name) : undefined,
-            deliveryStatus: (m.delivery_status as Message['deliveryStatus']) ?? 'queued',
-            errorCode: m.error_code ? String(m.error_code) : undefined,
-            errorMessage: m.error_message ? String(m.error_message) : undefined,
-            createdAt: String(m.created_at ?? new Date().toISOString()),
-          };
-        })
-      );
+      const loadedMsgs = [...(msgsRes.data ?? [])]
+        .reverse()
+        .map((m) => mapDbMessageRow(m as Record<string, unknown>, memberList));
+      setMessages(loadedMsgs);
+
+      const hasMoreInitial: Record<string, boolean> = {};
+      if ((msgsRes.data ?? []).length >= 300) {
+        for (const cv of convList) {
+          hasMoreInitial[cv.id] = true;
+        }
+      }
+      setHasMoreMessagesMap(hasMoreInitial);
+
+      // Load admin-only webhook diagnostics cleanly
+      const activeCallerMember = memberList.find((m) => m.id === userId);
+      if (activeCallerMember?.role === 'admin') {
+        const events = await fetchRecentWebhookEvents(businessId, 10);
+        setWebhookEvents(events);
+      } else {
+        setWebhookEvents([]);
+      }
 
       setTemplates(
         (tplsRes.data ?? []).map((t: Record<string, unknown>) => ({
@@ -810,27 +872,169 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       }
     });
 
+    return () => {
+      active = false;
+      listener.subscription.unsubscribe();
+    };
+  }, [resetWorkspaceState, resolveAuthenticatedUser]);
+
+  // Scoped, incremental Supabase Realtime subscription for live 1-to-1 messaging & delivery statuses
+  useEffect(() => {
+    if (
+      !supabase ||
+      !isSupabaseConfigured ||
+      authStatus !== 'authenticated' ||
+      !UUID_REGEX.test(business.id)
+    ) {
+      return;
+    }
+
+    const client = supabase;
+    const businessId = business.id;
+
     const channel = client
-      .channel('zoqniva-inbox-realtime')
+      .channel(`zoqniva-business-${businessId}`)
       .on(
         'postgres_changes',
-        { event: '*', schema: 'public', table: 'messages' },
-        () => {
-          void client.auth.getUser().then(({ data }) => {
-            if (data.user) {
-              void loadSupabaseWorkspace(data.user.id);
+        {
+          event: '*',
+          schema: 'public',
+          table: 'messages',
+          filter: `business_id=eq.${businessId}`,
+        },
+        (payload) => {
+          const row = (payload.new as Record<string, unknown> | null) ?? null;
+          if (!row) return;
+          const mapped = mapDbMessageRow(row, teamMembersRef.current);
+
+          setMessages((prev) => {
+            const idx = prev.findIndex(
+              (m) =>
+                m.id === mapped.id ||
+                (Boolean(mapped.clientRequestId) && m.clientRequestId === mapped.clientRequestId)
+            );
+            if (idx >= 0) {
+              const next = [...prev];
+              next[idx] = mapped;
+              return next;
             }
+            return [...prev, mapped].sort(
+              (a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime()
+            );
           });
+        }
+      )
+      .on(
+        'postgres_changes',
+        {
+          event: '*',
+          schema: 'public',
+          table: 'conversations',
+          filter: `business_id=eq.${businessId}`,
+        },
+        (payload) => {
+          const c = (payload.new as Record<string, unknown> | null) ?? null;
+          if (!c) return;
+          const mappedConv: Conversation = {
+            id: String(c.id),
+            contactId: String(c.contact_id),
+            assignedToId: c.assigned_to ? String(c.assigned_to) : null,
+            status: (c.status as ConversationStatus) ?? 'open',
+            unreadCount: Number(c.unread_count ?? 0),
+            humanHandoffRequested: Boolean(c.human_handoff_requested),
+            lastCustomerMessageAt: String(
+              c.last_customer_message_at ?? c.created_at ?? new Date().toISOString()
+            ),
+            windowExpiresAt: String(c.window_expires_at ?? new Date(0).toISOString()),
+            lastMessagePreview: String(c.last_message_preview ?? ''),
+            lastMessageAt: String(c.last_message_at ?? c.created_at ?? new Date().toISOString()),
+          };
+
+          setConversations((prev) => {
+            const exists = prev.some((item) => item.id === mappedConv.id);
+            if (exists) {
+              return prev.map((item) => (item.id === mappedConv.id ? mappedConv : item));
+            }
+            return [mappedConv, ...prev];
+          });
+        }
+      )
+      .on(
+        'postgres_changes',
+        {
+          event: '*',
+          schema: 'public',
+          table: 'contacts',
+          filter: `business_id=eq.${businessId}`,
+        },
+        (payload) => {
+          const c = (payload.new as Record<string, unknown> | null) ?? null;
+          if (!c) return;
+          setContacts((prev) => {
+            const existing = prev.find((item) => item.id === String(c.id));
+            const mappedContact: Contact = {
+              id: String(c.id),
+              fullName: String(c.full_name),
+              phoneE164: String(c.phone_e164),
+              waId: c.wa_id ? String(c.wa_id) : undefined,
+              email: String(c.email ?? ''),
+              company: String(c.company ?? ''),
+              city: String(c.city ?? ''),
+              country: String(c.country ?? ''),
+              marketingOptIn: Boolean(c.marketing_opt_in),
+              optedOutAt: c.opted_out_at ? String(c.opted_out_at) : undefined,
+              tagIds: existing?.tagIds ?? [],
+              notes: String(c.notes ?? ''),
+              lastContactedAt: c.last_contacted_at ? String(c.last_contacted_at) : undefined,
+              createdAt: String(c.created_at ?? new Date().toISOString()),
+            };
+            if (existing) {
+              return prev.map((item) => (item.id === mappedContact.id ? mappedContact : item));
+            }
+            return [mappedContact, ...prev];
+          });
+        }
+      )
+      .on(
+        'postgres_changes',
+        {
+          event: '*',
+          schema: 'public',
+          table: 'whatsapp_accounts',
+          filter: `business_id=eq.${businessId}`,
+        },
+        (payload) => {
+          const wa = (payload.new as Record<string, unknown> | null) ?? null;
+          if (!wa) return;
+          setBusiness((prev) => ({
+            ...prev,
+            whatsappDisplayName: String(wa.display_name ?? prev.whatsappDisplayName),
+            whatsappPhoneE164: String(wa.phone_number_e164 ?? prev.whatsappPhoneE164),
+            metaPhoneNumberId: String(wa.meta_phone_number_id ?? prev.metaPhoneNumberId),
+            metaWabaId: String(wa.meta_waba_id ?? prev.metaWabaId),
+            metaConnectionState:
+              (wa.connection_status as MetaConnectionState) ?? prev.metaConnectionState,
+            metaLastError: wa.last_error_message ? String(wa.last_error_message) : undefined,
+            messagingMode: wa.messaging_mode === 'live' ? 'live' : 'test',
+            testAllowlist: Array.isArray(wa.test_allowlist)
+              ? wa.test_allowlist.map(String)
+              : prev.testAllowlist,
+            graphApiVersion: String(wa.graph_api_version ?? prev.graphApiVersion),
+            verifiedName: wa.verified_name ? String(wa.verified_name) : prev.verifiedName,
+            qualityRating:
+              (wa.quality_rating as BusinessProfile['qualityRating']) ?? prev.qualityRating,
+            webhookVerifiedAt: wa.webhook_verified_at
+              ? String(wa.webhook_verified_at)
+              : prev.webhookVerifiedAt,
+          }));
         }
       )
       .subscribe();
 
     return () => {
-      active = false;
-      listener.subscription.unsubscribe();
       void client.removeChannel(channel);
     };
-  }, [loadSupabaseWorkspace, resetWorkspaceState, resolveAuthenticatedUser]);
+  }, [authStatus, business.id]);
 
   const appendAudit = (action: string, entityType: string, details: string) => {
     setAuditLogs((prev) => [
@@ -1037,7 +1241,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   );
 
   // ============================================================================
-  // INBOX OPERATIONS (Respecting 24h Window & Honest Delivery States)
+  // INBOX OPERATIONS (Respecting 24h Window, Test Mode & Honest Delivery States)
   // ============================================================================
   const sendMessage: AppContextValue['sendMessage'] = async ({
     conversationId,
@@ -1045,16 +1249,23 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     messageType,
     templateName,
     mediaFilename,
+    clientRequestId: providedRequestId,
   }) => {
     const conv = conversations.find((c) => c.id === conversationId);
     if (!conv) return { ok: false, error: 'Conversation not found.' };
 
     const trimmed = body.trim();
     if (!trimmed) return { ok: false, error: 'Message content cannot be empty.' };
+    if (trimmed.length > 4096) {
+      return { ok: false, error: 'WhatsApp messages cannot exceed 4,096 characters.' };
+    }
 
+    // Internal Team Note (written directly under strict RLS policy)
     if (messageType === 'internal_note') {
+      const noteId = crypto.randomUUID();
+      const nowIso = new Date().toISOString();
       const noteMsg: Message = {
-        id: `msg-${Date.now()}`,
+        id: noteId,
         conversationId,
         senderType: 'agent',
         senderName: currentUser?.fullName ?? 'Agent',
@@ -1063,58 +1274,85 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         messageType: 'internal_note',
         body: trimmed,
         deliveryStatus: 'internal',
-        createdAt: new Date().toISOString(),
+        createdAt: nowIso,
       };
       setMessages((prev) => [...prev, noteMsg]);
+
+      if (supabase && isSupabaseConfigured && UUID_REGEX.test(business.id)) {
+        const { error: noteErr } = await supabase.from('messages').insert({
+          id: noteId,
+          business_id: business.id,
+          conversation_id: conversationId,
+          sender_type: 'agent',
+          sender_profile_id: currentUser?.id ?? null,
+          direction: 'internal',
+          message_type: 'internal_note',
+          body: trimmed,
+          delivery_status: 'internal',
+          created_at: nowIso,
+        });
+        if (noteErr) {
+          setMessages((prev) => prev.filter((m) => m.id !== noteId));
+          return { ok: false, error: noteErr.message };
+        }
+      }
       return { ok: true };
     }
 
-    const windowState = getWindowStatus(conv.windowExpiresAt);
-    if (!windowState.isOpen && messageType !== 'template') {
+    // Only text replies and approved templates can be sent via WhatsApp Cloud API right now
+    if (messageType !== 'text' && messageType !== 'template') {
       return {
         ok: false,
+        code: 'MEDIA_UPLOAD_NOT_ENABLED',
+        error:
+          'Sending image or document attachments requires media upload integration first. Send a text reply or approved template.',
+      };
+    }
+
+    if (business.metaConnectionState !== 'connected') {
+      return {
+        ok: false,
+        code: 'WHATSAPP_NOT_CONNECTED',
+        error: 'Verify your WhatsApp Business connection in Settings before sending live messages.',
+      };
+    }
+
+    const contact = contacts.find((c) => c.id === conv.contactId);
+    if (business.messagingMode === 'test' && contact) {
+      const normalizedRecipient = normalizePhoneE164(contact.phoneE164);
+      const allowed = business.testAllowlist
+        .map((p) => normalizePhoneE164(p))
+        .filter((p): p is string => Boolean(p));
+      if (!normalizedRecipient || !allowed.includes(normalizedRecipient)) {
+        return {
+          ok: false,
+          code: 'TEST_MODE_RECIPIENT_NOT_ALLOWED',
+          error:
+            'Test Mode is active. Add this customer phone number to your Test Allowlist in Settings before sending.',
+        };
+      }
+    }
+
+    const windowState = getWindowStatus(conv.windowExpiresAt);
+    if (messageType === 'text' && !windowState.isOpen) {
+      return {
+        ok: false,
+        code: 'WINDOW_EXPIRED',
         error:
           'The 24-hour customer service window is closed. You must send an approved WhatsApp template message.',
       };
     }
 
-    const isMetaConnected = business.metaConnectionState === 'connected';
-
-    if (supabase && isSupabaseConfigured && isMetaConnected) {
-      const { data, error } = await supabase.functions.invoke('send-whatsapp-message', {
-        body: {
-          conversationId,
-          messageType,
-          body: trimmed,
-          templateName,
-        },
-      });
-
-      if (error || !data?.metaMessageId) {
-        const errMsg: Message = {
-          id: `msg-${Date.now()}`,
-          conversationId,
-          senderType: 'agent',
-          senderName: currentUser?.fullName ?? 'Agent',
-          senderId: currentUser?.id,
-          direction: 'outbound',
-          messageType,
-          body: trimmed,
-          templateName,
-          mediaFilename,
-          deliveryStatus: 'failed',
-          errorCode: data?.code ?? 'EDGE_FUNCTION_ERROR',
-          errorMessage: error?.message ?? data?.error ?? 'Failed to dispatch via Meta Cloud API.',
-          createdAt: new Date().toISOString(),
-        };
-        setMessages((prev) => [...prev, errMsg]);
-        return { ok: false, error: errMsg.errorMessage };
-      }
+    if (!supabase || !isSupabaseConfigured) {
+      return { ok: false, error: 'Supabase configuration is required to send WhatsApp messages.' };
     }
 
-    const deliveryStatus = isMetaConnected ? 'sent' : 'failed';
-    const newMsg: Message = {
-      id: `msg-${Date.now()}`,
+    const clientRequestId = providedRequestId || crypto.randomUUID();
+    const optimisticId = `pending-${clientRequestId}`;
+    const optimisticNow = new Date().toISOString();
+
+    const optimisticMsg: Message = {
+      id: optimisticId,
       conversationId,
       senderType: 'agent',
       senderName: currentUser?.fullName ?? 'Agent',
@@ -1124,22 +1362,74 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       body: trimmed,
       templateName,
       mediaFilename,
-      deliveryStatus,
-      errorCode: isMetaConnected ? undefined : 'META_NOT_CONNECTED',
-      errorMessage: isMetaConnected
-        ? undefined
-        : 'Meta WhatsApp Cloud API is not connected to transmit this message.',
-      createdAt: new Date().toISOString(),
+      clientRequestId,
+      deliveryStatus: 'pending',
+      createdAt: optimisticNow,
     };
 
-    setMessages((prev) => [...prev, newMsg]);
+    setMessages((prev) => [...prev, optimisticMsg]);
+
+    const tplObj = templateName
+      ? templates.find((t) => t.name === templateName && t.approvalStatus === 'APPROVED')
+      : undefined;
+
+    const result = await invokeSendWhatsAppMessage({
+      conversationId,
+      messageType,
+      body: trimmed,
+      templateName,
+      language: tplObj?.language ?? 'en_US',
+      clientRequestId,
+    });
+
+    if (result.messageRow) {
+      const authoritativeMsg = mapDbMessageRow(result.messageRow, teamMembers);
+      setMessages((prev) => {
+        const replaced = prev.map((m) =>
+          m.id === optimisticId ||
+          (m.clientRequestId && m.clientRequestId === clientRequestId)
+            ? authoritativeMsg
+            : m
+        );
+        // Deduplicate if Realtime inserted it concurrently
+        const seen = new Set<string>();
+        return replaced.filter((m) => {
+          if (seen.has(m.id)) return false;
+          seen.add(m.id);
+          return true;
+        });
+      });
+    } else if (!result.ok) {
+      setMessages((prev) =>
+        prev.map((m) =>
+          m.id === optimisticId
+            ? {
+                ...m,
+                deliveryStatus: 'failed',
+                failedAt: new Date().toISOString(),
+                errorCode: result.errorCode ?? 'SEND_FAILED',
+                errorMessage: result.error ?? 'Could not send message via WhatsApp Cloud API.',
+              }
+            : m
+        )
+      );
+    }
+
+    if (!result.ok) {
+      return {
+        ok: false,
+        code: result.errorCode,
+        error: result.error ?? 'Failed to send message via WhatsApp Cloud API.',
+      };
+    }
+
     setConversations((prev) =>
       prev.map((c) =>
         c.id === conversationId
           ? {
               ...c,
-              lastMessagePreview: trimmed,
-              lastMessageAt: newMsg.createdAt,
+              lastMessagePreview: trimmed.slice(0, 140),
+              lastMessageAt: optimisticNow,
               unreadCount: 0,
             }
           : c
@@ -1149,26 +1439,29 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     return { ok: true };
   };
 
-  const retryFailedMessage = async (messageId: string) => {
+  const retryFailedMessage: AppContextValue['retryFailedMessage'] = async (messageId) => {
     const target = messages.find((m) => m.id === messageId);
-    if (!target) return;
-
-    if (business.metaConnectionState !== 'connected') {
-      setMessages((prev) =>
-        prev.map((m) =>
-          m.id === messageId
-            ? {
-                ...m,
-                errorMessage:
-                  'Cannot retry delivery: Connect your WhatsApp account in Settings first.',
-              }
-            : m
-        )
-      );
-      return;
+    if (!target || target.deliveryStatus !== 'failed') {
+      return { ok: false, error: 'Only failed messages can be retried.' };
     }
 
-    await sendMessage({
+    if (target.metaMessageId) {
+      return {
+        ok: false,
+        error:
+          'This message already received a Meta message ID and cannot be blindly resent to avoid duplicates.',
+      };
+    }
+
+    if (business.metaConnectionState !== 'connected') {
+      const errMsg = 'Cannot retry delivery: Connect your WhatsApp account in Settings first.';
+      setMessages((prev) =>
+        prev.map((m) => (m.id === messageId ? { ...m, errorMessage: errMsg } : m))
+      );
+      return { ok: false, error: errMsg };
+    }
+
+    return sendMessage({
       conversationId: target.conversationId,
       body: target.body,
       messageType: target.messageType,
@@ -1177,10 +1470,51 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     });
   };
 
+  const loadOlderMessages: AppContextValue['loadOlderMessages'] = async (conversationId) => {
+    if (!supabase || !isSupabaseConfigured || !UUID_REGEX.test(business.id)) {
+      return { loaded: 0, hasMore: false };
+    }
+    const convMessages = messages
+      .filter((m) => m.conversationId === conversationId && !m.id.startsWith('pending-'))
+      .sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
+
+    const beforeIso = convMessages[0]?.createdAt ?? new Date().toISOString();
+    const { messages: older, hasMore } = await fetchOlderMessagesPage({
+      businessId: business.id,
+      conversationId,
+      beforeIso,
+      limit: 50,
+      teamMembers,
+    });
+
+    if (older.length > 0) {
+      setMessages((prev) => {
+        const existingIds = new Set(prev.map((m) => m.id));
+        const merged = [...older.filter((m) => !existingIds.has(m.id)), ...prev];
+        return merged.sort(
+          (a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime()
+        );
+      });
+    }
+
+    setHasMoreMessagesMap((prev) => ({ ...prev, [conversationId]: hasMore }));
+    return { loaded: older.length, hasMore };
+  };
+
   const markConversationRead = (conversationId: string) => {
+    const target = conversations.find((c) => c.id === conversationId);
     setConversations((prev) =>
       prev.map((c) => (c.id === conversationId ? { ...c, unreadCount: 0 } : c))
     );
+    if (
+      target &&
+      target.unreadCount > 0 &&
+      supabase &&
+      isSupabaseConfigured &&
+      UUID_REGEX.test(conversationId)
+    ) {
+      void supabase.from('conversations').update({ unread_count: 0 }).eq('id', conversationId);
+    }
   };
 
   const assignConversation = (conversationId: string, memberId: string | null) => {
@@ -1188,6 +1522,9 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       prev.map((c) => (c.id === conversationId ? { ...c, assignedToId: memberId } : c))
     );
     if (memberId) setLastAssignedMemberId(memberId);
+    if (supabase && isSupabaseConfigured && UUID_REGEX.test(conversationId)) {
+      void supabase.from('conversations').update({ assigned_to: memberId }).eq('id', conversationId);
+    }
     const memberName = teamMembers.find((m) => m.id === memberId)?.fullName ?? 'Unassigned';
     appendAudit('Assigned Conversation', 'conversation', `Assigned ${conversationId} to ${memberName}`);
   };
@@ -1196,6 +1533,9 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     setConversations((prev) =>
       prev.map((c) => (c.id === conversationId ? { ...c, status } : c))
     );
+    if (supabase && isSupabaseConfigured && UUID_REGEX.test(conversationId)) {
+      void supabase.from('conversations').update({ status }).eq('id', conversationId);
+    }
     appendAudit('Updated Conversation Status', 'conversation', `Marked ${conversationId} as ${status}`);
   };
 
@@ -1205,6 +1545,12 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         c.id === conversationId ? { ...c, humanHandoffRequested: requested } : c
       )
     );
+    if (supabase && isSupabaseConfigured && UUID_REGEX.test(conversationId)) {
+      void supabase
+        .from('conversations')
+        .update({ human_handoff_requested: requested })
+        .eq('id', conversationId);
+    }
   };
 
   // ============================================================================
@@ -1224,10 +1570,12 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         error: `A contact with phone number ${normalized} already exists.`,
       };
     }
+    const contactId = crypto.randomUUID();
     const created: Contact = {
-      id: `cnt-${Date.now()}`,
+      id: contactId,
       fullName: input.fullName.trim(),
       phoneE164: normalized,
+      waId: normalized.replace('+', ''),
       email: input.email.trim(),
       company: input.company.trim(),
       city: input.city.trim(),
@@ -1240,12 +1588,15 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     setContacts((prev) => [created, ...prev]);
 
     if (supabase && isSupabaseConfigured && UUID_REGEX.test(business.id)) {
-      void supabase
+      const client = supabase;
+      void client
         .from('contacts')
         .insert({
+          id: contactId,
           business_id: business.id,
           full_name: created.fullName,
           phone_e164: created.phoneE164,
+          wa_id: created.waId,
           email: created.email || null,
           company: created.company || null,
           city: created.city || null,
@@ -1254,12 +1605,12 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           notes: created.notes,
           created_by: currentUser?.id ?? null,
         })
-        .select('id')
-        .single()
-        .then(({ data }) => {
-          if (data?.id) {
-            setContacts((prev) =>
-              prev.map((c) => (c.id === created.id ? { ...c, id: String(data.id) } : c))
+        .then(({ error }) => {
+          if (!error && created.tagIds.length > 0) {
+            void client.from('contact_tags').insert(
+              created.tagIds
+                .filter((tid) => UUID_REGEX.test(tid))
+                .map((tid) => ({ contact_id: contactId, tag_id: tid }))
             );
           }
         });
@@ -1279,20 +1630,62 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         return { ok: false, error: `Phone ${normalized} belongs to another contact.` };
       }
       updates.phoneE164 = normalized;
+      updates.waId = normalized.replace('+', '');
     }
+
+    const existing = contacts.find((c) => c.id === id);
+    const nextOptOut =
+      updates.marketingOptIn === false && existing?.marketingOptIn
+        ? new Date().toISOString()
+        : updates.marketingOptIn === true
+        ? undefined
+        : existing?.optedOutAt;
 
     setContacts((prev) =>
       prev.map((c) => {
         if (c.id !== id) return c;
-        const optOutStamp =
-          updates.marketingOptIn === false && c.marketingOptIn
-            ? new Date().toISOString()
-            : updates.marketingOptIn === true
-            ? undefined
-            : c.optedOutAt;
-        return { ...c, ...updates, optedOutAt: optOutStamp };
+        return { ...c, ...updates, optedOutAt: nextOptOut };
       })
     );
+
+    if (supabase && isSupabaseConfigured && UUID_REGEX.test(id)) {
+      const client = supabase;
+      const dbPatch: Record<string, unknown> = {};
+      if (updates.fullName !== undefined) dbPatch.full_name = updates.fullName;
+      if (updates.phoneE164 !== undefined) {
+        dbPatch.phone_e164 = updates.phoneE164;
+        dbPatch.wa_id = updates.phoneE164.replace('+', '');
+      }
+      if (updates.email !== undefined) dbPatch.email = updates.email || null;
+      if (updates.company !== undefined) dbPatch.company = updates.company || null;
+      if (updates.city !== undefined) dbPatch.city = updates.city || null;
+      if (updates.country !== undefined) dbPatch.country = updates.country || null;
+      if (updates.notes !== undefined) dbPatch.notes = updates.notes;
+      if (updates.marketingOptIn !== undefined) {
+        dbPatch.marketing_opt_in = updates.marketingOptIn;
+        dbPatch.opted_out_at = nextOptOut ?? null;
+      }
+
+      if (Object.keys(dbPatch).length > 0) {
+        void client.from('contacts').update(dbPatch).eq('id', id);
+      }
+
+      if (updates.tagIds !== undefined) {
+        const validTags = updates.tagIds.filter((tid) => UUID_REGEX.test(tid));
+        void client
+          .from('contact_tags')
+          .delete()
+          .eq('contact_id', id)
+          .then(() => {
+            if (validTags.length > 0) {
+              void client
+                .from('contact_tags')
+                .insert(validTags.map((tid) => ({ contact_id: id, tag_id: tid })));
+            }
+          });
+      }
+    }
+
     return { ok: true };
   };
 
@@ -1317,6 +1710,14 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           : c
       )
     );
+    if (supabase && isSupabaseConfigured && UUID_REGEX.test(tagId)) {
+      const pairs = contactIds
+        .filter((cid) => UUID_REGEX.test(cid))
+        .map((cid) => ({ contact_id: cid, tag_id: tagId }));
+      if (pairs.length > 0) {
+        void supabase.from('contact_tags').upsert(pairs, { onConflict: 'contact_id,tag_id' });
+      }
+    }
     const tagName = tags.find((t) => t.id === tagId)?.name ?? tagId;
     appendAudit('Bulk Tagged Contacts', 'contact', `Applied "${tagName}" to ${contactIds.length} contacts`);
   };
@@ -1329,9 +1730,10 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       if (!existing.has(row.phoneE164)) {
         existing.add(row.phoneE164);
         toAdd.push({
-          id: `cnt-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+          id: crypto.randomUUID(),
           fullName: row.fullName,
           phoneE164: row.phoneE164,
+          waId: row.phoneE164.replace('+', ''),
           email: row.email,
           company: row.company,
           city: row.city,
@@ -1346,6 +1748,24 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
     if (toAdd.length > 0) {
       setContacts((prev) => [...toAdd, ...prev]);
+      if (supabase && isSupabaseConfigured && UUID_REGEX.test(business.id)) {
+        void supabase.from('contacts').insert(
+          toAdd.map((c) => ({
+            id: c.id,
+            business_id: business.id,
+            full_name: c.fullName,
+            phone_e164: c.phoneE164,
+            wa_id: c.waId,
+            email: c.email || null,
+            company: c.company || null,
+            city: c.city || null,
+            country: c.country || null,
+            marketing_opt_in: c.marketingOptIn,
+            notes: c.notes,
+            created_by: currentUser?.id ?? null,
+          }))
+        );
+      }
       appendAudit('Imported Contacts CSV', 'contact', `Imported ${toAdd.length} normalized contacts`);
     }
     return toAdd.length;
@@ -1355,11 +1775,19 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     const existing = tags.find((t) => t.name.toLowerCase() === name.trim().toLowerCase());
     if (existing) return existing;
     const tag: Tag = {
-      id: `tag-${Date.now()}`,
+      id: crypto.randomUUID(),
       name: name.trim(),
       color,
     };
     setTags((prev) => [...prev, tag]);
+    if (supabase && isSupabaseConfigured && UUID_REGEX.test(business.id)) {
+      void supabase.from('tags').insert({
+        id: tag.id,
+        business_id: business.id,
+        name: tag.name,
+        color: tag.color,
+      });
+    }
     return tag;
   };
 
@@ -1369,8 +1797,10 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       setSelectedConversationId(existing.id);
       return existing.id;
     }
+    const convId = crypto.randomUUID();
+    const nowIso = new Date().toISOString();
     const created: Conversation = {
-      id: `conv-${Date.now()}`,
+      id: convId,
       contactId,
       assignedToId: currentUser?.id ?? null,
       status: 'open',
@@ -1379,26 +1809,43 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       lastCustomerMessageAt: new Date(0).toISOString(),
       windowExpiresAt: new Date(0).toISOString(),
       lastMessagePreview: 'New conversation started — send an approved template to initiate.',
-      lastMessageAt: new Date().toISOString(),
+      lastMessageAt: nowIso,
     };
     setConversations((prev) => [created, ...prev]);
     setSelectedConversationId(created.id);
+
+    if (
+      supabase &&
+      isSupabaseConfigured &&
+      UUID_REGEX.test(business.id) &&
+      UUID_REGEX.test(contactId)
+    ) {
+      void supabase.from('conversations').insert({
+        id: convId,
+        business_id: business.id,
+        contact_id: contactId,
+        assigned_to: currentUser?.id ?? null,
+        status: 'open',
+        unread_count: 0,
+        last_message_preview: created.lastMessagePreview,
+        last_message_at: nowIso,
+      });
+    }
     return created.id;
   };
 
   // ============================================================================
-  // BROADCASTS & TEMPLATES
+  // BROADCASTS & TEMPLATES (Disabled from live execution in Test Mode)
   // ============================================================================
   const createCampaign: AppContextValue['createCampaign'] = (input) => {
-    const isMetaLive = business.metaConnectionState === 'connected';
+    const isMetaLive =
+      business.metaConnectionState === 'connected' && business.messagingMode === 'live';
     const nextStatus: Campaign['status'] =
-      input.scheduleMode === 'draft'
+      input.scheduleMode === 'draft' || !isMetaLive
         ? 'draft'
         : input.scheduleMode === 'scheduled'
         ? 'scheduled'
-        : isMetaLive
-        ? 'running'
-        : 'draft';
+        : 'running';
 
     const campaign: Campaign = {
       id: `cmp-${Date.now()}`,
@@ -1645,13 +2092,24 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
   const updateBusinessProfile = (updates: Partial<BusinessProfile>) => {
     setBusiness((prev) => ({ ...prev, ...updates }));
+    if (supabase && isSupabaseConfigured && UUID_REGEX.test(business.id)) {
+      const patch: Record<string, unknown> = {};
+      if (updates.name !== undefined) patch.name = updates.name;
+      if (updates.industry !== undefined) patch.industry = updates.industry;
+      if (updates.timezone !== undefined) patch.timezone = updates.timezone;
+      if (updates.website !== undefined) patch.website = updates.website;
+      if (Object.keys(patch).length > 0) {
+        void supabase.from('businesses').update(patch).eq('id', business.id);
+      }
+    }
     appendAudit('Updated Business Settings', 'business', 'Modified business profile configuration');
   };
 
-  const verifyMetaConnection = async (
-    phoneNumberId: string,
-    wabaId: string
-  ): Promise<{ ok: boolean; message: string }> => {
+  const verifyMetaConnection: AppContextValue['verifyMetaConnection'] = async (
+    phoneNumberId,
+    wabaId,
+    options
+  ) => {
     const cleanPhoneId = phoneNumberId.trim();
     const cleanWabaId = wabaId.trim();
 
@@ -1680,21 +2138,40 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       };
     }
 
-    const { data, error } = await supabase.functions.invoke('sync-templates');
-    if (!error) {
+    const res = await invokeConnectionCheck({
+      action: 'verify',
+      phoneNumberId: cleanPhoneId,
+      wabaId: cleanWabaId,
+      messagingMode: options?.messagingMode ?? business.messagingMode,
+      testAllowlist: options?.testAllowlist ?? business.testAllowlist,
+      graphApiVersion: options?.graphApiVersion ?? business.graphApiVersion,
+    });
+
+    if (typeof res.webhookSecretsReady === 'boolean') {
+      setWebhookSecretsReady(res.webhookSecretsReady);
+    }
+
+    if (res.ok) {
       setBusiness((prev) => ({
         ...prev,
-        metaPhoneNumberId: cleanPhoneId,
-        metaWabaId: cleanWabaId,
+        metaPhoneNumberId: res.phoneNumberId || cleanPhoneId,
+        metaWabaId: res.wabaId || cleanWabaId,
+        whatsappPhoneE164: res.displayPhoneNumber || prev.whatsappPhoneE164,
+        whatsappDisplayName: res.verifiedName || prev.whatsappDisplayName,
+        verifiedName: res.verifiedName || prev.verifiedName,
+        qualityRating: res.qualityRating ?? prev.qualityRating,
+        messagingMode: res.messagingMode ?? prev.messagingMode,
+        testAllowlist: res.testAllowlist ?? prev.testAllowlist,
+        graphApiVersion: res.graphApiVersion ?? prev.graphApiVersion,
         metaConnectionState: 'connected',
         metaLastError: undefined,
       }));
       if (currentUser?.id) {
-        await loadSupabaseWorkspace(currentUser.id);
+        await loadSupabaseWorkspace(currentUser.id, business.id || undefined);
       }
       return {
         ok: true,
-        message: `Meta WhatsApp Cloud API connection verified (${data?.templatesCount ?? 0} templates synced).`,
+        message: res.message || 'Meta WhatsApp Cloud API connection verified.',
       };
     }
 
@@ -1702,10 +2179,53 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       ...prev,
       metaPhoneNumberId: cleanPhoneId,
       metaWabaId: cleanWabaId,
-      metaConnectionState: 'connection_error',
-      metaLastError: error.message,
+      metaConnectionState: res.connectionStatus ?? 'connection_error',
+      metaLastError: res.error || 'Meta WhatsApp connection check failed.',
+      messagingMode: res.messagingMode ?? prev.messagingMode,
+      testAllowlist: res.testAllowlist ?? prev.testAllowlist,
+      graphApiVersion: res.graphApiVersion ?? prev.graphApiVersion,
     }));
-    return { ok: false, message: error.message };
+
+    return {
+      ok: false,
+      message: res.error || 'Could not verify Meta WhatsApp Cloud API connection.',
+      diagnostic: res.diagnostic,
+    };
+  };
+
+  const saveWhatsAppConfig: AppContextValue['saveWhatsAppConfig'] = async (options) => {
+    if (!isSupabaseConfigured || !supabase) {
+      return { ok: false, message: 'Supabase configuration is required.' };
+    }
+    const res = await invokeConnectionCheck({
+      action: 'save_config',
+      phoneNumberId: options.phoneNumberId ?? business.metaPhoneNumberId,
+      wabaId: options.wabaId ?? business.metaWabaId,
+      messagingMode: options.messagingMode,
+      testAllowlist: options.testAllowlist,
+      graphApiVersion: options.graphApiVersion ?? business.graphApiVersion,
+    });
+
+    if (typeof res.webhookSecretsReady === 'boolean') {
+      setWebhookSecretsReady(res.webhookSecretsReady);
+    }
+
+    if (res.ok) {
+      setBusiness((prev) => ({
+        ...prev,
+        messagingMode: res.messagingMode ?? options.messagingMode,
+        testAllowlist: res.testAllowlist ?? options.testAllowlist,
+        graphApiVersion: res.graphApiVersion ?? prev.graphApiVersion,
+      }));
+      return { ok: true, message: res.message || 'WhatsApp messaging mode updated.' };
+    }
+    return { ok: false, message: res.error || 'Could not save WhatsApp mode settings.' };
+  };
+
+  const refreshWebhookDiagnostics = async () => {
+    if (!UUID_REGEX.test(business.id) || currentUser?.role !== 'admin') return;
+    const events = await fetchRecentWebhookEvents(business.id, 10);
+    setWebhookEvents(events);
   };
 
   const updateBusinessHours = (hours: BusinessHoursDay[]) => {
@@ -1754,6 +2274,9 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     businessHours,
     auditLogs,
     notifications,
+    webhookEvents,
+    webhookCallbackUrl,
+    webhookSecretsReady,
     totalUnreadCount,
     selectedConversationId,
     setSelectedConversationId,
@@ -1765,6 +2288,8 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     setPreferredInboxFilter: handleSetPreferredInboxFilter,
     sendMessage,
     retryFailedMessage,
+    loadOlderMessages,
+    hasMoreMessagesMap,
     markConversationRead,
     assignConversation,
     updateConversationStatus,
@@ -1797,6 +2322,8 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     removeTeamMember,
     updateBusinessProfile,
     verifyMetaConnection,
+    saveWhatsAppConfig,
+    refreshWebhookDiagnostics,
     updateBusinessHours,
     markNotificationRead,
     markAllNotificationsRead,

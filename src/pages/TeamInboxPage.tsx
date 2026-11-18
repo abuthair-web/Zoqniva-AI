@@ -46,6 +46,8 @@ export function TeamInboxPage() {
     lastAssignedMemberId,
     sendMessage,
     retryFailedMessage,
+    loadOlderMessages,
+    hasMoreMessagesMap,
     markConversationRead,
     assignConversation,
     updateConversationStatus,
@@ -56,12 +58,12 @@ export function TeamInboxPage() {
   const [searchQuery, setSearchQuery] = useState('');
   const [composerMode, setComposerMode] = useState<'reply' | 'internal_note'>('reply');
   const [draftText, setDraftText] = useState('');
-  const [attachmentName, setAttachmentName] = useState<string | null>(null);
-  const [attachmentType, setAttachmentType] = useState<'image' | 'document'>('document');
   const [emojiOpen, setEmojiOpen] = useState(false);
   const [templateModalOpen, setTemplateModalOpen] = useState(false);
   const [selectedTemplateId, setSelectedTemplateId] = useState<string>('');
   const [sendError, setSendError] = useState<string | null>(null);
+  const [isSending, setIsSending] = useState(false);
+  const [loadingOlder, setLoadingOlder] = useState(false);
   const [mobileView, setMobileView] = useState<'list' | 'chat'>('list');
   const [showDetailsDrawer, setShowDetailsDrawer] = useState(false);
   const [overflowOpen, setOverflowOpen] = useState(false);
@@ -132,6 +134,11 @@ export function TeamInboxPage() {
     [templates]
   );
 
+  const isContactAllowlisted = useMemo(() => {
+    if (business.messagingMode !== 'test' || !activeContact) return true;
+    return business.testAllowlist.includes(activeContact.phoneE164);
+  }, [business.messagingMode, business.testAllowlist, activeContact]);
+
   const handleSelectConversation = (convId: string) => {
     setSelectedConversationId(convId);
     markConversationRead(convId);
@@ -139,57 +146,67 @@ export function TeamInboxPage() {
     setMobileView('chat');
   };
 
+  const handleLoadOlder = async () => {
+    if (!activeConversation || loadingOlder) return;
+    setLoadingOlder(true);
+    await loadOlderMessages(activeConversation.id);
+    setLoadingOlder(false);
+  };
+
   const handleSend = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!activeConversation) return;
+    if (!activeConversation || isSending) return;
     setSendError(null);
+    setIsSending(true);
 
-    const msgType =
-      composerMode === 'internal_note'
-        ? 'internal_note'
-        : attachmentName
-        ? attachmentType
-        : 'text';
+    const msgType = composerMode === 'internal_note' ? 'internal_note' : 'text';
 
-    const res = await sendMessage({
-      conversationId: activeConversation.id,
-      body: draftText || (attachmentName ? `Sent attachment: ${attachmentName}` : ''),
-      messageType: msgType,
-      mediaFilename: attachmentName ?? undefined,
-    });
+    try {
+      const res = await sendMessage({
+        conversationId: activeConversation.id,
+        body: draftText,
+        messageType: msgType,
+      });
 
-    if (!res.ok) {
-      setSendError(res.error ?? 'Could not send message.');
-      return;
+      if (!res.ok) {
+        setSendError(res.error ?? 'Could not send message.');
+        return;
+      }
+
+      setDraftText('');
+    } finally {
+      setIsSending(false);
     }
-
-    setDraftText('');
-    setAttachmentName(null);
   };
 
   const handleSendTemplate = async () => {
-    if (!activeConversation || !selectedTemplateId) return;
+    if (!activeConversation || !selectedTemplateId || isSending) return;
     const tpl = approvedTemplates.find((t) => t.id === selectedTemplateId);
     if (!tpl) return;
     setSendError(null);
+    setIsSending(true);
 
-    const renderedBody = tpl.bodyText.replace(
-      /\{\{1\}\}/g,
-      activeContact?.fullName.split(' ')[0] ?? 'Customer'
-    );
+    try {
+      const renderedBody = tpl.bodyText.replace(
+        /\{\{1\}\}/g,
+        activeContact?.fullName.split(' ')[0] ?? 'Customer'
+      );
 
-    const res = await sendMessage({
-      conversationId: activeConversation.id,
-      body: renderedBody,
-      messageType: 'template',
-      templateName: tpl.name,
-    });
+      const res = await sendMessage({
+        conversationId: activeConversation.id,
+        body: renderedBody,
+        messageType: 'template',
+        templateName: tpl.name,
+      });
 
-    if (!res.ok) {
-      setSendError(res.error ?? 'Could not send template.');
-    } else {
-      setTemplateModalOpen(false);
-      setSelectedTemplateId('');
+      if (!res.ok) {
+        setSendError(res.error ?? 'Could not send template.');
+      } else {
+        setTemplateModalOpen(false);
+        setSelectedTemplateId('');
+      }
+    } finally {
+      setIsSending(false);
     }
   };
 
@@ -214,15 +231,44 @@ export function TeamInboxPage() {
   const renderDeliveryIndicator = (status: DeliveryStatus) => {
     switch (status) {
       case 'read':
-        return <CheckCheck className="h-3.5 w-3.5 text-[#2563EB]" aria-label="Read" />;
+        return (
+          <span title="Read by customer" className="inline-flex items-center gap-1">
+            <CheckCheck className="h-3.5 w-3.5 text-[#2563EB]" aria-label="Read" />
+          </span>
+        );
       case 'delivered':
-        return <CheckCheck className="h-3.5 w-3.5 text-slate-400" aria-label="Delivered" />;
+        return (
+          <span title="Delivered to customer device" className="inline-flex items-center gap-1">
+            <CheckCheck className="h-3.5 w-3.5 text-slate-400" aria-label="Delivered" />
+          </span>
+        );
       case 'sent':
-        return <Check className="h-3.5 w-3.5 text-slate-400" aria-label="Sent" />;
+        return (
+          <span title="Sent by WhatsApp" className="inline-flex items-center gap-1">
+            <Check className="h-3.5 w-3.5 text-slate-400" aria-label="Sent" />
+          </span>
+        );
+      case 'submitted':
+        return (
+          <span title="Submitted to Meta Cloud API (awaiting webhook confirmation)" className="inline-flex items-center gap-1 text-[10px] text-slate-400">
+            <Clock className="h-3 w-3 text-[#2563EB]" aria-label="Submitted" />
+            <span>Submitted</span>
+          </span>
+        );
+      case 'pending':
       case 'queued':
-        return <Clock className="h-3.5 w-3.5 text-[#F4B942]" aria-label="Queued" />;
+        return (
+          <span title="Sending to WhatsApp..." className="inline-flex items-center gap-1 text-[10px] text-[#F4B942]">
+            <Clock className="h-3 w-3" aria-label="Sending" />
+            <span>Sending</span>
+          </span>
+        );
       case 'failed':
-        return <AlertTriangle className="h-3.5 w-3.5 text-[#E11D48]" aria-label="Failed" />;
+        return (
+          <span title="Delivery failed" className="inline-flex items-center gap-1">
+            <AlertTriangle className="h-3.5 w-3.5 text-[#E11D48]" aria-label="Failed" />
+          </span>
+        );
       default:
         return null;
     }
@@ -555,13 +601,45 @@ export function TeamInboxPage() {
               </div>
             </div>
 
-            {business.metaConnectionState !== 'connected' && (
+            {business.metaConnectionState !== 'connected' ? (
               <div className="bg-amber-50/90 border-b border-amber-200 px-4 py-2 text-xs text-amber-950">
-                WhatsApp is not connected yet — connect your account in Settings before sending live replies.
+                WhatsApp is not connected yet — verify your account in Settings before sending live replies.
               </div>
+            ) : (
+              business.messagingMode === 'test' &&
+              !isContactAllowlisted && (
+                <div className="bg-amber-50/90 border-b border-amber-200 px-4 py-2 text-xs text-amber-950 flex flex-wrap items-center justify-between gap-2">
+                  <span>
+                    Test Mode is active: add{' '}
+                    <span className="font-mono font-semibold">{activeContact.phoneE164}</span> to
+                    your Test Allowlist in Settings before sending replies.
+                  </span>
+                  {currentUser?.role === 'admin' && (
+                    <button
+                      type="button"
+                      onClick={() => navigate('/app/settings')}
+                      className="font-semibold text-[#2563EB] hover:underline cursor-pointer"
+                    >
+                      Open Settings
+                    </button>
+                  )}
+                </div>
+              )
             )}
 
             <div className="flex-1 overflow-y-auto p-4 sm:p-6 space-y-3">
+              {hasMoreMessagesMap[activeConversation.id] && (
+                <div className="flex justify-center pb-2">
+                  <button
+                    type="button"
+                    onClick={handleLoadOlder}
+                    disabled={loadingOlder}
+                    className="rounded-xl border border-[#E2E8F0] bg-white px-3.5 py-1.5 text-xs font-semibold text-slate-600 hover:bg-[#F8FAFC] disabled:opacity-50 cursor-pointer"
+                  >
+                    {loadingOlder ? 'Loading earlier messages...' : 'Load older messages'}
+                  </button>
+                </div>
+              )}
               {activeMessages.map((msg) => {
                 const isInternal = msg.direction === 'internal';
                 const isInbound = msg.direction === 'inbound';
@@ -622,16 +700,22 @@ export function TeamInboxPage() {
                     </div>
 
                     {msg.deliveryStatus === 'failed' && (
-                      <div className="mt-1 flex items-center gap-2 text-[11px] text-[#E11D48]">
-                        <span>Not delivered — WhatsApp connection required</span>
-                        <button
-                          type="button"
-                          onClick={() => retryFailedMessage(msg.id)}
-                          className="inline-flex items-center gap-1 font-semibold underline cursor-pointer"
-                        >
-                          <RefreshCw className="h-3 w-3" />
-                          Retry
-                        </button>
+                      <div className="mt-1 flex flex-wrap items-center gap-2 text-[11px] text-[#E11D48]">
+                        <span>
+                          {msg.errorMessage || 'Not delivered — check WhatsApp connection'}
+                          {currentUser?.role === 'admin' && msg.errorCode ? ` (${msg.errorCode})` : ''}
+                        </span>
+                        {!msg.metaMessageId && (
+                          <button
+                            type="button"
+                            disabled={isSending}
+                            onClick={() => void retryFailedMessage(msg.id)}
+                            className="inline-flex items-center gap-1 font-semibold underline cursor-pointer disabled:opacity-50"
+                          >
+                            <RefreshCw className="h-3 w-3" />
+                            Retry
+                          </button>
+                        )}
                       </div>
                     )}
                   </div>
@@ -681,16 +765,6 @@ export function TeamInboxPage() {
                 </div>
               )}
 
-              {attachmentName && (
-                <div className="mb-2 inline-flex items-center gap-2 rounded-lg border border-[#E2E8F0] bg-[#F8FAFC] px-3 py-1.5 text-xs text-[#0F172A]">
-                  <Paperclip className="h-3.5 w-3.5 text-[#2563EB]" />
-                  <span>{attachmentName}</span>
-                  <button type="button" onClick={() => setAttachmentName(null)}>
-                    <X className="h-3.5 w-3.5 text-slate-400 hover:text-[#E11D48]" />
-                  </button>
-                </div>
-              )}
-
               <form onSubmit={handleSend} className="flex items-end gap-2">
                 <div className="flex items-center gap-1 pb-1.5">
                   <div className="relative">
@@ -721,24 +795,14 @@ export function TeamInboxPage() {
                     )}
                   </div>
 
-                  <label
-                    className="p-2 rounded-xl text-slate-500 hover:bg-[#F8FAFC] hover:text-[#0F172A] cursor-pointer"
-                    title="Attach file"
+                  <button
+                    type="button"
+                    disabled
+                    className="p-2 rounded-xl text-slate-300 cursor-not-allowed"
+                    title="Media attachments are not enabled yet — send text or an approved template"
                   >
                     <Paperclip className="h-4 w-4" />
-                    <input
-                      type="file"
-                      className="hidden"
-                      accept="image/*,.pdf,.doc,.docx"
-                      onChange={(e) => {
-                        const file = e.target.files?.[0];
-                        if (file) {
-                          setAttachmentName(file.name);
-                          setAttachmentType(file.type.startsWith('image/') ? 'image' : 'document');
-                        }
-                      }}
-                    />
-                  </label>
+                  </button>
 
                   <button
                     type="button"
@@ -754,7 +818,7 @@ export function TeamInboxPage() {
                   type="text"
                   value={draftText}
                   onChange={(e) => setDraftText(e.target.value)}
-                  disabled={composerMode === 'reply' && !windowStatus.isOpen}
+                  disabled={isSending || (composerMode === 'reply' && !windowStatus.isOpen)}
                   placeholder={
                     composerMode === 'internal_note'
                       ? 'Add an internal note for your team...'
@@ -772,14 +836,19 @@ export function TeamInboxPage() {
                 <button
                   type="submit"
                   disabled={
-                    (!draftText.trim() && !attachmentName) ||
+                    isSending ||
+                    !draftText.trim() ||
                     (composerMode === 'reply' && !windowStatus.isOpen)
                   }
                   className="h-10 px-4 rounded-xl bg-[#2563EB] text-white text-xs font-semibold hover:bg-[#1D4ED8] disabled:opacity-45 transition-colors inline-flex items-center gap-1.5 shrink-0 cursor-pointer"
                 >
                   <Send className="h-3.5 w-3.5" />
                   <span className="hidden sm:inline">
-                    {composerMode === 'internal_note' ? 'Save Note' : 'Send Message'}
+                    {isSending
+                      ? 'Sending...'
+                      : composerMode === 'internal_note'
+                      ? 'Save Note'
+                      : 'Send Message'}
                   </span>
                 </button>
               </form>
@@ -947,11 +1016,11 @@ export function TeamInboxPage() {
               </button>
               <button
                 type="button"
-                disabled={!selectedTemplateId}
+                disabled={!selectedTemplateId || isSending}
                 onClick={handleSendTemplate}
                 className="rounded-xl bg-[#2563EB] px-4 py-2 text-xs font-semibold text-white hover:bg-[#1D4ED8] disabled:opacity-50 cursor-pointer"
               >
-                Send Template
+                {isSending ? 'Sending...' : 'Send Template'}
               </button>
             </div>
           </div>

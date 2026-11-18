@@ -239,9 +239,11 @@ export function AutomationPage() {
       <div className="rounded-xl border border-[#E2E8F0] bg-white px-4 py-3 flex items-start gap-3 text-xs text-slate-600">
         <AlertCircle className="h-4 w-4 text-[#F4B942] shrink-0 mt-0.5" />
         <p>
-          {business.metaConnectionState === 'connected'
-            ? 'Your WhatsApp connection is active. Enabled automations below will respond to incoming customer messages automatically.'
-            : 'Your rules are saved safely. Automatic replies will start running as soon as you finish connecting your WhatsApp number in Settings.'}
+          {business.messagingMode === 'test'
+            ? 'Test Mode is active: automated replies are disabled so only manual 1-to-1 messages to allowlisted test numbers are sent.'
+            : business.metaConnectionState === 'connected'
+            ? 'Your WhatsApp connection is active. Note: automated webhook replies remain paused until enabled in a future automation rollout.'
+            : 'Your rules are saved safely. Automatic replies will stay paused until you finish connecting your WhatsApp number in Settings.'}
         </p>
       </div>
 

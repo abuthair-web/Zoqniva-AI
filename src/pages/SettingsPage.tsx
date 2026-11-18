@@ -4,13 +4,19 @@ import {
   AlertTriangle,
   Bell,
   Building2,
+  Check,
   CheckCircle2,
   ChevronDown,
+  Copy,
   MessageCircle,
+  RefreshCw,
+  ShieldCheck,
   Sliders,
   Users,
 } from 'lucide-react';
 import { useApp } from '@/context/AppContext';
+import { normalizePhoneE164 } from '@/lib/phone';
+import type { MessagingMode } from '@/types/crm';
 
 type SettingsTab = 'business' | 'whatsapp' | 'team' | 'notifications' | 'advanced';
 
@@ -21,8 +27,13 @@ export function SettingsPage() {
     isSupabaseReady,
     business,
     teamMembers,
+    webhookEvents,
+    webhookCallbackUrl,
+    webhookSecretsReady,
     updateBusinessProfile,
     verifyMetaConnection,
+    saveWhatsAppConfig,
+    refreshWebhookDiagnostics,
     businessHours,
     updateBusinessHours,
     auditLogs,
@@ -37,8 +48,16 @@ export function SettingsPage() {
 
   const [phoneNumberId, setPhoneNumberId] = useState(business.metaPhoneNumberId);
   const [wabaId, setWabaId] = useState(business.metaWabaId);
-  const [verifyMsg, setVerifyMsg] = useState<{ ok: boolean; text: string } | null>(null);
+  const [messagingMode, setMessagingMode] = useState<MessagingMode>(business.messagingMode);
+  const [allowlistText, setAllowlistText] = useState(business.testAllowlist.join(', '));
+  const [verifyMsg, setVerifyMsg] = useState<{
+    ok: boolean;
+    text: string;
+    diagnostic?: string;
+  } | null>(null);
   const [verifying, setVerifying] = useState(false);
+  const [savingMode, setSavingMode] = useState(false);
+  const [copiedWebhook, setCopiedWebhook] = useState(false);
   const [showTechnicalApi, setShowTechnicalApi] = useState(false);
 
   const [notifPrefs, setNotifPrefs] = useState({
@@ -55,6 +74,8 @@ export function SettingsPage() {
     setBizWebsite(business.website);
     setPhoneNumberId(business.metaPhoneNumberId);
     setWabaId(business.metaWabaId);
+    setMessagingMode(business.messagingMode);
+    setAllowlistText(business.testAllowlist.join(', '));
   }, [business]);
 
   const isAdmin = currentUser?.role === 'admin';
@@ -70,12 +91,46 @@ export function SettingsPage() {
     setBizSavedMsg('Business profile saved.');
   };
 
+  const parseAllowlistInput = (): string[] =>
+    allowlistText
+      .split(/[\n,;]+/)
+      .map((s) => normalizePhoneE164(s.trim()))
+      .filter((v): v is string => Boolean(v));
+
   const handleVerifyMeta = async (e: React.FormEvent) => {
     e.preventDefault();
     setVerifying(true);
-    const res = await verifyMetaConnection(phoneNumberId, wabaId);
-    setVerifyMsg({ ok: res.ok, text: res.message });
+    const parsedAllowlist = parseAllowlistInput();
+    const res = await verifyMetaConnection(phoneNumberId, wabaId, {
+      messagingMode,
+      testAllowlist: parsedAllowlist,
+    });
+    setVerifyMsg({ ok: res.ok, text: res.message, diagnostic: res.diagnostic });
     setVerifying(false);
+  };
+
+  const handleSaveMessagingMode = async () => {
+    setSavingMode(true);
+    const parsedAllowlist = parseAllowlistInput();
+    const res = await saveWhatsAppConfig({
+      messagingMode,
+      testAllowlist: parsedAllowlist,
+      phoneNumberId,
+      wabaId,
+    });
+    setVerifyMsg({ ok: res.ok, text: res.message });
+    setSavingMode(false);
+  };
+
+  const handleCopyWebhook = async () => {
+    if (!webhookCallbackUrl) return;
+    try {
+      await navigator.clipboard.writeText(webhookCallbackUrl);
+      setCopiedWebhook(true);
+      setTimeout(() => setCopiedWebhook(false), 2000);
+    } catch {
+      // Clipboard fallback ignored cleanly
+    }
   };
 
   const metaStatusMeta = {
@@ -234,15 +289,51 @@ export function SettingsPage() {
               </div>
 
               <div className={`rounded-2xl border p-4 ${metaStatusMeta.color}`}>
-                <div className="flex items-center gap-2 font-bold text-sm">
-                  {business.metaConnectionState === 'connected' ? (
-                    <CheckCircle2 className="h-4 w-4" />
-                  ) : (
-                    <AlertTriangle className="h-4 w-4" />
-                  )}
-                  <span>{metaStatusMeta.label}</span>
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="flex items-center gap-2 font-bold text-sm">
+                    {business.metaConnectionState === 'connected' ? (
+                      <CheckCircle2 className="h-4 w-4" />
+                    ) : (
+                      <AlertTriangle className="h-4 w-4" />
+                    )}
+                    <span>{metaStatusMeta.label}</span>
+                  </div>
+                  <span
+                    className={`rounded-lg px-2.5 py-1 text-[11px] font-semibold ${
+                      business.messagingMode === 'test'
+                        ? 'bg-amber-100 text-amber-900'
+                        : 'bg-emerald-100 text-emerald-900'
+                    }`}
+                  >
+                    {business.messagingMode === 'test' ? 'Test Mode (Allowlist Only)' : 'Live Mode'}
+                  </span>
                 </div>
                 <p className="mt-1.5 leading-relaxed">{metaStatusMeta.desc}</p>
+                {business.metaConnectionState === 'connected' && (
+                  <div className="mt-3 pt-2.5 border-t border-emerald-200/70 flex flex-wrap gap-x-5 gap-y-1 text-[11px] text-emerald-900">
+                    {business.whatsappPhoneE164 && business.whatsappPhoneE164 !== '+10000000000' && (
+                      <span>
+                        Number: <strong className="font-mono">{business.whatsappPhoneE164}</strong>
+                      </span>
+                    )}
+                    {business.verifiedName && (
+                      <span>
+                        Verified Name: <strong>{business.verifiedName}</strong>
+                      </span>
+                    )}
+                    <span>
+                      Quality: <strong className="capitalize">{business.qualityRating || 'unknown'}</strong>
+                    </span>
+                    <span>
+                      Webhook:{' '}
+                      <strong>
+                        {business.webhookVerifiedAt
+                          ? `Verified (${new Date(business.webhookVerifiedAt).toLocaleDateString()})`
+                          : 'Awaiting first Meta webhook event'}
+                      </strong>
+                    </span>
+                  </div>
+                )}
               </div>
 
               {/* Plain-language 3-step guide */}
@@ -253,10 +344,10 @@ export function SettingsPage() {
                     Sign in to your <strong>Meta Business Account</strong> and copy your WhatsApp Phone Number ID and Business Account ID.
                   </li>
                   <li>
-                    Open <strong>Technical / API Settings</strong> below to paste those IDs and test the connection.
+                    Open <strong>Technical / API Settings</strong> below to paste those IDs, set your Test Allowlist, and verify the connection.
                   </li>
                   <li>
-                    Keep your WhatsApp secret token stored safely on the server — never paste private access tokens into browser fields.
+                    Configure your Meta Webhook Callback URL below and keep your WhatsApp tokens stored securely in Supabase Secrets — never in the browser.
                   </li>
                 </ol>
               </div>
@@ -280,13 +371,16 @@ export function SettingsPage() {
                   <div className="p-4 pt-3 border-t border-[#E2E8F0] space-y-5">
                     {verifyMsg && (
                       <div
-                        className={`rounded-xl border px-4 py-3 ${
+                        className={`rounded-xl border px-4 py-3 space-y-1 ${
                           verifyMsg.ok
                             ? 'border-emerald-200 bg-emerald-50 text-emerald-900'
                             : 'border-rose-200 bg-rose-50 text-[#E11D48]'
                         }`}
                       >
-                        {verifyMsg.text}
+                        <p className="font-semibold">{verifyMsg.text}</p>
+                        {isAdmin && verifyMsg.diagnostic && (
+                          <p className="text-[11px] font-mono opacity-85">{verifyMsg.diagnostic}</p>
+                        )}
                       </div>
                     )}
 
@@ -329,6 +423,152 @@ export function SettingsPage() {
                       )}
                     </form>
 
+                    {/* Test Mode vs Live Mode Safety Guardrails */}
+                    <div className="pt-4 border-t border-[#E2E8F0] space-y-3 max-w-lg">
+                      <div className="flex items-center gap-2 font-semibold text-[#0F172A]">
+                        <ShieldCheck className="h-4 w-4 text-[#2563EB]" />
+                        <span>Messaging Mode &amp; Test Allowlist</span>
+                      </div>
+                      <p className="text-slate-600 leading-relaxed">
+                        In <strong>Test Mode</strong>, 1-to-1 replies only send to phone numbers listed below, and bulk broadcasts and auto-replies stay disabled.
+                      </p>
+
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                        {(
+                          [
+                            {
+                              value: 'test' as const,
+                              title: 'Test Mode (Recommended)',
+                              desc: 'Only allowlisted test numbers',
+                            },
+                            {
+                              value: 'live' as const,
+                              title: 'Live Mode',
+                              desc: 'Any opted-in / open-window customer',
+                            },
+                          ] as const
+                        ).map((opt) => (
+                          <button
+                            key={opt.value}
+                            type="button"
+                            disabled={!isAdmin}
+                            onClick={() => setMessagingMode(opt.value)}
+                            className={`rounded-xl border p-3 text-left cursor-pointer disabled:opacity-60 ${
+                              messagingMode === opt.value
+                                ? 'border-[#2563EB] bg-[#EFF6FF]/60'
+                                : 'border-[#E2E8F0] hover:bg-[#F8FAFC]'
+                            }`}
+                          >
+                            <p className="font-semibold text-[#0F172A]">{opt.title}</p>
+                            <p className="text-[11px] text-slate-500 mt-0.5">{opt.desc}</p>
+                          </button>
+                        ))}
+                      </div>
+
+                      <div>
+                        <label className="block font-semibold text-[#0F172A] mb-1">
+                          Authorized Test Phone Numbers (E.164, comma-separated)
+                        </label>
+                        <textarea
+                          rows={2}
+                          disabled={!isAdmin}
+                          value={allowlistText}
+                          onChange={(e) => setAllowlistText(e.target.value)}
+                          placeholder="+15551234567, +971501234567"
+                          className="w-full rounded-xl border border-[#E2E8F0] px-3 py-2 font-mono"
+                        />
+                      </div>
+
+                      {isAdmin && (
+                        <button
+                          type="button"
+                          disabled={savingMode}
+                          onClick={handleSaveMessagingMode}
+                          className="rounded-xl border border-[#E2E8F0] bg-[#F8FAFC] px-4 py-2 font-semibold text-[#0F172A] hover:bg-slate-100 disabled:opacity-50 cursor-pointer"
+                        >
+                          {savingMode ? 'Saving Mode...' : 'Save Messaging Mode'}
+                        </button>
+                      )}
+                    </div>
+
+                    {/* Meta Webhook Callback URL & Diagnostics */}
+                    <div className="pt-4 border-t border-[#E2E8F0] space-y-3">
+                      <p className="font-semibold text-[#0F172A]">Meta Webhook Callback URL</p>
+                      <div className="flex items-center gap-2">
+                        <input
+                          type="text"
+                          readOnly
+                          value={webhookCallbackUrl || 'Set VITE_SUPABASE_URL to generate callback URL'}
+                          className="flex-1 rounded-xl border border-[#E2E8F0] bg-[#F8FAFC] px-3 py-2 font-mono text-[11px] text-slate-700"
+                        />
+                        {webhookCallbackUrl && (
+                          <button
+                            type="button"
+                            onClick={handleCopyWebhook}
+                            className="inline-flex items-center gap-1.5 rounded-xl border border-[#E2E8F0] bg-white px-3 py-2 font-semibold text-[#0F172A] hover:bg-[#F8FAFC] cursor-pointer"
+                          >
+                            {copiedWebhook ? (
+                              <>
+                                <Check className="h-3.5 w-3.5 text-emerald-600" />
+                                <span>Copied</span>
+                              </>
+                            ) : (
+                              <>
+                                <Copy className="h-3.5 w-3.5" />
+                                <span>Copy</span>
+                              </>
+                            )}
+                          </button>
+                        )}
+                      </div>
+
+                      {isAdmin && (
+                        <div className="space-y-2 pt-1">
+                          <div className="flex items-center justify-between">
+                            <span className="font-semibold text-[#0F172A]">
+                              Recent Webhook Events
+                            </span>
+                            <button
+                              type="button"
+                              onClick={() => void refreshWebhookDiagnostics()}
+                              className="inline-flex items-center gap-1 text-[11px] font-semibold text-[#2563EB] hover:underline cursor-pointer"
+                            >
+                              <RefreshCw className="h-3 w-3" />
+                              <span>Refresh</span>
+                            </button>
+                          </div>
+                          {webhookEvents.length === 0 ? (
+                            <p className="text-[11px] text-slate-500">
+                              No webhook events received yet. Verify your callback URL and subscribe to the{' '}
+                              <code>messages</code> field in Meta App Dashboard.
+                            </p>
+                          ) : (
+                            <div className="rounded-xl border border-[#E2E8F0] divide-y divide-[#E2E8F0] max-h-48 overflow-y-auto">
+                              {webhookEvents.slice(0, 6).map((ev) => (
+                                <div
+                                  key={ev.id}
+                                  className="px-3 py-2 flex items-center justify-between gap-3 text-[11px]"
+                                >
+                                  <div className="min-w-0">
+                                    <span className="font-semibold text-[#0F172A]">
+                                      {ev.signatureValid ? 'Signed' : 'Invalid Sig'} ·{' '}
+                                      {ev.processed ? 'Processed' : 'Pending/Error'}
+                                    </span>
+                                    {ev.processingError && (
+                                      <p className="text-[#E11D48] truncate">{ev.processingError}</p>
+                                    )}
+                                  </div>
+                                  <span className="font-mono text-slate-400 shrink-0">
+                                    {new Date(ev.receivedAt).toLocaleTimeString()}
+                                  </span>
+                                </div>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                      )}
+                    </div>
+
                     <div className="pt-4 border-t border-[#E2E8F0] space-y-2">
                       <p className="font-semibold text-[#0F172A]">Server Setup Checklist</p>
                       <ul className="list-disc pl-5 space-y-1 text-slate-600">
@@ -339,15 +579,23 @@ export function SettingsPage() {
                           </strong>
                         </li>
                         <li>
-                          Apply SQL migrations in <code>supabase/migrations/</code> to create tables &amp; access rules.
+                          Apply SQL migrations <code>001</code>, <code>002</code>, and{' '}
+                          <code>003_whatsapp_messaging_engine.sql</code>.
                         </li>
                         <li>
-                          Deploy <code>whatsapp-webhook</code>, <code>send-whatsapp-message</code>, and{' '}
-                          <code>sync-templates</code> Edge Functions.
+                          Deploy <code>whatsapp-webhook --no-verify-jwt</code>,{' '}
+                          <code>whatsapp-send-message</code>, and <code>whatsapp-connection-check</code>.
                         </li>
                         <li>
-                          Configure server secrets:{' '}
-                          <code>META_WHATSAPP_ACCESS_TOKEN</code> and <code>META_APP_SECRET</code>.
+                          Configure Supabase Secrets: <code>META_ACCESS_TOKEN</code>,{' '}
+                          <code>META_APP_SECRET</code>, <code>META_APP_ID</code>,{' '}
+                          <code>META_WABA_ID</code>, <code>META_PHONE_NUMBER_ID</code>,{' '}
+                          <code>META_WEBHOOK_VERIFY_TOKEN</code>.
+                          {webhookSecretsReady !== null && (
+                            <span className="ml-1.5 font-semibold">
+                              ({webhookSecretsReady ? 'Webhook secrets ready' : 'Webhook secrets missing'})
+                            </span>
+                          )}
                         </li>
                       </ul>
                     </div>

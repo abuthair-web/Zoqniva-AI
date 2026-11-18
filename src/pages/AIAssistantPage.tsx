@@ -43,7 +43,9 @@ export function AIAssistantPage() {
 
   const isAdmin = currentUser?.role === 'admin';
   const canAuthorizeLive =
-    aiConfig.provider !== 'unconfigured' && business.metaConnectionState === 'connected';
+    aiConfig.provider !== 'unconfigured' &&
+    business.metaConnectionState === 'connected' &&
+    business.messagingMode === 'live';
   const liveActive = aiConfig.enabled && aiConfig.autoReplyAuthorized && canAuthorizeLive;
 
   const handleAddKb = (e: React.FormEvent) => {

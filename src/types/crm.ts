@@ -6,10 +6,14 @@ export type MetaConnectionState =
   | 'connected'
   | 'connection_error';
 
+export type MessagingMode = 'test' | 'live';
+
 export type ConversationStatus = 'open' | 'pending' | 'resolved';
 
 export type DeliveryStatus =
+  | 'pending'
   | 'queued'
+  | 'submitted'
   | 'sent'
   | 'delivered'
   | 'read'
@@ -21,6 +25,8 @@ export type MessageType =
   | 'template'
   | 'image'
   | 'document'
+  | 'audio'
+  | 'video'
   | 'internal_note';
 
 export interface BusinessProfile {
@@ -36,6 +42,21 @@ export interface BusinessProfile {
   metaWabaId: string;
   metaConnectionState: MetaConnectionState;
   metaLastError?: string;
+  messagingMode: MessagingMode;
+  testAllowlist: string[];
+  graphApiVersion: string;
+  verifiedName?: string;
+  qualityRating?: 'green' | 'yellow' | 'red' | 'unknown';
+  webhookVerifiedAt?: string;
+}
+
+export interface WebhookEventSummary {
+  id: string;
+  eventType: string;
+  signatureValid: boolean;
+  processed: boolean;
+  processingError?: string;
+  receivedAt: string;
 }
 
 export interface TeamMember {
@@ -59,6 +80,7 @@ export interface Contact {
   id: string;
   fullName: string;
   phoneE164: string;
+  waId?: string;
   email: string;
   company: string;
   city: string;
@@ -83,9 +105,17 @@ export interface Message {
   mediaUrl?: string;
   mediaFilename?: string;
   templateName?: string;
+  clientRequestId?: string;
+  metaMessageId?: string;
   deliveryStatus: DeliveryStatus;
   errorCode?: string;
   errorMessage?: string;
+  submittedAt?: string;
+  sentAt?: string;
+  deliveredAt?: string;
+  readAt?: string;
+  failedAt?: string;
+  lastStatusAt?: string;
   createdAt: string;
 }
 

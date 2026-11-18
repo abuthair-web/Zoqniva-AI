@@ -281,6 +281,10 @@ export function BroadcastsPage() {
 
     if (asDraft) {
       setBannerFeedback(`Saved "${created.name}" as a draft.`);
+    } else if (business.messagingMode === 'test') {
+      setBannerFeedback(
+        `Saved "${created.name}" as a draft. Bulk broadcasts are disabled while Test Mode is active in Settings.`
+      );
     } else if (business.metaConnectionState !== 'connected') {
       setBannerFeedback(
         `Saved "${created.name}" (${created.metrics.eligible} ready to receive). Connect your WhatsApp account in Settings before live sending.`
@@ -902,10 +906,11 @@ export function BroadcastsPage() {
                   )}
                 </div>
 
-                {business.metaConnectionState !== 'connected' && (
+                {(business.metaConnectionState !== 'connected' || business.messagingMode === 'test') && (
                   <p className="rounded-xl border border-amber-200 bg-amber-50 px-3.5 py-2.5 text-xs text-amber-900">
-                    WhatsApp is not connected yet — confirming saves this broadcast as a draft so
-                    nothing is sent prematurely.
+                    {business.messagingMode === 'test'
+                      ? 'Test Mode is active — bulk broadcasts are disabled so confirming saves this campaign as a draft only.'
+                      : 'WhatsApp is not connected yet — confirming saves this broadcast as a draft so nothing is sent prematurely.'}
                   </p>
                 )}
 

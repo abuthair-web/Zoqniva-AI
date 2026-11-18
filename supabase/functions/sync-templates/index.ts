@@ -1,63 +1,137 @@
 // Supabase Edge Function: Sync Message Templates from Meta WhatsApp Business Account
-import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
+// Deploy with JWT verification ENABLED:
+//   supabase functions deploy sync-templates
 
-const corsHeaders = {
-  'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
-};
+import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
+import { logEvent } from '../_shared/logger.ts';
+import {
+  classifyMetaError,
+  corsHeaders,
+  getMetaRuntimeConfig,
+  jsonResponse,
+} from '../_shared/metaCloudApi.ts';
 
 Deno.serve(async (req: Request) => {
   if (req.method === 'OPTIONS') {
     return new Response('ok', { headers: corsHeaders });
   }
 
-  const metaAccessToken = Deno.env.get('META_WHATSAPP_ACCESS_TOKEN');
-  const wabaId = Deno.env.get('META_WABA_ID');
+  const authHeader = req.headers.get('Authorization');
+  if (!authHeader) {
+    return jsonResponse({ ok: false, error: 'Unauthorized' }, 401);
+  }
 
-  if (!metaAccessToken || !wabaId) {
-    return new Response(
-      JSON.stringify({
-        error: 'META_WHATSAPP_ACCESS_TOKEN and META_WABA_ID must be configured in Supabase Secrets.',
+  const supabaseUrl = Deno.env.get('SUPABASE_URL') ?? '';
+  const supabaseAnonKey = Deno.env.get('SUPABASE_ANON_KEY') ?? '';
+  const supabaseServiceKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? '';
+
+  const userClient = createClient(supabaseUrl, supabaseAnonKey, {
+    global: { headers: { Authorization: authHeader } },
+  });
+  const serviceClient = createClient(supabaseUrl, supabaseServiceKey);
+
+  const { data: userRes, error: userErr } = await userClient.auth.getUser();
+  if (userErr || !userRes.user) {
+    return jsonResponse({ ok: false, error: 'Invalid session' }, 401);
+  }
+
+  const { data: member } = await serviceClient
+    .from('business_members')
+    .select('business_id, role, status')
+    .eq('user_id', userRes.user.id)
+    .eq('status', 'active')
+    .limit(1)
+    .maybeSingle();
+
+  if (!member || member.role !== 'admin') {
+    return jsonResponse({ ok: false, error: 'Only admins can sync templates.' }, 403);
+  }
+
+  const { data: waAccount } = await serviceClient
+    .from('whatsapp_accounts')
+    .select('meta_waba_id, graph_api_version')
+    .eq('business_id', member.business_id)
+    .limit(1)
+    .maybeSingle();
+
+  const config = getMetaRuntimeConfig({
+    wabaId: waAccount?.meta_waba_id ? String(waAccount.meta_waba_id) : undefined,
+    graphApiVersion: waAccount?.graph_api_version ? String(waAccount.graph_api_version) : undefined,
+  });
+
+  if (!config.accessToken || !config.wabaId) {
+    return jsonResponse(
+      {
+        ok: false,
         code: 'META_NOT_CONFIGURED',
-      }),
-      { status: 422, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        error: 'META_ACCESS_TOKEN and WABA ID must be configured before syncing templates.',
+      },
+      422
     );
   }
 
-  const authHeader = req.headers.get('Authorization');
-  if (!authHeader) {
-    return new Response(JSON.stringify({ error: 'Unauthorized' }), {
-      status: 401,
-      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-    });
-  }
-
-  const supabase = createClient(
-    Deno.env.get('SUPABASE_URL') ?? '',
-    Deno.env.get('SUPABASE_ANON_KEY') ?? '',
-    { global: { headers: { Authorization: authHeader } } }
-  );
-
   const metaRes = await fetch(
-    `https://graph.facebook.com/v21.0/${wabaId}/message_templates?limit=100`,
-    { headers: { Authorization: `Bearer ${metaAccessToken}` } }
+    `https://graph.facebook.com/${config.graphApiVersion}/${encodeURIComponent(config.wabaId)}/message_templates?limit=100`,
+    { headers: { Authorization: `Bearer ${config.accessToken}` } }
   );
 
-  const metaJson = await metaRes.json();
+  const metaJson = (await metaRes.json().catch(() => ({}))) as Record<string, unknown>;
   if (!metaRes.ok) {
-    return new Response(JSON.stringify({ error: metaJson?.error?.message ?? 'Meta sync failed' }), {
-      status: 502,
-      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-    });
+    const classified = classifyMetaError(metaRes.status, metaJson);
+    logEvent('meta_api_error', 'error', 'Template sync failed', { code: classified.code });
+    return jsonResponse({ ok: false, code: classified.code, error: classified.userMessage }, classified.httpStatus);
   }
 
-  const { data: userRes } = await supabase.auth.getUser();
-  return new Response(
-    JSON.stringify({
-      syncedBy: userRes.user?.id,
-      templatesCount: Array.isArray(metaJson.data) ? metaJson.data.length : 0,
-      templates: metaJson.data ?? [],
-    }),
-    { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-  );
+  const metaTemplates = Array.isArray(metaJson.data)
+    ? (metaJson.data as Array<Record<string, unknown>>)
+    : [];
+
+  const nowIso = new Date().toISOString();
+  for (const tpl of metaTemplates) {
+    const rawName = String(tpl.name ?? '').toLowerCase().replace(/[^a-z0-9_]/g, '_');
+    if (!rawName) continue;
+    const components = Array.isArray(tpl.components)
+      ? (tpl.components as Array<Record<string, unknown>>)
+      : [];
+    const headerComp = components.find((c) => c.type === 'HEADER');
+    const bodyComp = components.find((c) => c.type === 'BODY');
+    const footerComp = components.find((c) => c.type === 'FOOTER');
+    const buttonsComp = components.find((c) => c.type === 'BUTTONS');
+    const bodyText = typeof bodyComp?.text === 'string' ? bodyComp.text : '';
+    const matches = bodyText.match(/\{\{\d+\}\}/g) ?? [];
+    const headerFmt = String(headerComp?.format ?? 'NONE').toUpperCase();
+    const headerType = ['TEXT', 'IMAGE', 'DOCUMENT'].includes(headerFmt) ? headerFmt : 'NONE';
+    const rawStatus = String(tpl.status ?? 'PENDING').toUpperCase();
+    const approvalStatus = ['DRAFT', 'PENDING', 'APPROVED', 'REJECTED', 'PAUSED'].includes(rawStatus)
+      ? rawStatus
+      : 'PENDING';
+    const rawCat = String(tpl.category ?? 'UTILITY').toUpperCase();
+    const category = ['MARKETING', 'UTILITY', 'AUTHENTICATION'].includes(rawCat) ? rawCat : 'UTILITY';
+
+    await serviceClient.from('templates').upsert(
+      {
+        business_id: member.business_id,
+        meta_template_id: tpl.id ? String(tpl.id) : null,
+        name: rawName,
+        category,
+        language: String(tpl.language ?? 'en_US'),
+        header_type: headerType,
+        header_text: typeof headerComp?.text === 'string' ? headerComp.text : null,
+        body_text: bodyText || rawName,
+        footer_text: typeof footerComp?.text === 'string' ? footerComp.text : null,
+        buttons: Array.isArray(buttonsComp?.buttons) ? buttonsComp.buttons : [],
+        variables_count: matches.length,
+        approval_status: approvalStatus,
+        rejection_reason: typeof tpl.rejected_reason === 'string' ? tpl.rejected_reason : null,
+        last_synced_at: nowIso,
+      },
+      { onConflict: 'business_id,name,language' }
+    );
+  }
+
+  return jsonResponse({
+    ok: true,
+    syncedBy: userRes.user.id,
+    templatesCount: metaTemplates.length,
+  });
 });

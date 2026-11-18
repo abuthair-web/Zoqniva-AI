@@ -13,6 +13,12 @@ export const EMPTY_BUSINESS_PROFILE: BusinessProfile = {
   metaWabaId: '',
   metaConnectionState: 'not_connected',
   metaLastError: undefined,
+  messagingMode: 'test',
+  testAllowlist: [],
+  graphApiVersion: 'v21.0',
+  verifiedName: undefined,
+  qualityRating: 'unknown',
+  webhookVerifiedAt: undefined,
 };
 
 export const DEFAULT_BUSINESS_HOURS: BusinessHoursDay[] = [
