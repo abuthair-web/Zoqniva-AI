@@ -1,8 +1,8 @@
 import React from 'react';
 import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom';
 import { Clock, LogOut, RefreshCw, ShieldAlert } from 'lucide-react';
-import { AuthScreen } from '@/components/Auth/AuthScreen';
-import { ResetPasswordScreen } from '@/components/Auth/ResetPasswordScreen';
+import { AuthScreen, type AuthViewMode } from '@/components/Auth/AuthScreen';
+import { UpdatePasswordScreen } from '@/components/Auth/UpdatePasswordScreen';
 import { BrandLogo } from '@/components/BrandLogo';
 import { AppShell } from '@/components/Layout/AppShell';
 import { AppProvider, useApp } from '@/context/AppContext';
@@ -41,7 +41,7 @@ function ProtectedAppRoute() {
   }
 
   if (passwordRecoveryActive) {
-    return <Navigate to="/reset-password" replace />;
+    return <Navigate to="/update-password" replace />;
   }
 
   if (authStatus === 'unauthenticated') {
@@ -156,15 +156,22 @@ function ProtectedAppRoute() {
   return <AppShell />;
 }
 
-function LoginRoute() {
+function PublicAuthRoute({ mode }: { mode: AuthViewMode }) {
   const { authStatus, authLoading, passwordRecoveryActive } = useApp();
+
   if (!authLoading && passwordRecoveryActive) {
-    return <Navigate to="/reset-password" replace />;
+    return <Navigate to="/update-password" replace />;
   }
-  if (!authLoading && (authStatus === 'authenticated' || authStatus === 'awaiting_access')) {
+
+  if (
+    mode !== 'forgot' &&
+    !authLoading &&
+    authStatus === 'authenticated'
+  ) {
     return <Navigate to="/app" replace />;
   }
-  return <AuthScreen />;
+
+  return <AuthScreen mode={mode} />;
 }
 
 export default function App() {
@@ -175,9 +182,12 @@ export default function App() {
           {/* Public Marketing Homepage */}
           <Route path="/" element={<HomePage />} />
 
-          {/* Sign-In, Registration & Password Recovery */}
-          <Route path="/login" element={<LoginRoute />} />
-          <Route path="/reset-password" element={<ResetPasswordScreen />} />
+          {/* Public Authentication & Password Recovery Routes */}
+          <Route path="/login" element={<PublicAuthRoute mode="signin" />} />
+          <Route path="/register" element={<PublicAuthRoute mode="signup" />} />
+          <Route path="/forgot-password" element={<PublicAuthRoute mode="forgot" />} />
+          <Route path="/update-password" element={<UpdatePasswordScreen />} />
+          <Route path="/reset-password" element={<UpdatePasswordScreen />} />
 
           {/* Protected CRM Workspace */}
           <Route path="/app" element={<ProtectedAppRoute />}>

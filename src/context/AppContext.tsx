@@ -977,11 +977,19 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     }
     setAuthError(null);
     const { error } = await supabase.auth.resetPasswordForEmail(email.trim(), {
-      redirectTo: `${window.location.origin}/reset-password`,
+      redirectTo: `${window.location.origin}/update-password`,
     });
     if (error) {
-      setAuthError(error.message);
-      return { ok: false, error: error.message };
+      const lower = error.message.toLowerCase();
+      const friendlyError =
+        error.status === 429 ||
+        lower.includes('rate limit') ||
+        lower.includes('security purposes') ||
+        lower.includes('too many requests')
+          ? `Email rate limit reached. Please wait a minute before requesting another reset link. (${error.message})`
+          : error.message;
+      setAuthError(friendlyError);
+      return { ok: false, error: friendlyError };
     }
     return { ok: true };
   };
@@ -991,16 +999,20 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       return { ok: false, error: 'Supabase configuration is required.' };
     }
     setAuthError(null);
-    const { error } = await supabase.auth.updateUser({ password: newPassword });
-    if (error) {
-      setAuthError(error.message);
-      return { ok: false, error: error.message };
+    const { data, error } = await supabase.auth.updateUser({ password: newPassword });
+    if (error || !data.user) {
+      const msg = error?.message || 'Unable to update password. Please request a new reset link.';
+      setAuthError(msg);
+      return { ok: false, error: msg };
     }
+
+    // Password is confirmed updated by Supabase; sign out temporary recovery session cleanly
     setPasswordRecoveryActive(false);
-    const { data: userRes } = await supabase.auth.getUser();
-    if (userRes.user) {
-      await resolveAuthenticatedUser(userRes.user);
-    }
+    await supabase.auth.signOut();
+    setCurrentUser(null);
+    setPendingAccount(null);
+    setAuthStatus('unauthenticated');
+    resetWorkspaceState();
     return { ok: true };
   };
 
