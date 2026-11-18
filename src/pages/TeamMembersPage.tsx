@@ -1,5 +1,16 @@
 import React, { useState } from 'react';
-import { ChevronDown, Plus, Shield, Trash2, UserCheck, Users, X } from 'lucide-react';
+import {
+  AlertTriangle,
+  ChevronDown,
+  Loader2,
+  Plus,
+  RefreshCw,
+  Shield,
+  Trash2,
+  UserCheck,
+  Users,
+  X,
+} from 'lucide-react';
 import { useApp } from '@/context/AppContext';
 import type { StaffRole, TeamMember } from '@/types/crm';
 
@@ -7,6 +18,9 @@ export function TeamMembersPage() {
   const {
     currentUser,
     teamMembers,
+    teamMembersLoading,
+    teamMembersError,
+    refreshTeamMembers,
     inviteTeamMember,
     updateTeamMemberRole,
     toggleTeamMemberStatus,
@@ -67,7 +81,33 @@ export function TeamMembersPage() {
         )}
       </div>
 
-      {teamMembers.length === 0 ? (
+      {teamMembersError && (
+        <div className="rounded-2xl border border-rose-200 bg-rose-50 px-5 py-4 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 text-xs text-rose-900">
+          <div className="flex items-start gap-2.5">
+            <AlertTriangle className="h-4 w-4 text-[#E11D48] shrink-0 mt-0.5" />
+            <div>
+              <p className="font-semibold text-[#0F172A]">Unable to load full team directory</p>
+              <p className="text-rose-800 mt-0.5">{teamMembersError}</p>
+            </div>
+          </div>
+          <button
+            type="button"
+            disabled={teamMembersLoading}
+            onClick={() => void refreshTeamMembers()}
+            className="inline-flex items-center gap-1.5 rounded-xl border border-rose-200 bg-white px-3.5 py-2 font-semibold text-[#0F172A] hover:bg-rose-100/50 disabled:opacity-60 self-start sm:self-center cursor-pointer"
+          >
+            <RefreshCw className={`h-3.5 w-3.5 ${teamMembersLoading ? 'animate-spin' : ''}`} />
+            <span>Retry</span>
+          </button>
+        </div>
+      )}
+
+      {teamMembersLoading && teamMembers.length === 0 ? (
+        <div className="rounded-2xl border border-[#E2E8F0] bg-white px-6 py-14 text-center space-y-3">
+          <Loader2 className="h-6 w-6 text-[#2563EB] animate-spin mx-auto" />
+          <p className="text-xs font-medium text-slate-500">Loading workspace team members...</p>
+        </div>
+      ) : teamMembers.length === 0 && !teamMembersError ? (
         <div className="rounded-2xl border border-dashed border-[#E2E8F0] bg-white px-6 py-14 text-center space-y-4">
           <div className="h-12 w-12 rounded-2xl bg-[#EFF6FF] text-[#2563EB] flex items-center justify-center mx-auto">
             <Users className="h-6 w-6" />
@@ -91,7 +131,7 @@ export function TeamMembersPage() {
             </button>
           )}
         </div>
-      ) : (
+      ) : teamMembers.length === 0 ? null : (
         <>
           {/* Team Members: Mobile Cards */}
           <div className="md:hidden space-y-3">
@@ -108,7 +148,7 @@ export function TeamMembersPage() {
                       <p className="font-semibold text-[#0F172A] text-sm truncate">
                         {member.fullName} {isSelf && <span className="text-slate-400">(You)</span>}
                       </p>
-                      <p className="text-slate-500 truncate">{member.email}</p>
+                      <p className="text-slate-500 truncate">{member.email || '—'}</p>
                     </div>
                     <span className={`font-semibold shrink-0 ${st.color}`}>{st.label}</span>
                   </div>
@@ -177,7 +217,7 @@ export function TeamMembersPage() {
                             {member.fullName}{' '}
                             {isSelf && <span className="text-[11px] text-slate-400 font-normal">(You)</span>}
                           </p>
-                          <p className="text-[11px] text-slate-500">{member.email}</p>
+                          <p className="text-[11px] text-slate-500">{member.email || '—'}</p>
                         </td>
                         <td className="py-3.5 px-5">
                           {isAdmin && !isSelf ? (

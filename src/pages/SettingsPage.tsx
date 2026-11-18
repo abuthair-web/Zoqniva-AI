@@ -30,6 +30,9 @@ export function SettingsPage() {
     isSupabaseReady,
     business,
     teamMembers,
+    teamMembersLoading,
+    teamMembersError,
+    refreshTeamMembers,
     webhookEvents,
     webhookCallbackUrl,
     webhookSecretsReady,
@@ -771,17 +774,35 @@ export function SettingsPage() {
                 </button>
               </div>
 
-              {teamMembers.length === 0 ? (
+              {teamMembersError && (
+                <div className="rounded-2xl border border-rose-200 bg-rose-50 px-4 py-3 flex flex-wrap items-center justify-between gap-2 text-xs text-rose-900">
+                  <div className="flex items-start gap-2">
+                    <AlertTriangle className="h-4 w-4 text-[#E11D48] shrink-0 mt-0.5" />
+                    <span>{teamMembersError}</span>
+                  </div>
+                  <button
+                    type="button"
+                    disabled={teamMembersLoading}
+                    onClick={() => void refreshTeamMembers()}
+                    className="inline-flex items-center gap-1.5 rounded-lg border border-rose-200 bg-white px-3 py-1.5 font-semibold text-[#0F172A] hover:bg-rose-100/50 disabled:opacity-60 cursor-pointer"
+                  >
+                    <RefreshCw className={`h-3 w-3 ${teamMembersLoading ? 'animate-spin' : ''}`} />
+                    <span>Retry</span>
+                  </button>
+                </div>
+              )}
+
+              {teamMembers.length === 0 && !teamMembersError ? (
                 <div className="rounded-2xl border border-dashed border-[#E2E8F0] bg-[#F8FAFC] p-6 text-center text-slate-500">
                   No team members listed yet.
                 </div>
-              ) : (
+              ) : teamMembers.length === 0 ? null : (
                 <div className="rounded-2xl border border-[#E2E8F0] divide-y divide-[#E2E8F0]">
                   {teamMembers.map((m) => (
                     <div key={m.id} className="px-4 py-3 flex items-center justify-between gap-3">
                       <div>
                         <p className="font-semibold text-[#0F172A]">{m.fullName}</p>
-                        <p className="text-[11px] text-slate-500">{m.email}</p>
+                        <p className="text-[11px] text-slate-500">{m.email || '—'}</p>
                       </div>
                       <div className="text-right">
                         <p className="font-semibold capitalize text-[#0F172A]">{m.role}</p>

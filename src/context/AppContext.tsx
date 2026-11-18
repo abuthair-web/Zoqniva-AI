@@ -28,6 +28,7 @@ import {
   normalizeWhatsAppConnectionStatus,
   saveBusinessWhatsAppConfiguration,
 } from '@/services/whatsappService';
+import { fetchBusinessTeamMembers } from '@/services/teamService';
 import type { User } from '@supabase/supabase-js';
 import type {
   AIAutomationLog,
@@ -106,6 +107,9 @@ interface AppContextValue {
   // Core Data
   business: BusinessProfile;
   teamMembers: TeamMember[];
+  teamMembersLoading: boolean;
+  teamMembersError: string | null;
+  refreshTeamMembers: () => Promise<void>;
   tags: Tag[];
   contacts: Contact[];
   conversations: Conversation[];
@@ -289,6 +293,8 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   // Clean empty workspace state (hydrated exclusively from real Supabase tables when signed in)
   const [business, setBusiness] = useState<BusinessProfile>(EMPTY_BUSINESS_PROFILE);
   const [teamMembers, setTeamMembers] = useState<TeamMember[]>([]);
+  const [teamMembersLoading, setTeamMembersLoading] = useState<boolean>(false);
+  const [teamMembersError, setTeamMembersError] = useState<string | null>(null);
   const [tags, setTags] = useState<Tag[]>([]);
   const [contacts, setContacts] = useState<Contact[]>([]);
   const [conversations, setConversations] = useState<Conversation[]>([]);
@@ -343,6 +349,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const currentUserIdRef = useRef<string | null>(null);
   const authStatusRef = useRef<AuthGateStatus>('loading');
   const resolvingUserPromiseRef = useRef<{ userId: string; promise: Promise<void> } | null>(null);
+  const teamRefreshPromiseRef = useRef<Promise<void> | null>(null);
   useEffect(() => {
     currentUserIdRef.current = currentUser?.id ?? null;
   }, [currentUser]);
@@ -355,6 +362,8 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const resetWorkspaceState = useCallback(() => {
     setBusiness(EMPTY_BUSINESS_PROFILE);
     setTeamMembers([]);
+    setTeamMembersLoading(false);
+    setTeamMembersError(null);
     setTags([]);
     setContacts([]);
     setConversations([]);
@@ -376,58 +385,75 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   // Load real Supabase records for the authenticated user without inventing any mock data
-  const loadSupabaseWorkspace = useCallback(async (userId: string, knownBusinessId?: string) => {
-    if (!supabase || !isSupabaseConfigured) return;
-    const client = supabase;
-    setWorkspaceLoading(true);
+  const loadSupabaseWorkspace = useCallback(
+    async (
+      userId: string,
+      knownBusinessId?: string,
+      callerMeta?: { role?: StaffRole; email?: string; fullName?: string }
+    ) => {
+      if (!supabase || !isSupabaseConfigured) return;
+      const client = supabase;
+      setWorkspaceLoading(true);
+      setTeamMembersLoading(true);
 
-    try {
-      let businessId = knownBusinessId;
-      if (!businessId) {
-        const { data: memberRows } = await client
-          .from('business_members')
-          .select('business_id, role, is_active')
-          .eq('user_id', userId)
-          .eq('is_active', true);
+      try {
+        let businessId = knownBusinessId;
+        let callerRole: StaffRole | undefined = callerMeta?.role;
 
-        const activeRow = ((memberRows ?? []) as Array<Record<string, unknown>>).find(
-          (m) => m.is_active === true
-        );
-        businessId = activeRow?.business_id ? String(activeRow.business_id) : undefined;
-      }
+        if (!businessId || !callerRole) {
+          const { data: memberRows } = await client
+            .from('business_members')
+            .select('business_id, role, is_active')
+            .eq('user_id', userId)
+            .eq('is_active', true);
 
-      if (!businessId) {
-        setWorkspaceLoading(false);
-        return;
-      }
+          const activeRow = ((memberRows ?? []) as Array<Record<string, unknown>>).find(
+            (m) => m.is_active === true
+          );
+          if (!businessId && activeRow?.business_id) {
+            businessId = String(activeRow.business_id);
+          }
+          if (!callerRole && (activeRow?.role === 'admin' || activeRow?.role === 'agent')) {
+            callerRole = activeRow.role;
+          }
+        }
 
-      const [
-        bizRes,
-        waRes,
-        membersRes,
-        tagsRes,
-        contactsRes,
-        contactTagsRes,
-        convsRes,
-        msgsRes,
-        tplsRes,
-        cmpsRes,
-        rulesRes,
-        auditRes,
-      ] = await Promise.all([
-        client.from('businesses').select('*').eq('id', businessId).maybeSingle(),
-        client
-          .from('whatsapp_accounts')
-          .select('*')
-          .eq('business_id', businessId)
-          .order('created_at', { ascending: true })
-          .limit(1)
-          .maybeSingle(),
-        client
-          .from('business_members')
-          .select('business_id, user_id, role, is_active, created_at, profiles(id, email, full_name)')
-          .eq('business_id', businessId),
-        client.from('tags').select('*').eq('business_id', businessId),
+        if (!businessId) {
+          setWorkspaceLoading(false);
+          setTeamMembersLoading(false);
+          return;
+        }
+
+        const [
+          bizRes,
+          waRes,
+          teamRes,
+          tagsRes,
+          contactsRes,
+          contactTagsRes,
+          convsRes,
+          msgsRes,
+          tplsRes,
+          cmpsRes,
+          rulesRes,
+          auditRes,
+        ] = await Promise.all([
+          client.from('businesses').select('*').eq('id', businessId).maybeSingle(),
+          client
+            .from('whatsapp_accounts')
+            .select('*')
+            .eq('business_id', businessId)
+            .order('created_at', { ascending: true })
+            .limit(1)
+            .maybeSingle(),
+          fetchBusinessTeamMembers({
+            businessId,
+            currentUserId: userId,
+            currentUserRole: callerRole ?? 'agent',
+            currentUserEmail: callerMeta?.email,
+            currentUserFullName: callerMeta?.fullName,
+          }),
+          client.from('tags').select('*').eq('business_id', businessId),
         client.from('contacts').select('*').eq('business_id', businessId).order('created_at', { ascending: false }),
         client.from('contact_tags').select('contact_id, tag_id'),
         client
@@ -530,27 +556,17 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       }));
       setConversations(convList);
 
-      const memberList: TeamMember[] = (membersRes.data ?? []).map((m: Record<string, unknown>) => {
-        const prof = Array.isArray(m.profiles)
-          ? (m.profiles[0] as Record<string, unknown> | undefined)
-          : (m.profiles as Record<string, unknown> | undefined);
-        const profileId = String(m.user_id ?? prof?.id ?? m.id);
-        return {
-          id: profileId,
-          fullName: String(prof?.full_name ?? 'Team Member'),
-          email: String(prof?.email ?? ''),
-          role: (m.role as StaffRole) ?? 'agent',
-          status: m.is_active === false ? 'suspended' : 'active',
-          jobTitle: String(m.job_title ?? ''),
-          activeConversations: convList.filter(
-            (cv) => cv.assignedToId === profileId && cv.status !== 'resolved'
-          ).length,
-          resolvedToday: convList.filter(
-            (cv) => cv.assignedToId === profileId && cv.status === 'resolved'
-          ).length,
-        };
-      });
+      const memberList: TeamMember[] = teamRes.members.map((tm) => ({
+        ...tm,
+        activeConversations: convList.filter(
+          (cv) => cv.assignedToId === tm.id && cv.status !== 'resolved'
+        ).length,
+        resolvedToday: convList.filter(
+          (cv) => cv.assignedToId === tm.id && cv.status === 'resolved'
+        ).length,
+      }));
       setTeamMembers(memberList);
+      setTeamMembersError(teamRes.error);
 
       setTags(
         (tagsRes.data ?? []).map((t: Record<string, unknown>) => ({
@@ -689,6 +705,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       );
     } finally {
       setWorkspaceLoading(false);
+      setTeamMembersLoading(false);
     }
   }, []);
 
@@ -708,16 +725,16 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             ? authUser.user_metadata.full_name.trim()
             : '';
 
-        // Step 1: Load signed-in user's profile from public.profiles (schema-tolerant)
+        // Step 1: Load signed-in user's profile from public.profiles (actual columns only; email lives in auth.users)
         const { data: profileData } = await client
           .from('profiles')
-          .select('*')
+          .select('id, full_name, role, created_at, updated_at')
           .eq('id', authUser.id)
           .maybeSingle();
 
         const profile = (profileData as Record<string, unknown> | null) ?? null;
 
-        const resolvedEmail = String(profile?.email || authUser.email || '');
+        const resolvedEmail = String(authUser.email || '');
         const resolvedName = String(
           profile?.full_name || metadataName || authUser.email || 'Staff Member'
         );
@@ -836,7 +853,11 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         createdAt: String(profile?.created_at || authUser.created_at || new Date().toISOString()),
       });
       setAuthStatus('authenticated');
-      await loadSupabaseWorkspace(authUser.id, activeBusinessId);
+      await loadSupabaseWorkspace(authUser.id, activeBusinessId, {
+        role: validRole,
+        email: resolvedEmail,
+        fullName: resolvedName,
+      });
       })();
 
       resolvingUserPromiseRef.current = { userId: authUser.id, promise: task };
@@ -2001,7 +2022,11 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         return { ok: false, message: res.error || 'Could not sync templates from Meta.' };
       }
       if (currentUser?.id) {
-        await loadSupabaseWorkspace(currentUser.id);
+        await loadSupabaseWorkspace(currentUser.id, business.id, {
+          role: currentUser.role,
+          email: currentUser.email,
+          fullName: currentUser.fullName,
+        });
       }
       return { ok: true, message: `Synced ${res.templatesCount} template(s) from Meta.` };
     }
@@ -2112,6 +2137,47 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   // ============================================================================
   // TEAM & SETTINGS
   // ============================================================================
+  const refreshTeamMembers = useCallback(async () => {
+    if (
+      !supabase ||
+      !isSupabaseConfigured ||
+      !currentUser?.id ||
+      !UUID_REGEX.test(business.id)
+    ) {
+      return;
+    }
+    if (teamRefreshPromiseRef.current) {
+      return teamRefreshPromiseRef.current;
+    }
+
+    const task = (async () => {
+      setTeamMembersLoading(true);
+      try {
+        const res = await fetchBusinessTeamMembers({
+          businessId: business.id,
+          currentUserId: currentUser.id,
+          currentUserRole: currentUser.role,
+          currentUserEmail: currentUser.email,
+          currentUserFullName: currentUser.fullName,
+          conversations,
+        });
+        setTeamMembers(res.members);
+        setTeamMembersError(res.error);
+      } finally {
+        setTeamMembersLoading(false);
+      }
+    })();
+
+    teamRefreshPromiseRef.current = task;
+    try {
+      await task;
+    } finally {
+      if (teamRefreshPromiseRef.current === task) {
+        teamRefreshPromiseRef.current = null;
+      }
+    }
+  }, [business.id, conversations, currentUser]);
+
   const inviteTeamMember = (
     fullName: string,
     email: string,
@@ -2357,6 +2423,9 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     logout,
     business,
     teamMembers,
+    teamMembersLoading,
+    teamMembersError,
+    refreshTeamMembers,
     tags,
     contacts,
     conversations,
