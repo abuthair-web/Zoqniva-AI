@@ -204,26 +204,22 @@ export function AnalyticsPage() {
       {/* Header + Simple Date Filter (Today / 7 Days / 30 Days) */}
       <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
         <div>
-          <div className="flex items-center gap-2">
-            <span className="h-[2px] w-5 bg-[#F4B942]" />
-            <span className="text-xs font-semibold text-[#2563EB]">Business Results</span>
-          </div>
-          <h2 className="font-display text-2xl font-bold text-[#0F172A] tracking-tight mt-0.5">
+          <h1 className="font-display text-xl sm:text-2xl font-bold text-[#0F172A] tracking-tight">
             Analytics
-          </h2>
-          <p className="text-sm text-slate-500 mt-0.5">
+          </h1>
+          <p className="text-xs sm:text-sm text-slate-500 mt-0.5">
             Track message delivery, open conversations, and campaign performance.
           </p>
         </div>
 
         <div className="flex flex-wrap items-center gap-2.5">
-          <div className="inline-flex items-center gap-1 p-1 rounded-xl bg-white border border-[#E2E8F0]">
+          <div className="inline-flex items-center gap-1 p-1 rounded-lg bg-white border border-[#E2E8F0]">
             {(['today', '7d', '30d'] as const).map((range) => (
               <button
                 key={range}
                 type="button"
                 onClick={() => setDateRange(range)}
-                className={`px-3 py-1.5 rounded-lg text-xs font-semibold whitespace-nowrap cursor-pointer ${
+                className={`px-3 py-1.5 rounded-md text-xs font-semibold whitespace-nowrap cursor-pointer ${
                   dateRange === range
                     ? 'bg-[#2563EB] text-white'
                     : 'text-slate-600 hover:text-[#0F172A]'
@@ -238,7 +234,7 @@ export function AnalyticsPage() {
             type="button"
             disabled={activitySeries.length === 0}
             onClick={handleExportAnalyticsCsv}
-            className="inline-flex items-center gap-2 rounded-xl border border-[#E2E8F0] bg-white px-3.5 py-2 text-xs font-semibold text-[#0F172A] hover:bg-[#F8FAFC] disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
+            className="inline-flex items-center gap-2 rounded-lg border border-[#E2E8F0] bg-white px-3.5 py-2 text-xs font-semibold text-[#0F172A] hover:bg-[#F8FAFC] disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
           >
             <Download className="h-3.5 w-3.5 text-[#2563EB]" />
             <span>Export CSV</span>
@@ -259,11 +255,11 @@ export function AnalyticsPage() {
           return (
             <div
               key={card.label}
-              className="rounded-2xl border border-[#E2E8F0] bg-white p-4 flex flex-col justify-between gap-2"
+              className="rounded-xl border border-[#E2E8F0] bg-white p-4 flex flex-col justify-between gap-2"
             >
               <div className="flex items-center justify-between gap-2">
                 <span className="text-xs font-semibold text-slate-600">{card.label}</span>
-                <div className={`h-8 w-8 rounded-xl flex items-center justify-center shrink-0 ${iconClass}`}>
+                <div className={`h-8 w-8 rounded-lg flex items-center justify-center shrink-0 ${iconClass}`}>
                   <Icon className="h-4 w-4" />
                 </div>
               </div>
@@ -277,7 +273,7 @@ export function AnalyticsPage() {
       </div>
 
       {/* 1 Clean Primary Chart */}
-      <div className="rounded-2xl border border-[#E2E8F0] bg-white p-5 shadow-2xs">
+      <div className="rounded-xl border border-[#E2E8F0] bg-white p-5">
         <div className="flex flex-wrap items-center justify-between gap-2 mb-4">
           <div>
             <h3 className="font-display text-base font-bold text-[#0F172A]">
@@ -327,7 +323,7 @@ export function AnalyticsPage() {
       </div>
 
       {/* Progressive Disclosure: Detailed Analytics */}
-      <div className="rounded-2xl border border-[#E2E8F0] bg-white overflow-hidden">
+      <div className="rounded-xl border border-[#E2E8F0] bg-white overflow-hidden">
         <button
           type="button"
           onClick={() => setShowDetailed((s) => !s)}

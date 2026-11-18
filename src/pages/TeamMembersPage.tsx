@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   AlertTriangle,
   ChevronDown,
@@ -20,12 +20,17 @@ export function TeamMembersPage() {
     teamMembers,
     teamMembersLoading,
     teamMembersError,
+    ensureTeamDirectoryLoaded,
     refreshTeamMembers,
     inviteTeamMember,
     updateTeamMemberRole,
     toggleTeamMemberStatus,
     removeTeamMember,
   } = useApp();
+
+  useEffect(() => {
+    void ensureTeamDirectoryLoaded();
+  }, [ensureTeamDirectoryLoaded]);
 
   const [inviteOpen, setInviteOpen] = useState(false);
   const [fullName, setFullName] = useState('');

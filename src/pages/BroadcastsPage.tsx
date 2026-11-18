@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { useLocation } from 'react-router-dom';
 import {
+  AlertCircle,
   ArrowLeft,
   ArrowRight,
   BarChart2,
@@ -10,13 +11,12 @@ import {
   ChevronDown,
   Copy,
   FileText,
-  Image as ImageIcon,
   Megaphone,
   Pause,
   Play,
   Plus,
   Search,
-  Send,
+  Users,
   X,
 } from 'lucide-react';
 import { useApp } from '@/context/AppContext';
@@ -26,18 +26,18 @@ const DRAFT_STORAGE_KEY = 'zoqniva_broadcast_composer_draft';
 
 const HUMAN_VAR_LABELS: Record<string, string> = {
   '1': 'Customer Name',
-  '2': 'Offer or Order Detail',
+  '2': 'Order or Offer Detail',
   '3': 'Courier or Reference',
   '4': 'Estimated Date or Time',
 };
 
 const CATEGORY_LABELS: Record<TemplateCategory, string> = {
-  UTILITY: 'Customer Update',
-  MARKETING: 'Promotion & Offer',
-  AUTHENTICATION: 'Security Code',
+  UTILITY: 'Utility',
+  MARKETING: 'Marketing',
+  AUTHENTICATION: 'Authentication',
 };
 
-type WizardStep = 1 | 2 | 3;
+type WizardStage = 1 | 2 | 3;
 
 export function BroadcastsPage() {
   const {
@@ -58,6 +58,11 @@ export function BroadcastsPage() {
 
   const [viewMode, setViewMode] = useState<'list' | 'compose'>('list');
   const [statusFilter, setStatusFilter] = useState<'all' | CampaignStatus>('all');
+  const [sortBy, setSortBy] = useState<'newest' | 'name' | 'audience'>('newest');
+  const [searchCampaign, setSearchCampaign] = useState('');
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState<10 | 25 | 50>(10);
+
   const [reportCampaign, setReportCampaign] = useState<Campaign | null>(null);
   const [bannerFeedback, setBannerFeedback] = useState<string | null>(null);
 
@@ -82,9 +87,18 @@ export function BroadcastsPage() {
     }
   }, []);
 
-  const [wizardStep, setWizardStep] = useState<WizardStep>(
-    savedDraft?.wizardStep === 2 || savedDraft?.wizardStep === 3 ? savedDraft.wizardStep : 1
+  // Stage 1: Choose Template -> Stage 2: Choose Audience -> Stage 3: Review & Schedule
+  const [wizardStage, setWizardStage] = useState<WizardStage>(
+    savedDraft?.wizardStage === 2 || savedDraft?.wizardStage === 3 ? savedDraft.wizardStage : 1
   );
+  const [selectedTemplateId, setSelectedTemplateId] = useState<string>(
+    savedDraft?.selectedTemplateId || approvedTemplates[0]?.id || ''
+  );
+  const [templateSearch, setTemplateSearch] = useState('');
+  const [varMapping, setVarMapping] = useState<Record<string, string>>(
+    savedDraft?.varMapping ?? {}
+  );
+
   const [audienceMode, setAudienceMode] = useState<'all' | 'groups' | 'specific'>(
     savedDraft?.audienceMode ?? 'all'
   );
@@ -95,13 +109,6 @@ export function BroadcastsPage() {
   const [contactSearch, setContactSearch] = useState('');
   const [showExcludedDetails, setShowExcludedDetails] = useState(false);
 
-  const [selectedTemplateId, setSelectedTemplateId] = useState<string>(
-    savedDraft?.selectedTemplateId || approvedTemplates[0]?.id || ''
-  );
-  const [varMapping, setVarMapping] = useState<Record<string, string>>(
-    savedDraft?.varMapping ?? {}
-  );
-
   const [scheduleMode, setScheduleMode] = useState<'immediate' | 'scheduled'>(
     savedDraft?.scheduleMode ?? 'immediate'
   );
@@ -110,25 +117,23 @@ export function BroadcastsPage() {
       new Date(Date.now() + 24 * 3600 * 1000).toISOString().slice(0, 16)
   );
   const [customName, setCustomName] = useState<string>(savedDraft?.customName ?? '');
-  const [showAdvanced, setShowAdvanced] = useState(false);
   const [consentConfirmed, setConsentConfirmed] = useState(false);
   const [submitting, setSubmitting] = useState(false);
 
   useEffect(() => {
     const state = location.state as { openWizard?: boolean } | null;
     if (state?.openWizard && isAdmin) {
-      setWizardStep(1);
+      setWizardStage(1);
       setViewMode('compose');
     }
   }, [location.state, isAdmin]);
 
-  // Persist unfinished wizard draft automatically
   useEffect(() => {
     if (viewMode === 'compose') {
       localStorage.setItem(
         DRAFT_STORAGE_KEY,
         JSON.stringify({
-          wizardStep,
+          wizardStage,
           audienceMode,
           selectedTagIds,
           selectedContactIds,
@@ -142,7 +147,7 @@ export function BroadcastsPage() {
     }
   }, [
     viewMode,
-    wizardStep,
+    wizardStage,
     audienceMode,
     selectedTagIds,
     selectedContactIds,
@@ -159,7 +164,14 @@ export function BroadcastsPage() {
     [approvedTemplates, selectedTemplateId]
   );
 
-  // Audience calculation with automatic invalid & opted-out exclusion
+  const filteredTemplatesForWizard = useMemo(() => {
+    const q = templateSearch.trim().toLowerCase();
+    if (!q) return approvedTemplates;
+    return approvedTemplates.filter(
+      (t) => t.name.toLowerCase().includes(q) || t.bodyText.toLowerCase().includes(q)
+    );
+  }, [approvedTemplates, templateSearch]);
+
   const audienceStats = useMemo(() => {
     let matched = contacts;
     if (audienceMode === 'groups') {
@@ -189,17 +201,17 @@ export function BroadcastsPage() {
   const autoCampaignName = useMemo(() => {
     const groupPart =
       audienceMode === 'all'
-        ? 'All Customers'
+        ? 'All Opted-In Contacts'
         : audienceMode === 'groups' && selectedTagIds.length > 0
         ? tags
             .filter((t) => selectedTagIds.includes(t.id))
             .map((t) => t.name)
             .slice(0, 2)
             .join(' & ')
-        : 'Selected Customers';
+        : 'Selected Contacts';
     const tplLabel = selectedTemplate
       ? selectedTemplate.name.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase())
-      : 'Broadcast';
+      : 'Campaign';
     const dateLabel = new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
     return `${groupPart} · ${tplLabel} (${dateLabel})`;
   }, [audienceMode, selectedTagIds, tags, selectedTemplate]);
@@ -225,30 +237,43 @@ export function BroadcastsPage() {
     );
   }, [contacts, contactSearch]);
 
-  const filteredCampaigns = useMemo(
-    () => campaigns.filter((c) => (statusFilter === 'all' ? true : c.status === statusFilter)),
-    [campaigns, statusFilter]
-  );
+  const filteredCampaigns = useMemo(() => {
+    const q = searchCampaign.trim().toLowerCase();
+    const list = campaigns.filter((c) => {
+      if (statusFilter !== 'all' && c.status !== statusFilter) return false;
+      if (!q) return true;
+      return c.name.toLowerCase().includes(q);
+    });
 
-  const audienceSummaryLabel = useMemo(() => {
-    if (audienceMode === 'all') return 'All eligible customers';
-    if (audienceMode === 'groups') {
-      const names = tags
-        .filter((t) => selectedTagIds.includes(t.id))
-        .map((t) => t.name);
-      return names.length > 0 ? names.join(', ') : 'Customer groups';
-    }
-    return `${selectedContactIds.length} selected customer${selectedContactIds.length === 1 ? '' : 's'}`;
-  }, [audienceMode, tags, selectedTagIds, selectedContactIds]);
+    return list.sort((a, b) => {
+      if (sortBy === 'name') return a.name.localeCompare(b.name);
+      if (sortBy === 'audience') return b.metrics.eligible - a.metrics.eligible;
+      return new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime();
+    });
+  }, [campaigns, statusFilter, searchCampaign, sortBy]);
 
-  const canContinueStep1 = audienceStats.eligibleCount > 0;
-  const canContinueStep2 = Boolean(selectedTemplate);
+  const totalPages = Math.max(1, Math.ceil(filteredCampaigns.length / pageSize));
+  const currentPage = Math.min(page, totalPages);
+  const paginatedCampaigns = useMemo(() => {
+    const start = (currentPage - 1) * pageSize;
+    return filteredCampaigns.slice(start, start + pageSize);
+  }, [filteredCampaigns, currentPage, pageSize]);
+
+  const formatTemplateTitle = (slug: string) =>
+    slug.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
 
   const handleOpenNewWizard = () => {
-    setWizardStep(1);
+    setWizardStage(1);
     setConsentConfirmed(false);
     setViewMode('compose');
   };
+
+  const dispatchDisabledReason =
+    business.messagingMode === 'test'
+      ? 'Test Mode is active — bulk campaign dispatch is disabled. Confirming saves this campaign as a draft.'
+      : business.metaConnectionState !== 'connected'
+      ? 'WhatsApp is not connected — confirming saves this campaign as a draft only.'
+      : null;
 
   const handleSubmitBroadcast = (asDraft: boolean) => {
     if (submitting || !selectedTemplate) return;
@@ -275,25 +300,21 @@ export function BroadcastsPage() {
     localStorage.removeItem(DRAFT_STORAGE_KEY);
     setCustomName('');
     setConsentConfirmed(false);
-    setWizardStep(1);
+    setWizardStage(1);
     setSubmitting(false);
     setViewMode('list');
 
-    if (asDraft) {
-      setBannerFeedback(`Saved "${created.name}" as a draft.`);
-    } else if (business.messagingMode === 'test') {
+    if (asDraft || dispatchDisabledReason) {
       setBannerFeedback(
-        `Saved "${created.name}" as a draft. Bulk broadcasts are disabled while Test Mode is active in Settings.`
-      );
-    } else if (business.metaConnectionState !== 'connected') {
-      setBannerFeedback(
-        `Saved "${created.name}" (${created.metrics.eligible} ready to receive). Connect your WhatsApp account in Settings before live sending.`
+        `Saved "${created.name}" as a draft (${created.metrics.eligible} opted-in recipient${
+          created.metrics.eligible === 1 ? '' : 's'
+        }).`
       );
     } else {
       setBannerFeedback(
         scheduleMode === 'scheduled'
           ? `Scheduled "${created.name}" for ${new Date(scheduledFor).toLocaleString()}.`
-          : `Queued "${created.name}" for sending.`
+          : `Created campaign "${created.name}".`
       );
     }
   };
@@ -305,47 +326,53 @@ export function BroadcastsPage() {
     }
   };
 
-  const formatTemplateTitle = (slug: string) =>
-    slug.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
-
   if (viewMode === 'compose') {
-    const steps: Array<{ num: WizardStep; title: string; subtitle: string }> = [
+    const stages: Array<{
+      num: WizardStage;
+      title: string;
+      subtitle: string;
+      icon: React.ComponentType<{ className?: string }>;
+    }> = [
       {
         num: 1,
-        title: 'Choose Audience',
-        subtitle: `${audienceStats.eligibleCount} eligible`,
+        title: 'Choose Template',
+        subtitle: selectedTemplate ? formatTemplateTitle(selectedTemplate.name) : 'Approved Meta template',
+        icon: FileText,
       },
       {
         num: 2,
-        title: 'Select Template',
-        subtitle: selectedTemplate ? formatTemplateTitle(selectedTemplate.name) : 'Pick a template',
+        title: 'Choose Audience',
+        subtitle: `${audienceStats.eligibleCount} eligible contact${audienceStats.eligibleCount === 1 ? '' : 's'}`,
+        icon: Users,
       },
       {
         num: 3,
-        title: 'Preview & Send',
-        subtitle: scheduleMode === 'scheduled' ? 'Schedule' : 'Send now',
+        title: 'Review & Schedule',
+        subtitle: scheduleMode === 'scheduled' ? 'Schedule time' : 'Confirm draft',
+        icon: Calendar,
       },
     ];
-    const trackWidthClass = wizardStep === 1 ? 'w-0' : wizardStep === 2 ? 'w-1/2' : 'w-full';
-    const mobileBarClass = wizardStep === 1 ? 'w-1/3' : wizardStep === 2 ? 'w-2/3' : 'w-full';
+
+    const canAccessStage2 = Boolean(selectedTemplate);
+    const canAccessStage3 = Boolean(selectedTemplate) && audienceStats.eligibleCount > 0;
 
     return (
-      <div className="p-4 sm:p-6 lg:p-8 pb-20 lg:pb-8 max-w-[1040px] mx-auto space-y-6">
+      <div className="p-4 sm:p-6 pb-20 lg:pb-8 max-w-[1440px] mx-auto space-y-5">
         {/* Top Bar */}
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div className="flex items-center gap-3">
             <button
               type="button"
               onClick={() => setViewMode('list')}
-              className="inline-flex items-center gap-1.5 rounded-xl border border-[#E2E8F0] bg-white px-3 py-2 text-xs font-semibold text-[#0F172A] hover:bg-[#F8FAFC] cursor-pointer"
+              className="inline-flex items-center gap-1.5 rounded-lg border border-[#E2E8F0] bg-white px-3 py-2 text-xs font-semibold text-[#0F172A] hover:bg-[#F1F5F9] cursor-pointer"
             >
               <ArrowLeft className="h-3.5 w-3.5" />
-              <span>Back to Broadcasts</span>
+              <span>Campaigns</span>
             </button>
             <div>
-              <h2 className="font-display text-xl font-bold text-[#0F172A]">New Broadcast</h2>
+              <h2 className="font-display text-lg font-bold text-[#0F172A]">Create Campaign</h2>
               <p className="text-xs text-slate-500">
-                Step {wizardStep} of 3 · {steps[wizardStep - 1].title}
+                Stage {wizardStage} of 3 · {stages[wizardStage - 1].title}
               </p>
             </div>
           </div>
@@ -354,650 +381,564 @@ export function BroadcastsPage() {
             type="button"
             onClick={() => handleSubmitBroadcast(true)}
             disabled={submitting || !selectedTemplate}
-            className="rounded-xl border border-[#E2E8F0] bg-white px-4 py-2 text-xs font-semibold text-[#0F172A] hover:bg-[#F8FAFC] cursor-pointer disabled:opacity-50"
+            className="rounded-lg border border-[#E2E8F0] bg-white px-3.5 py-2 text-xs font-semibold text-[#0F172A] hover:bg-[#F1F5F9] cursor-pointer disabled:opacity-50"
           >
             Save as Draft
           </button>
         </div>
 
-        {/* Multi-Step Visual Progress Indicator */}
-        <nav
-          aria-label="Broadcast creation progress"
-          className="rounded-2xl border border-[#E2E8F0] bg-white px-4 py-5 sm:px-8 sm:py-5 shadow-2xs"
-        >
-          <div className="relative">
-            {/* Background & Active Connector Track (Desktop/Tablet) */}
-            <div
-              aria-hidden="true"
-              className="hidden sm:block absolute top-4 left-[16%] right-[16%] h-0.5 bg-[#E2E8F0]"
-            >
-              <div
-                className={`h-full bg-[#2563EB] transition-all duration-300 ${trackWidthClass}`}
-              />
-            </div>
+        {/* Two-Column Wizard: Persistent Left Stage Rail + Active Stage Panel */}
+        <div className="grid grid-cols-1 lg:grid-cols-12 gap-5 items-start">
+          {/* Persistent Left Stage Navigation Rail */}
+          <aside className="lg:col-span-3 rounded-xl border border-[#E2E8F0] bg-white p-3 space-y-1.5 lg:sticky lg:top-20">
+            <p className="px-2.5 py-1 text-[10px] font-semibold uppercase tracking-wider text-slate-400">
+              Campaign Setup
+            </p>
+            {stages.map((st) => {
+              const Icon = st.icon;
+              const isActive = wizardStage === st.num;
+              const isDone = wizardStage > st.num;
+              const canJump =
+                st.num === 1 ||
+                (st.num === 2 && canAccessStage2) ||
+                (st.num === 3 && canAccessStage3);
 
-            <ol className="relative grid grid-cols-3 gap-2">
-              {steps.map((st) => {
-                const isActive = wizardStep === st.num;
-                const isCompleted = wizardStep > st.num;
-                const canJump =
-                  st.num === 1 ||
-                  (st.num === 2 && canContinueStep1) ||
-                  (st.num === 3 && canContinueStep1 && canContinueStep2);
-
-                return (
-                  <li key={st.num} className="flex flex-col items-center text-center">
-                    <button
-                      type="button"
-                      disabled={!canJump}
-                      onClick={() => canJump && setWizardStep(st.num)}
-                      aria-current={isActive ? 'step' : undefined}
-                      className="group flex flex-col items-center gap-2 focus:outline-none cursor-pointer disabled:cursor-not-allowed"
-                    >
-                      <span
-                        className={`relative z-10 h-8 w-8 rounded-full text-xs font-bold flex items-center justify-center transition-all tabular-nums ring-4 ring-white ${
-                          isActive
-                            ? 'bg-[#2563EB] text-white shadow-xs'
-                            : isCompleted
-                            ? 'bg-emerald-600 text-white'
-                            : 'bg-[#F8FAFC] border border-[#E2E8F0] text-slate-500'
-                        }`}
-                      >
-                        {isCompleted ? <Check className="h-4 w-4" /> : st.num}
-                      </span>
-                      <div>
-                        <p
-                          className={`text-xs font-semibold transition-colors ${
-                            isActive
-                              ? 'text-[#2563EB]'
-                              : isCompleted
-                              ? 'text-[#0F172A]'
-                              : 'text-slate-400'
-                          }`}
-                        >
-                          {st.num}. {st.title}
-                        </p>
-                        <p className="hidden sm:block text-[11px] text-slate-400 truncate max-w-[160px] mt-0.5">
-                          {st.subtitle}
-                        </p>
-                      </div>
-                    </button>
-                  </li>
-                );
-              })}
-            </ol>
-          </div>
-
-          {/* Mobile Compact Progress Bar */}
-          <div className="sm:hidden mt-3 h-1.5 w-full rounded-full bg-[#F8FAFC] overflow-hidden">
-            <div
-              className={`h-full bg-[#2563EB] rounded-full transition-all duration-300 ${mobileBarClass}`}
-            />
-          </div>
-        </nav>
-
-        {/* STEP 1: CHOOSE CUSTOMERS */}
-        {wizardStep === 1 && (
-          <section className="rounded-2xl border border-[#E2E8F0] bg-white p-5 sm:p-6 space-y-5 shadow-2xs">
-            <div className="flex flex-wrap items-center justify-between gap-2">
-              <div>
-                <h3 className="font-display text-lg font-bold text-[#0F172A]">
-                  Who should receive this broadcast?
-                </h3>
-                <p className="text-xs text-slate-500 mt-0.5">
-                  Customers who opted out of updates are skipped automatically.
-                </p>
-              </div>
-              <div className="rounded-xl bg-[#EFF6FF] px-3.5 py-2 text-xs font-semibold text-[#2563EB] tabular-nums">
-                {audienceStats.eligibleCount} ready to receive
-              </div>
-            </div>
-
-            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-              {[
-                {
-                  key: 'all' as const,
-                  title: 'All eligible customers',
-                  desc: 'Everyone who agreed to WhatsApp updates',
-                },
-                {
-                  key: 'groups' as const,
-                  title: 'Customer groups',
-                  desc: 'Pick one or more customer groups',
-                },
-                {
-                  key: 'specific' as const,
-                  title: 'Specific customers',
-                  desc: 'Search and choose individuals',
-                },
-              ].map((opt) => (
+              return (
                 <button
-                  key={opt.key}
+                  key={st.num}
                   type="button"
-                  onClick={() => setAudienceMode(opt.key)}
-                  className={`text-left rounded-xl border p-4 transition-all cursor-pointer ${
-                    audienceMode === opt.key
-                      ? 'border-[#2563EB] bg-[#EFF6FF]/60 shadow-2xs'
-                      : 'border-[#E2E8F0] hover:bg-[#F8FAFC]'
+                  disabled={!canJump}
+                  onClick={() => canJump && setWizardStage(st.num)}
+                  className={`w-full text-left rounded-lg px-3 py-2.5 flex items-start gap-3 transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed ${
+                    isActive
+                      ? 'bg-[#EFF6FF] text-[#2563EB]'
+                      : 'hover:bg-[#F8FAFC] text-[#0F172A]'
                   }`}
                 >
-                  <p className="text-xs font-bold text-[#0F172A]">{opt.title}</p>
-                  <p className="text-[11px] text-slate-500 mt-1 leading-relaxed">{opt.desc}</p>
-                </button>
-              ))}
-            </div>
-
-            {/* Progressive Disclosure: Group Picker */}
-            {audienceMode === 'groups' && (
-              <div className="rounded-xl border border-[#E2E8F0] bg-[#F8FAFC] p-4 space-y-2.5">
-                <p className="text-xs font-semibold text-[#0F172A]">Select customer groups:</p>
-                <div className="flex flex-wrap gap-2">
-                  {tags.map((t) => {
-                    const active = selectedTagIds.includes(t.id);
-                    const count = contacts.filter(
-                      (c) => c.tagIds.includes(t.id) && c.marketingOptIn
-                    ).length;
-                    return (
-                      <button
-                        key={t.id}
-                        type="button"
-                        onClick={() =>
-                          setSelectedTagIds((prev) =>
-                            active ? prev.filter((x) => x !== t.id) : [...prev, t.id]
-                          )
-                        }
-                        className={`px-3.5 py-2 rounded-xl border text-xs font-semibold transition-colors cursor-pointer ${
-                          active
-                            ? 'bg-[#2563EB] border-[#2563EB] text-white'
-                            : 'bg-white border-[#E2E8F0] text-[#0F172A] hover:bg-slate-50'
-                        }`}
-                      >
-                        {t.name} ({count})
-                      </button>
-                    );
-                  })}
-                </div>
-              </div>
-            )}
-
-            {/* Progressive Disclosure: Specific Customer Search */}
-            {audienceMode === 'specific' && (
-              <div className="rounded-xl border border-[#E2E8F0] bg-[#F8FAFC] p-4 space-y-3">
-                <div className="relative max-w-sm">
-                  <Search className="h-3.5 w-3.5 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
-                  <input
-                    type="text"
-                    value={contactSearch}
-                    onChange={(e) => setContactSearch(e.target.value)}
-                    placeholder="Search customers by name or phone..."
-                    className="w-full rounded-xl border border-[#E2E8F0] bg-white pl-8 pr-3 py-2 text-xs focus:border-[#2563EB] focus:outline-none"
-                  />
-                </div>
-                <div className="max-h-56 overflow-y-auto rounded-xl border border-[#E2E8F0] bg-white divide-y divide-[#E2E8F0]">
-                  {filteredContactsForPicker.map((c) => {
-                    const checked = selectedContactIds.includes(c.id);
-                    return (
-                      <label
-                        key={c.id}
-                        className="flex items-center justify-between px-3.5 py-2.5 text-xs hover:bg-[#F8FAFC] cursor-pointer"
-                      >
-                        <span className="flex items-center gap-2.5 min-w-0">
-                          <input
-                            type="checkbox"
-                            checked={checked}
-                            onChange={(e) =>
-                              setSelectedContactIds((prev) =>
-                                e.target.checked
-                                  ? [...prev, c.id]
-                                  : prev.filter((id) => id !== c.id)
-                              )
-                            }
-                            className="rounded border-slate-300 accent-[#2563EB]"
-                          />
-                          <span className="font-semibold text-[#0F172A] truncate">
-                            {c.fullName}
-                          </span>
-                          <span className="font-mono text-slate-400 hidden sm:inline">
-                            {c.phoneE164}
-                          </span>
-                        </span>
-                        <span
-                          className={`text-[11px] font-medium shrink-0 ${
-                            c.marketingOptIn ? 'text-emerald-700' : 'text-[#E11D48]'
-                          }`}
-                        >
-                          {c.marketingOptIn ? 'Eligible' : 'Opted out'}
-                        </span>
-                      </label>
-                    );
-                  })}
-                </div>
-              </div>
-            )}
-
-            {/* Progressive Disclosure: Excluded Breakdown */}
-            {audienceStats.skippedCount > 0 && (
-              <div>
-                <button
-                  type="button"
-                  onClick={() => setShowExcludedDetails((s) => !s)}
-                  className="inline-flex items-center gap-1.5 text-xs font-medium text-slate-500 hover:text-[#0F172A] cursor-pointer"
-                >
-                  <ChevronDown
-                    className={`h-3.5 w-3.5 transition-transform ${
-                      showExcludedDetails ? 'rotate-180' : ''
+                  <span
+                    className={`h-6 w-6 rounded-full text-[11px] font-bold flex items-center justify-center shrink-0 mt-0.5 tabular-nums ${
+                      isActive
+                        ? 'bg-[#2563EB] text-white'
+                        : isDone
+                        ? 'bg-emerald-600 text-white'
+                        : 'bg-[#F1F5F9] text-slate-600'
                     }`}
-                  />
-                  <span>
-                    {audienceStats.skippedCount} customer
-                    {audienceStats.skippedCount === 1 ? '' : 's'} excluded automatically — see why
+                  >
+                    {isDone ? <Check className="h-3.5 w-3.5" /> : st.num}
                   </span>
+                  <div className="min-w-0">
+                    <p className="text-xs font-semibold truncate flex items-center gap-1.5">
+                      <Icon className="h-3.5 w-3.5 shrink-0" />
+                      <span>{st.title}</span>
+                    </p>
+                    <p className="text-[11px] text-slate-500 truncate mt-0.5">{st.subtitle}</p>
+                  </div>
                 </button>
-                {showExcludedDetails && (
-                  <p className="mt-2 rounded-xl border border-[#E2E8F0] bg-[#F8FAFC] px-3.5 py-2.5 text-xs text-slate-600">
-                    {audienceStats.optedOutCount} opted out of marketing updates
-                    {audienceStats.invalidPhoneCount > 0
-                      ? ` · ${audienceStats.invalidPhoneCount} missing a valid phone number`
-                      : ''}
-                    .
-                  </p>
-                )}
-              </div>
-            )}
+              );
+            })}
+          </aside>
 
-            <div className="pt-3 border-t border-[#E2E8F0] flex flex-wrap items-center justify-between gap-3">
-              <p className="text-xs text-slate-500">
-                {!canContinueStep1
-                  ? 'Select at least one eligible customer or group to continue.'
-                  : `Selected: ${audienceSummaryLabel}`}
-              </p>
-              <button
-                type="button"
-                disabled={!canContinueStep1}
-                onClick={() => setWizardStep(2)}
-                className="inline-flex items-center gap-2 rounded-xl bg-[#2563EB] px-5 py-2.5 text-xs font-semibold text-white hover:bg-[#1D4ED8] disabled:opacity-45 cursor-pointer"
-              >
-                <span>Continue to Select Template</span>
-                <ArrowRight className="h-3.5 w-3.5" />
-              </button>
-            </div>
-          </section>
-        )}
+          {/* Active Stage Workspace */}
+          <div className="lg:col-span-9 rounded-xl border border-[#E2E8F0] bg-white p-5 sm:p-6 space-y-5">
+            {/* STAGE 1: CHOOSE TEMPLATE */}
+            {wizardStage === 1 && (
+              <>
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                  <div>
+                    <h3 className="font-display text-base font-bold text-[#0F172A]">
+                      1. Choose Approved Template
+                    </h3>
+                    <p className="text-xs text-slate-500 mt-0.5">
+                      Only Meta-approved templates can be used in outbound WhatsApp campaigns.
+                    </p>
+                  </div>
 
-        {/* STEP 2: CHOOSE MESSAGE */}
-        {wizardStep === 2 && (
-          <section className="rounded-2xl border border-[#E2E8F0] bg-white p-5 sm:p-6 space-y-5 shadow-2xs">
-            <div>
-              <h3 className="font-display text-lg font-bold text-[#0F172A]">
-                Pick an approved WhatsApp message
-              </h3>
-              <p className="text-xs text-slate-500 mt-0.5">
-                Recently used messages appear first. You can fill in personalized details below.
-              </p>
-            </div>
+                  <div className="relative w-full sm:w-64">
+                    <Search className="h-3.5 w-3.5 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
+                    <input
+                      type="text"
+                      value={templateSearch}
+                      onChange={(e) => setTemplateSearch(e.target.value)}
+                      placeholder="Search approved templates..."
+                      className="w-full rounded-lg border border-[#E2E8F0] bg-[#F8FAFC] pl-8 pr-3 py-1.5 text-xs focus:border-[#2563EB] focus:bg-white focus:outline-none"
+                    />
+                  </div>
+                </div>
 
-            {approvedTemplates.length === 0 ? (
-              <div className="rounded-xl border border-amber-200 bg-amber-50 p-4 text-xs text-amber-950">
-                No approved message templates are ready yet. Approve or sync a template in Message
-                Templates first.
-              </div>
-            ) : (
-              <div className="grid grid-cols-1 md:grid-cols-3 gap-3.5">
-                {approvedTemplates.map((tpl, index) => {
-                  const active = selectedTemplate?.id === tpl.id;
-                  return (
-                    <button
-                      key={tpl.id}
-                      type="button"
-                      onClick={() => setSelectedTemplateId(tpl.id)}
-                      className={`text-left rounded-xl border p-4 transition-all cursor-pointer flex flex-col justify-between ${
-                        active
-                          ? 'border-[#2563EB] bg-[#EFF6FF]/60 shadow-2xs'
-                          : 'border-[#E2E8F0] bg-white hover:bg-[#F8FAFC]'
-                      }`}
-                    >
-                      <div>
-                        <div className="flex items-start justify-between gap-2">
-                          <span className="font-display text-xs font-bold text-[#0F172A]">
-                            {formatTemplateTitle(tpl.name)}
-                          </span>
-                          {active && (
-                            <span className="h-5 w-5 rounded-full bg-[#2563EB] text-white flex items-center justify-center shrink-0">
-                              <Check className="h-3 w-3" />
-                            </span>
-                          )}
-                        </div>
-                        <p className="text-[11px] text-slate-500 mt-0.5">
-                          {index === 0 && recentTemplateIds.includes(tpl.id)
-                            ? 'Recently used · '
-                            : ''}
-                          {CATEGORY_LABELS[tpl.category]}
-                        </p>
-                        <p className="text-xs text-slate-600 mt-2.5 line-clamp-3 leading-relaxed">
-                          {tpl.bodyText}
-                        </p>
+                {approvedTemplates.length === 0 ? (
+                  <div className="rounded-xl border border-dashed border-[#E2E8F0] bg-[#F8FAFC] p-8 text-center text-xs text-slate-500 space-y-2">
+                    <p className="font-semibold text-[#0F172A]">No approved templates found</p>
+                    <p>
+                      Connect your WhatsApp account in Settings and sync approved templates from Meta before creating a campaign.
+                    </p>
+                  </div>
+                ) : (
+                  <div className="grid grid-cols-1 lg:grid-cols-12 gap-5">
+                    <div className="lg:col-span-7 space-y-3">
+                      <div className="space-y-2 max-h-72 overflow-y-auto pr-1">
+                        {filteredTemplatesForWizard.map((tpl) => {
+                          const selected = selectedTemplate?.id === tpl.id;
+                          return (
+                            <button
+                              key={tpl.id}
+                              type="button"
+                              onClick={() => setSelectedTemplateId(tpl.id)}
+                              className={`w-full text-left rounded-lg border p-3.5 transition-colors cursor-pointer ${
+                                selected
+                                  ? 'border-[#2563EB] bg-[#EFF6FF]/60'
+                                  : 'border-[#E2E8F0] hover:bg-[#F8FAFC]'
+                              }`}
+                            >
+                              <div className="flex items-center justify-between gap-2">
+                                <span className="text-xs font-bold text-[#0F172A]">
+                                  {formatTemplateTitle(tpl.name)}
+                                </span>
+                                <span className="text-[11px] font-medium text-slate-500">
+                                  {CATEGORY_LABELS[tpl.category]} · {tpl.language}
+                                </span>
+                              </div>
+                              <p className="text-xs text-slate-600 mt-1 line-clamp-2">
+                                {tpl.bodyText}
+                              </p>
+                            </button>
+                          );
+                        })}
                       </div>
-                      {tpl.headerType !== 'NONE' && (
-                        <div className="mt-3 pt-2 border-t border-[#E2E8F0] flex items-center gap-1.5 text-[11px] text-slate-500">
-                          {tpl.headerType === 'IMAGE' ? (
-                            <ImageIcon className="h-3.5 w-3.5 text-[#2563EB]" />
-                          ) : (
-                            <FileText className="h-3.5 w-3.5 text-[#2563EB]" />
-                          )}
-                          <span>Includes {tpl.headerText || tpl.headerType.toLowerCase()}</span>
+
+                      {selectedTemplate && selectedTemplate.variablesCount > 0 && (
+                        <div className="rounded-lg border border-[#E2E8F0] bg-[#F8FAFC] p-4 space-y-2.5">
+                          <p className="text-xs font-bold text-[#0F172A]">
+                            Fill Template Variables
+                          </p>
+                          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                            {Array.from(
+                              { length: selectedTemplate.variablesCount },
+                              (_, idx) => String(idx + 1)
+                            ).map((key) => (
+                              <div key={key}>
+                                <label className="block text-[11px] font-semibold text-slate-600 mb-1">
+                                  {'{{'}{key}{'}}'} {HUMAN_VAR_LABELS[key] ?? `Variable ${key}`}
+                                </label>
+                                <input
+                                  type="text"
+                                  value={varMapping[key] ?? ''}
+                                  onChange={(e) =>
+                                    setVarMapping((p) => ({ ...p, [key]: e.target.value }))
+                                  }
+                                  placeholder={`Sample for {{${key}}}`}
+                                  className="w-full rounded-lg border border-[#E2E8F0] bg-white px-2.5 py-1.5 text-xs focus:border-[#2563EB] focus:outline-none"
+                                />
+                              </div>
+                            ))}
+                          </div>
                         </div>
                       )}
-                    </button>
-                  );
-                })}
-              </div>
+                    </div>
+
+                    {/* Live WhatsApp Bubble Preview */}
+                    <div className="lg:col-span-5 rounded-xl border border-[#E2E8F0] bg-[#F8FAFC] p-4">
+                      <p className="text-xs font-bold text-[#0F172A] mb-2.5">Message Preview</p>
+                      <div className="rounded-xl border border-[#E2E8F0] bg-white p-3.5 space-y-2">
+                        {selectedTemplate?.headerText && (
+                          <p className="text-xs font-bold text-[#0F172A]">
+                            {selectedTemplate.headerText}
+                          </p>
+                        )}
+                        <p className="text-xs text-slate-800 whitespace-pre-wrap leading-relaxed">
+                          {renderedPreview}
+                        </p>
+                        {selectedTemplate?.footerText && (
+                          <p className="text-[11px] text-slate-400">{selectedTemplate.footerText}</p>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+                <div className="pt-4 border-t border-[#E2E8F0] flex justify-end">
+                  <button
+                    type="button"
+                    disabled={!canAccessStage2}
+                    onClick={() => setWizardStage(2)}
+                    className="inline-flex items-center gap-1.5 rounded-lg bg-[#2563EB] px-4 py-2 text-xs font-semibold text-white hover:bg-[#1D4ED8] disabled:opacity-45 cursor-pointer"
+                  >
+                    <span>Next: Choose Audience</span>
+                    <ArrowRight className="h-3.5 w-3.5" />
+                  </button>
+                </div>
+              </>
             )}
 
-            {/* Progressive Disclosure: Personalize Details + Instant Preview */}
-            {selectedTemplate && (
-              <div className="grid grid-cols-1 lg:grid-cols-12 gap-5 pt-2">
-                {selectedTemplate.variablesCount > 0 && (
-                  <div className="lg:col-span-7 rounded-xl border border-[#E2E8F0] bg-[#F8FAFC] p-4 space-y-3">
-                    <p className="text-xs font-semibold text-[#0F172A]">
-                      Personalize message details
-                    </p>
-                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                      {Array.from({ length: selectedTemplate.variablesCount }).map((_, idx) => {
-                        const key = String(idx + 1);
-                        return (
-                          <div key={key}>
-                            <label className="block text-[11px] font-medium text-slate-600 mb-1">
-                              {HUMAN_VAR_LABELS[key] ?? `Custom Detail ${key}`}
-                            </label>
-                            <input
-                              type="text"
-                              value={varMapping[key] ?? ''}
-                              onChange={(e) =>
-                                setVarMapping((prev) => ({ ...prev, [key]: e.target.value }))
+            {/* STAGE 2: CHOOSE AUDIENCE */}
+            {wizardStage === 2 && (
+              <>
+                <div>
+                  <h3 className="font-display text-base font-bold text-[#0F172A]">
+                    2. Choose Audience
+                  </h3>
+                  <p className="text-xs text-slate-500 mt-0.5">
+                    Only contacts with explicit Marketing Opt-In and valid E.164 WhatsApp numbers are eligible.
+                  </p>
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                  {(
+                    [
+                      {
+                        key: 'all',
+                        title: 'All Opted-In Contacts',
+                        desc: 'Every contact with marketing consent',
+                      },
+                      {
+                        key: 'groups',
+                        title: 'Filter by Tags',
+                        desc: 'Target one or more contact tags',
+                      },
+                      {
+                        key: 'specific',
+                        title: 'Select Specific Contacts',
+                        desc: 'Pick individual recipients manually',
+                      },
+                    ] as const
+                  ).map((opt) => (
+                    <button
+                      key={opt.key}
+                      type="button"
+                      onClick={() => setAudienceMode(opt.key)}
+                      className={`text-left rounded-lg border p-3.5 transition-colors cursor-pointer ${
+                        audienceMode === opt.key
+                          ? 'border-[#2563EB] bg-[#EFF6FF]/60'
+                          : 'border-[#E2E8F0] hover:bg-[#F8FAFC]'
+                      }`}
+                    >
+                      <p className="text-xs font-bold text-[#0F172A]">{opt.title}</p>
+                      <p className="text-[11px] text-slate-500 mt-0.5">{opt.desc}</p>
+                    </button>
+                  ))}
+                </div>
+
+                {audienceMode === 'groups' && (
+                  <div className="space-y-2">
+                    <p className="text-xs font-semibold text-[#0F172A]">Select Contact Tags</p>
+                    {tags.length === 0 ? (
+                      <p className="text-xs text-slate-500">
+                        No tags created yet. Add tags in Contacts first.
+                      </p>
+                    ) : (
+                      <div className="flex flex-wrap gap-2">
+                        {tags.map((t) => {
+                          const active = selectedTagIds.includes(t.id);
+                          return (
+                            <button
+                              key={t.id}
+                              type="button"
+                              onClick={() =>
+                                setSelectedTagIds((prev) =>
+                                  active ? prev.filter((x) => x !== t.id) : [...prev, t.id]
+                                )
                               }
-                              className="w-full rounded-lg border border-[#E2E8F0] bg-white px-3 py-2 text-xs focus:border-[#2563EB] focus:outline-none"
-                            />
-                          </div>
+                              className={`px-3 py-1.5 rounded-lg text-xs font-semibold border cursor-pointer ${
+                                active
+                                  ? 'bg-[#2563EB] border-[#2563EB] text-white'
+                                  : 'bg-[#F8FAFC] border-[#E2E8F0] text-slate-700 hover:bg-[#F1F5F9]'
+                              }`}
+                            >
+                              {t.name}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {audienceMode === 'specific' && (
+                  <div className="space-y-2.5">
+                    <div className="relative max-w-sm">
+                      <Search className="h-3.5 w-3.5 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
+                      <input
+                        type="text"
+                        value={contactSearch}
+                        onChange={(e) => setContactSearch(e.target.value)}
+                        placeholder="Search contacts..."
+                        className="w-full rounded-lg border border-[#E2E8F0] pl-8 pr-3 py-1.5 text-xs focus:border-[#2563EB] focus:outline-none"
+                      />
+                    </div>
+                    <div className="max-h-56 overflow-y-auto border border-[#E2E8F0] rounded-lg divide-y divide-[#E2E8F0]">
+                      {filteredContactsForPicker.map((c) => {
+                        const checked = selectedContactIds.includes(c.id);
+                        return (
+                          <label
+                            key={c.id}
+                            className="px-3.5 py-2 flex items-center justify-between gap-3 text-xs hover:bg-[#F8FAFC] cursor-pointer"
+                          >
+                            <span className="flex items-center gap-2.5 min-w-0">
+                              <input
+                                type="checkbox"
+                                checked={checked}
+                                onChange={() =>
+                                  setSelectedContactIds((prev) =>
+                                    checked ? prev.filter((id) => id !== c.id) : [...prev, c.id]
+                                  )
+                                }
+                                className="rounded border-slate-300 accent-[#2563EB]"
+                              />
+                              <span className="font-medium text-[#0F172A] truncate">
+                                {c.fullName}
+                              </span>
+                            </span>
+                            <span className="text-[11px] font-mono text-slate-500 shrink-0">
+                              {c.phoneE164} · {c.marketingOptIn ? 'Opted In' : 'Not Opted In'}
+                            </span>
+                          </label>
                         );
                       })}
                     </div>
                   </div>
                 )}
 
-                <div
-                  className={`${
-                    selectedTemplate.variablesCount > 0 ? 'lg:col-span-5' : 'lg:col-span-12'
-                  } rounded-xl border border-[#E2E8F0] bg-[#F8FAFC] p-4`}
-                >
-                  <p className="text-xs font-semibold text-[#0F172A] mb-2">Customer Preview</p>
-                  <div className="rounded-xl border border-[#E2E8F0] bg-white p-3.5 shadow-2xs space-y-1.5">
-                    {selectedTemplate.headerText && (
-                      <p className="text-xs font-bold text-[#0F172A]">
-                        {selectedTemplate.headerText}
-                      </p>
-                    )}
-                    <p className="text-xs text-slate-800 whitespace-pre-wrap leading-relaxed">
-                      {renderedPreview}
-                    </p>
-                    {selectedTemplate.footerText && (
-                      <p className="text-[11px] text-slate-400">{selectedTemplate.footerText}</p>
-                    )}
-                  </div>
-                </div>
-              </div>
-            )}
-
-            <div className="pt-3 border-t border-[#E2E8F0] flex items-center justify-between gap-3">
-              <button
-                type="button"
-                onClick={() => setWizardStep(1)}
-                className="inline-flex items-center gap-1.5 rounded-xl border border-[#E2E8F0] bg-white px-4 py-2.5 text-xs font-semibold text-[#0F172A] hover:bg-[#F8FAFC] cursor-pointer"
-              >
-                <ArrowLeft className="h-3.5 w-3.5" />
-                <span>Back</span>
-              </button>
-              <button
-                type="button"
-                disabled={!canContinueStep2}
-                onClick={() => setWizardStep(3)}
-                className="inline-flex items-center gap-2 rounded-xl bg-[#2563EB] px-5 py-2.5 text-xs font-semibold text-white hover:bg-[#1D4ED8] disabled:opacity-45 cursor-pointer"
-              >
-                <span>Continue to Preview &amp; Send</span>
-                <ArrowRight className="h-3.5 w-3.5" />
-              </button>
-            </div>
-          </section>
-        )}
-
-        {/* STEP 3: PREVIEW & SEND */}
-        {wizardStep === 3 && (
-          <section className="rounded-2xl border border-[#E2E8F0] bg-white p-5 sm:p-6 space-y-5 shadow-2xs">
-            <div>
-              <h3 className="font-display text-lg font-bold text-[#0F172A]">
-                Preview &amp; Send Broadcast
-              </h3>
-              <p className="text-xs text-slate-500 mt-0.5">
-                Choose when to send, check the preview, and confirm customer consent.
-              </p>
-            </div>
-
-            <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
-              <div className="lg:col-span-7 space-y-4">
-                {/* Summary Card */}
-                <div className="rounded-xl border border-[#E2E8F0] bg-[#F8FAFC] p-4 space-y-2.5 text-xs">
-                  <div className="flex items-center justify-between gap-2">
-                    <span className="text-slate-500">Customers</span>
-                    <button
-                      type="button"
-                      onClick={() => setWizardStep(1)}
-                      className="font-semibold text-[#2563EB] hover:underline cursor-pointer"
-                    >
-                      {audienceSummaryLabel} ({audienceStats.eligibleCount} ready)
-                    </button>
-                  </div>
-                  <div className="flex items-center justify-between gap-2">
-                    <span className="text-slate-500">Message</span>
-                    <button
-                      type="button"
-                      onClick={() => setWizardStep(2)}
-                      className="font-semibold text-[#2563EB] hover:underline cursor-pointer"
-                    >
-                      {selectedTemplate ? formatTemplateTitle(selectedTemplate.name) : '—'}
-                    </button>
-                  </div>
-                  {audienceStats.skippedCount > 0 && (
-                    <div className="flex items-center justify-between gap-2">
-                      <span className="text-slate-500">Automatically excluded</span>
-                      <span className="font-semibold text-[#E11D48] tabular-nums">
-                        {audienceStats.skippedCount} opted-out / invalid
-                      </span>
-                    </div>
-                  )}
-                </div>
-
-                {/* When to send */}
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                  <button
-                    type="button"
-                    onClick={() => setScheduleMode('immediate')}
-                    className={`rounded-xl border p-3.5 text-left cursor-pointer ${
-                      scheduleMode === 'immediate'
-                        ? 'border-[#2563EB] bg-[#EFF6FF]/60'
-                        : 'border-[#E2E8F0] hover:bg-[#F8FAFC]'
-                    }`}
-                  >
-                    <p className="text-xs font-bold text-[#0F172A] flex items-center gap-1.5">
-                      <Send className="h-3.5 w-3.5 text-[#2563EB]" />
-                      Send Now
-                    </p>
-                    <p className="text-[11px] text-slate-500 mt-0.5">
-                      Start sending right after you confirm
-                    </p>
-                  </button>
-
-                  <button
-                    type="button"
-                    onClick={() => setScheduleMode('scheduled')}
-                    className={`rounded-xl border p-3.5 text-left cursor-pointer ${
-                      scheduleMode === 'scheduled'
-                        ? 'border-[#2563EB] bg-[#EFF6FF]/60'
-                        : 'border-[#E2E8F0] hover:bg-[#F8FAFC]'
-                    }`}
-                  >
-                    <p className="text-xs font-bold text-[#0F172A] flex items-center gap-1.5">
-                      <Calendar className="h-3.5 w-3.5 text-[#2563EB]" />
-                      Schedule for Later
-                    </p>
-                    <p className="text-[11px] text-slate-500 mt-0.5">
-                      Pick a date &amp; time ({business.timezone})
-                    </p>
-                  </button>
-                </div>
-
-                {scheduleMode === 'scheduled' && (
+                {/* Audience Eligibility Summary */}
+                <div className="rounded-lg border border-[#E2E8F0] bg-[#F8FAFC] p-4 flex flex-wrap items-center justify-between gap-3">
                   <div>
-                    <label className="block text-xs font-semibold text-[#0F172A] mb-1">
-                      Sending Time ({business.timezone})
-                    </label>
-                    <input
-                      type="datetime-local"
-                      value={scheduledFor}
-                      onChange={(e) => setScheduledFor(e.target.value)}
-                      className="rounded-xl border border-[#E2E8F0] px-3 py-2 text-xs focus:border-[#2563EB] focus:outline-none"
-                    />
+                    <p className="text-xs text-slate-500">Eligible Opted-In Recipients</p>
+                    <p className="font-display text-2xl font-bold text-[#2563EB] tabular-nums">
+                      {audienceStats.eligibleCount}
+                    </p>
                   </div>
-                )}
 
-                {/* Progressive Disclosure: Optional Campaign Name & Details */}
-                <div>
-                  <button
-                    type="button"
-                    onClick={() => setShowAdvanced((v) => !v)}
-                    className="inline-flex items-center gap-1.5 text-xs font-semibold text-slate-600 hover:text-[#2563EB] cursor-pointer"
-                  >
-                    <ChevronDown
-                      className={`h-3.5 w-3.5 transition-transform ${
-                        showAdvanced ? 'rotate-180' : ''
-                      }`}
-                    />
-                    <span>Customize Campaign Name &amp; Messaging Notes</span>
-                  </button>
-
-                  {showAdvanced && (
-                    <div className="mt-3 rounded-xl border border-[#E2E8F0] bg-[#F8FAFC] p-4 space-y-3 text-xs">
-                      <div>
-                        <label className="block font-semibold text-[#0F172A] mb-1">
-                          Campaign Name (auto-named if left blank)
-                        </label>
-                        <input
-                          type="text"
-                          value={customName}
-                          onChange={(e) => setCustomName(e.target.value)}
-                          placeholder={autoCampaignName}
-                          className="w-full rounded-lg border border-[#E2E8F0] bg-white px-3 py-2"
+                  {audienceStats.skippedCount > 0 && (
+                    <div className="text-right text-xs">
+                      <button
+                        type="button"
+                        onClick={() => setShowExcludedDetails((v) => !v)}
+                        className="font-semibold text-slate-600 hover:text-[#0F172A] inline-flex items-center gap-1 cursor-pointer"
+                      >
+                        <span className="tabular-nums">
+                          {audienceStats.skippedCount} automatically excluded
+                        </span>
+                        <ChevronDown
+                          className={`h-3.5 w-3.5 transition-transform ${
+                            showExcludedDetails ? 'rotate-180' : ''
+                          }`}
                         />
-                      </div>
-                      <p className="text-[11px] text-slate-500 leading-relaxed">
-                        WhatsApp template fees apply per conversation according to your Meta
-                        Business Account region and message type (
-                        {selectedTemplate ? CATEGORY_LABELS[selectedTemplate.category] : 'Update'}).
-                      </p>
+                      </button>
+                      {showExcludedDetails && (
+                        <p className="text-[11px] text-slate-500 mt-1 tabular-nums">
+                          {audienceStats.optedOutCount} not opted in ·{' '}
+                          {audienceStats.invalidPhoneCount} invalid phone
+                        </p>
+                      )}
                     </div>
                   )}
                 </div>
 
-                {(business.metaConnectionState !== 'connected' || business.messagingMode === 'test') && (
-                  <p className="rounded-xl border border-amber-200 bg-amber-50 px-3.5 py-2.5 text-xs text-amber-900">
-                    {business.messagingMode === 'test'
-                      ? 'Test Mode is active — bulk broadcasts are disabled so confirming saves this campaign as a draft only.'
-                      : 'WhatsApp is not connected yet — confirming saves this broadcast as a draft so nothing is sent prematurely.'}
-                  </p>
-                )}
-
-                {/* Required Consent Check */}
-                <label className="flex items-start gap-2.5 rounded-xl border border-[#E2E8F0] bg-white p-3.5 cursor-pointer">
-                  <input
-                    type="checkbox"
-                    checked={consentConfirmed}
-                    onChange={(e) => setConsentConfirmed(e.target.checked)}
-                    className="mt-0.5 rounded border-slate-300 accent-[#2563EB]"
-                  />
-                  <span className="text-xs font-medium text-[#0F172A] leading-relaxed">
-                    I confirm these {audienceStats.eligibleCount} customers agreed to receive
-                    WhatsApp updates from {business.name}.
-                  </span>
-                </label>
-              </div>
-
-              {/* Final Customer Preview + Primary Confirm Action */}
-              <div className="lg:col-span-5 rounded-xl border border-[#E2E8F0] bg-[#F8FAFC] p-4 flex flex-col justify-between gap-4">
-                <div>
-                  <p className="text-xs font-bold text-[#0F172A] mb-3">Final Message Preview</p>
-                  <div className="rounded-xl border border-[#E2E8F0] bg-white p-4 shadow-2xs space-y-2">
-                    {selectedTemplate?.headerText && (
-                      <p className="text-xs font-bold text-[#0F172A]">
-                        {selectedTemplate.headerText}
-                      </p>
-                    )}
-                    <p className="text-xs text-slate-800 whitespace-pre-wrap leading-relaxed">
-                      {renderedPreview}
-                    </p>
-                    {selectedTemplate?.footerText && (
-                      <p className="text-[11px] text-slate-400">{selectedTemplate.footerText}</p>
-                    )}
-                  </div>
-                </div>
-
-                <div className="space-y-2">
+                <div className="pt-4 border-t border-[#E2E8F0] flex items-center justify-between">
                   <button
                     type="button"
-                    disabled={
-                      submitting ||
-                      !selectedTemplate ||
-                      !consentConfirmed ||
-                      audienceStats.eligibleCount === 0
-                    }
-                    onClick={() => handleSubmitBroadcast(false)}
-                    className="w-full inline-flex items-center justify-center gap-2 rounded-xl bg-[#E11D48] py-3 text-xs font-semibold text-white hover:bg-rose-700 disabled:opacity-45 transition-colors cursor-pointer shadow-xs"
-                  >
-                    <Megaphone className="h-4 w-4" />
-                    <span>
-                      {scheduleMode === 'scheduled'
-                        ? 'Confirm & Schedule Broadcast'
-                        : 'Send Broadcast Now'}
-                    </span>
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setWizardStep(2)}
-                    className="w-full inline-flex items-center justify-center gap-1.5 rounded-xl border border-[#E2E8F0] bg-white py-2.5 text-xs font-semibold text-[#0F172A] hover:bg-[#F8FAFC] cursor-pointer"
+                    onClick={() => setWizardStage(1)}
+                    className="inline-flex items-center gap-1.5 rounded-lg border border-[#E2E8F0] bg-white px-3.5 py-2 text-xs font-semibold text-[#0F172A] hover:bg-[#F1F5F9] cursor-pointer"
                   >
                     <ArrowLeft className="h-3.5 w-3.5" />
-                    <span>Back to Choose Message</span>
+                    <span>Back</span>
+                  </button>
+                  <button
+                    type="button"
+                    disabled={!canAccessStage3}
+                    onClick={() => setWizardStage(3)}
+                    className="inline-flex items-center gap-1.5 rounded-lg bg-[#2563EB] px-4 py-2 text-xs font-semibold text-white hover:bg-[#1D4ED8] disabled:opacity-45 cursor-pointer"
+                  >
+                    <span>Next: Review &amp; Schedule</span>
+                    <ArrowRight className="h-3.5 w-3.5" />
                   </button>
                 </div>
-              </div>
-            </div>
-          </section>
-        )}
+              </>
+            )}
+
+            {/* STAGE 3: REVIEW & SCHEDULE */}
+            {wizardStage === 3 && (
+              <>
+                <div>
+                  <h3 className="font-display text-base font-bold text-[#0F172A]">
+                    3. Review &amp; Schedule
+                  </h3>
+                  <p className="text-xs text-slate-500 mt-0.5">
+                    Review audience size, campaign schedule ({business.timezone}), and template content.
+                  </p>
+                </div>
+
+                <div className="grid grid-cols-1 lg:grid-cols-12 gap-5">
+                  <div className="lg:col-span-7 space-y-4 text-xs">
+                    <div>
+                      <label className="block font-semibold text-[#0F172A] mb-1">
+                        Campaign Name
+                      </label>
+                      <input
+                        type="text"
+                        value={customName}
+                        onChange={(e) => setCustomName(e.target.value)}
+                        placeholder={autoCampaignName}
+                        className="w-full rounded-lg border border-[#E2E8F0] px-3 py-2 focus:border-[#2563EB] focus:outline-none"
+                      />
+                    </div>
+
+                    <div className="grid grid-cols-2 gap-3 rounded-lg border border-[#E2E8F0] bg-[#F8FAFC] p-3.5">
+                      <div>
+                        <p className="text-[11px] text-slate-500">Eligible Audience</p>
+                        <p className="font-semibold text-[#0F172A] mt-0.5 tabular-nums">
+                          {audienceStats.eligibleCount} contact{audienceStats.eligibleCount === 1 ? '' : 's'}
+                        </p>
+                      </div>
+                      <div>
+                        <p className="text-[11px] text-slate-500">Template</p>
+                        <p className="font-semibold text-[#0F172A] mt-0.5 truncate">
+                          {selectedTemplate ? formatTemplateTitle(selectedTemplate.name) : '—'}
+                        </p>
+                      </div>
+                    </div>
+
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                      <button
+                        type="button"
+                        onClick={() => setScheduleMode('immediate')}
+                        className={`rounded-lg border p-3 text-left cursor-pointer ${
+                          scheduleMode === 'immediate'
+                            ? 'border-[#2563EB] bg-[#EFF6FF]/60'
+                            : 'border-[#E2E8F0] hover:bg-[#F8FAFC]'
+                        }`}
+                      >
+                        <p className="font-bold text-[#0F172A]">Immediate</p>
+                        <p className="text-[11px] text-slate-500 mt-0.5">
+                          Ready upon confirmation
+                        </p>
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={() => setScheduleMode('scheduled')}
+                        className={`rounded-lg border p-3 text-left cursor-pointer ${
+                          scheduleMode === 'scheduled'
+                            ? 'border-[#2563EB] bg-[#EFF6FF]/60'
+                            : 'border-[#E2E8F0] hover:bg-[#F8FAFC]'
+                        }`}
+                      >
+                        <p className="font-bold text-[#0F172A] flex items-center gap-1.5">
+                          <Calendar className="h-3.5 w-3.5 text-[#2563EB]" />
+                          Schedule for Later
+                        </p>
+                        <p className="text-[11px] text-slate-500 mt-0.5">
+                          Timezone: {business.timezone}
+                        </p>
+                      </button>
+                    </div>
+
+                    {scheduleMode === 'scheduled' && (
+                      <div>
+                        <label className="block font-semibold text-[#0F172A] mb-1">
+                          Scheduled Time ({business.timezone})
+                        </label>
+                        <input
+                          type="datetime-local"
+                          value={scheduledFor}
+                          onChange={(e) => setScheduledFor(e.target.value)}
+                          className="rounded-lg border border-[#E2E8F0] px-3 py-2 focus:border-[#2563EB] focus:outline-none"
+                        />
+                      </div>
+                    )}
+
+                    {dispatchDisabledReason && (
+                      <div className="rounded-lg border border-amber-200 bg-amber-50 px-3.5 py-2.5 text-amber-900 flex items-start gap-2">
+                        <AlertCircle className="h-4 w-4 shrink-0 mt-0.5" />
+                        <span>{dispatchDisabledReason}</span>
+                      </div>
+                    )}
+
+                    <label className="flex items-start gap-2.5 rounded-lg border border-[#E2E8F0] bg-[#F8FAFC] p-3 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={consentConfirmed}
+                        onChange={(e) => setConsentConfirmed(e.target.checked)}
+                        className="mt-0.5 rounded border-slate-300 accent-[#2563EB]"
+                      />
+                      <span className="font-medium text-[#0F172A] leading-relaxed">
+                        I confirm these {audienceStats.eligibleCount} recipients explicitly opted in to receive WhatsApp messages from {business.name}.
+                      </span>
+                    </label>
+                  </div>
+
+                  {/* Final Preview + Save/Confirm */}
+                  <div className="lg:col-span-5 rounded-xl border border-[#E2E8F0] bg-[#F8FAFC] p-4 flex flex-col justify-between gap-4">
+                    <div>
+                      <p className="text-xs font-bold text-[#0F172A] mb-2.5">Final Message Preview</p>
+                      <div className="rounded-xl border border-[#E2E8F0] bg-white p-3.5 space-y-2">
+                        {selectedTemplate?.headerText && (
+                          <p className="text-xs font-bold text-[#0F172A]">
+                            {selectedTemplate.headerText}
+                          </p>
+                        )}
+                        <p className="text-xs text-slate-800 whitespace-pre-wrap leading-relaxed">
+                          {renderedPreview}
+                        </p>
+                        {selectedTemplate?.footerText && (
+                          <p className="text-[11px] text-slate-400">{selectedTemplate.footerText}</p>
+                        )}
+                      </div>
+                    </div>
+
+                    <div className="space-y-2">
+                      <button
+                        type="button"
+                        disabled={
+                          submitting ||
+                          !selectedTemplate ||
+                          !consentConfirmed ||
+                          audienceStats.eligibleCount === 0
+                        }
+                        onClick={() => handleSubmitBroadcast(false)}
+                        className="w-full inline-flex items-center justify-center gap-2 rounded-lg bg-[#E11D48] py-2.5 text-xs font-semibold text-white hover:bg-rose-700 disabled:opacity-45 transition-colors cursor-pointer"
+                      >
+                        <Megaphone className="h-3.5 w-3.5" />
+                        <span>
+                          {dispatchDisabledReason
+                            ? 'Save Campaign Draft'
+                            : scheduleMode === 'scheduled'
+                            ? 'Schedule Campaign'
+                            : 'Create Campaign'}
+                        </span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setWizardStage(2)}
+                        className="w-full inline-flex items-center justify-center gap-1.5 rounded-lg border border-[#E2E8F0] bg-white py-2 text-xs font-semibold text-[#0F172A] hover:bg-[#F1F5F9] cursor-pointer"
+                      >
+                        <ArrowLeft className="h-3.5 w-3.5" />
+                        <span>Back to Audience</span>
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              </>
+            )}
+          </div>
+        </div>
       </div>
     );
   }
 
   return (
-    <div className="p-4 sm:p-6 lg:p-8 pb-20 lg:pb-8 max-w-[1440px] mx-auto space-y-6">
+    <div className="p-4 sm:p-6 pb-20 lg:pb-8 max-w-[1520px] mx-auto space-y-5">
       {/* Header */}
       <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
         <div>
-          <div className="flex items-center gap-2">
-            <span className="h-[2px] w-5 bg-[#F4B942]" />
-            <span className="text-xs font-semibold text-[#2563EB]">Outreach</span>
+          <div className="flex items-center gap-2.5">
+            <h2 className="font-display text-xl font-bold text-[#0F172A] tracking-tight">
+              Campaigns
+            </h2>
+            <span className="text-xs font-medium text-slate-500 tabular-nums">
+              {campaigns.length} total
+            </span>
           </div>
-          <h2 className="font-display text-2xl font-bold text-[#0F172A] tracking-tight mt-0.5">
-            Broadcast Campaigns
-          </h2>
-          <p className="text-sm text-slate-500 mt-0.5">
-            Send approved WhatsApp announcements to opted-in customers in three simple steps.
+          <p className="text-xs text-slate-500 mt-0.5">
+            Plan WhatsApp template broadcasts for opted-in contacts and inspect delivery analytics.
           </p>
         </div>
 
@@ -1005,16 +946,24 @@ export function BroadcastsPage() {
           <button
             type="button"
             onClick={handleOpenNewWizard}
-            className="inline-flex items-center gap-2 rounded-xl bg-[#E11D48] px-4 py-2.5 text-xs font-semibold text-white hover:bg-rose-700 whitespace-nowrap self-start cursor-pointer shadow-2xs"
+            className="inline-flex items-center gap-1.5 rounded-lg bg-[#E11D48] px-3.5 py-2 text-xs font-semibold text-white hover:bg-rose-700 whitespace-nowrap self-start cursor-pointer"
           >
-            <Plus className="h-4 w-4" />
-            <span>New Broadcast</span>
+            <Plus className="h-3.5 w-3.5" />
+            <span>New Campaign</span>
           </button>
         )}
       </div>
 
+      {/* Honest Test Mode / Dispatch Readiness Notice */}
+      {dispatchDisabledReason && (
+        <div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-2.5 text-xs text-amber-950 flex items-center gap-2">
+          <AlertCircle className="h-4 w-4 text-[#F4B942] shrink-0" />
+          <span>{dispatchDisabledReason}</span>
+        </div>
+      )}
+
       {bannerFeedback && (
-        <div className="rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-xs text-emerald-900 flex items-center justify-between gap-2">
+        <div className="rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-2.5 text-xs text-emerald-900 flex items-center justify-between gap-2">
           <span className="flex items-center gap-2 font-medium">
             <CheckCircle2 className="h-4 w-4 shrink-0" />
             {bannerFeedback}
@@ -1026,209 +975,286 @@ export function BroadcastsPage() {
       )}
 
       {campaigns.length === 0 ? (
-        <div className="rounded-2xl border border-[#E2E8F0] bg-white p-10 text-center shadow-2xs">
-          <div className="h-12 w-12 rounded-2xl bg-rose-50 text-[#E11D48] flex items-center justify-center mx-auto mb-4">
+        <div className="rounded-xl border border-[#E2E8F0] bg-white p-10 text-center space-y-3">
+          <div className="h-12 w-12 rounded-xl bg-rose-50 text-[#E11D48] flex items-center justify-center mx-auto">
             <Megaphone className="h-6 w-6" />
           </div>
-          <h3 className="font-display text-lg font-bold text-[#0F172A]">No campaigns yet.</h3>
-          <p className="text-xs text-slate-500 mt-1.5 max-w-md mx-auto leading-relaxed">
-            Reach opted-in customers with approved WhatsApp messages in three guided steps: choose
-            your audience, pick a template, and preview before sending.
+          <h3 className="font-display text-base font-bold text-[#0F172A]">No campaigns yet</h3>
+          <p className="text-xs text-slate-500 max-w-md mx-auto leading-relaxed">
+            Create a campaign draft in three stages: choose an approved template, select opted-in contacts, and review schedule details.
           </p>
           {isAdmin && (
             <button
               type="button"
               onClick={handleOpenNewWizard}
-              className="mt-5 inline-flex items-center gap-2 rounded-xl bg-[#E11D48] px-5 py-2.5 text-xs font-semibold text-white hover:bg-rose-700 cursor-pointer shadow-2xs"
+              className="mt-2 inline-flex items-center gap-1.5 rounded-lg bg-[#E11D48] px-4 py-2 text-xs font-semibold text-white hover:bg-rose-700 cursor-pointer"
             >
-              <Plus className="h-4 w-4" />
-              <span>Create Your First Broadcast</span>
+              <Plus className="h-3.5 w-3.5" />
+              <span>Create Campaign</span>
             </button>
           )}
         </div>
       ) : (
         <>
-      {/* Status Tabs */}
-      <div className="flex items-center gap-1.5 overflow-x-auto pb-1">
-        {(
-          [
-            { key: 'all', label: 'All' },
-            { key: 'draft', label: 'Drafts' },
-            { key: 'scheduled', label: 'Scheduled' },
-            { key: 'running', label: 'Sending' },
-            { key: 'paused', label: 'Paused' },
-            { key: 'completed', label: 'Completed' },
-          ] as const
-        ).map((tab) => (
-          <button
-            key={tab.key}
-            type="button"
-            onClick={() => setStatusFilter(tab.key)}
-            className={`px-3.5 py-2 rounded-xl text-xs font-semibold whitespace-nowrap transition-colors cursor-pointer ${
-              statusFilter === tab.key
-                ? 'bg-[#2563EB] text-white'
-                : 'bg-white border border-[#E2E8F0] text-slate-600 hover:bg-[#F8FAFC]'
-            }`}
-          >
-            {tab.label}
-          </button>
-        ))}
-      </div>
+          {/* Filter, Sort & Search Toolbar */}
+          <div className="rounded-xl border border-[#E2E8F0] bg-white p-3 flex flex-col lg:flex-row lg:items-center justify-between gap-3">
+            <div className="flex flex-wrap items-center gap-2">
+              <select
+                aria-label="Filter by status"
+                value={statusFilter}
+                onChange={(e) => {
+                  setStatusFilter(e.target.value as 'all' | CampaignStatus);
+                  setPage(1);
+                }}
+                className="rounded-lg border border-[#E2E8F0] bg-[#F8FAFC] px-2.5 py-1.5 text-xs font-medium text-[#0F172A] cursor-pointer"
+              >
+                <option value="all">Filter by Status: All</option>
+                <option value="draft">Draft</option>
+                <option value="scheduled">Scheduled</option>
+                <option value="running">Running</option>
+                <option value="paused">Paused</option>
+                <option value="completed">Completed</option>
+              </select>
 
-      {/* Responsive Mobile Cards + Desktop Table */}
-      <div className="grid grid-cols-1 gap-3 md:hidden">
-        {filteredCampaigns.map((cmp) => (
-          <div key={cmp.id} className="rounded-2xl border border-[#E2E8F0] bg-white p-4 space-y-3">
-            <div className="flex items-start justify-between gap-2">
-              <div>
-                <p className="text-sm font-bold text-[#0F172A]">{cmp.name}</p>
-                <p className="text-xs text-slate-500 capitalize mt-0.5">{cmp.status}</p>
-              </div>
-              <span className="text-xs font-semibold text-[#2563EB] tabular-nums">
-                {cmp.metrics.eligible} ready
-              </span>
+              <select
+                aria-label="Sort campaigns"
+                value={sortBy}
+                onChange={(e) => setSortBy(e.target.value as 'newest' | 'name' | 'audience')}
+                className="rounded-lg border border-[#E2E8F0] bg-[#F8FAFC] px-2.5 py-1.5 text-xs font-medium text-[#0F172A] cursor-pointer"
+              >
+                <option value="newest">Sort: Newest First</option>
+                <option value="name">Sort: Name (A–Z)</option>
+                <option value="audience">Sort: Audience Size</option>
+              </select>
             </div>
-            <div className="flex items-center justify-between text-xs text-slate-600 pt-2 border-t border-[#E2E8F0]">
-              <span className="tabular-nums">
-                Delivered: {cmp.metrics.delivered} · Read: {cmp.metrics.read}
-              </span>
-              <div className="flex items-center gap-2">
-                {isAdmin && (
+
+            <div className="relative w-full lg:w-72">
+              <Search className="h-3.5 w-3.5 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
+              <input
+                type="text"
+                value={searchCampaign}
+                onChange={(e) => {
+                  setSearchCampaign(e.target.value);
+                  setPage(1);
+                }}
+                placeholder="Search campaigns..."
+                className="w-full rounded-lg border border-[#E2E8F0] bg-[#F8FAFC] pl-8 pr-3 py-1.5 text-xs focus:border-[#2563EB] focus:bg-white focus:outline-none"
+              />
+            </div>
+          </div>
+
+          {/* Mobile Cards */}
+          <div className="grid grid-cols-1 gap-2.5 md:hidden">
+            {paginatedCampaigns.map((cmp) => (
+              <div key={cmp.id} className="rounded-xl border border-[#E2E8F0] bg-white p-4 space-y-2.5 text-xs">
+                <div className="flex items-start justify-between gap-2">
+                  <div>
+                    <p className="font-semibold text-[#0F172A]">{cmp.name}</p>
+                    <p className="text-[11px] text-slate-500 capitalize mt-0.5">
+                      {cmp.status} · {new Date(cmp.createdAt).toLocaleDateString()}
+                    </p>
+                  </div>
+                  <span className="font-mono font-semibold text-[#2563EB] tabular-nums">
+                    {cmp.metrics.eligible} audience
+                  </span>
+                </div>
+                <div className="flex items-center justify-between pt-2 border-t border-[#E2E8F0] text-slate-600 tabular-nums">
+                  <span>
+                    Delivered: {cmp.metrics.delivered} · Read: {cmp.metrics.read}
+                  </span>
+                  <div className="flex items-center gap-3">
+                    {isAdmin && (
+                      <button
+                        type="button"
+                        onClick={() => handleDuplicate(cmp.id)}
+                        className="font-semibold text-slate-600 cursor-pointer"
+                      >
+                        Duplicate
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      onClick={() => setReportCampaign(cmp)}
+                      className="font-semibold text-[#2563EB] cursor-pointer"
+                    >
+                      Report
+                    </button>
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
+
+          {/* Desktop Campaigns Table */}
+          <div className="hidden md:block rounded-xl border border-[#E2E8F0] bg-white overflow-hidden">
+            <div className="overflow-x-auto">
+              <table className="w-full text-left border-collapse">
+                <thead>
+                  <tr className="border-b border-[#E2E8F0] bg-[#F8FAFC] text-[11px] font-semibold text-slate-500 uppercase tracking-wider">
+                    <th className="py-3 px-4">Campaign Name</th>
+                    <th className="py-3 px-4">Status</th>
+                    <th className="py-3 px-4 text-right">Audience</th>
+                    <th className="py-3 px-4 text-right">Sent</th>
+                    <th className="py-3 px-4 text-right">Delivered</th>
+                    <th className="py-3 px-4 text-right">Read</th>
+                    <th className="py-3 px-4 text-right">Failed</th>
+                    <th className="py-3 px-4">Created Date</th>
+                    <th className="py-3 px-4 text-right">Actions</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-[#E2E8F0] text-xs">
+                  {paginatedCampaigns.length === 0 ? (
+                    <tr>
+                      <td colSpan={9} className="py-12 text-center text-slate-500">
+                        No campaigns match your current filter.
+                      </td>
+                    </tr>
+                  ) : (
+                    paginatedCampaigns.map((cmp) => {
+                      const tpl = templates.find((t) => t.id === cmp.templateId);
+                      return (
+                        <tr key={cmp.id} className="hover:bg-[#F8FAFC] transition-colors">
+                          <td className="py-3 px-4">
+                            <p className="font-semibold text-[#0F172A]">{cmp.name}</p>
+                            <p className="text-[11px] text-slate-500 mt-0.5">
+                              {tpl ? formatTemplateTitle(tpl.name) : 'Template'}
+                            </p>
+                          </td>
+                          <td className="py-3 px-4 capitalize font-medium text-slate-700">
+                            {cmp.status}
+                          </td>
+                          <td className="py-3 px-4 text-right font-mono tabular-nums font-semibold text-[#0F172A]">
+                            {cmp.metrics.eligible}
+                          </td>
+                          <td className="py-3 px-4 text-right font-mono tabular-nums text-slate-700">
+                            {cmp.metrics.sent}
+                          </td>
+                          <td className="py-3 px-4 text-right font-mono tabular-nums text-emerald-700">
+                            {cmp.metrics.delivered}
+                          </td>
+                          <td className="py-3 px-4 text-right font-mono tabular-nums text-[#2563EB]">
+                            {cmp.metrics.read}
+                          </td>
+                          <td className="py-3 px-4 text-right font-mono tabular-nums text-[#E11D48]">
+                            {cmp.metrics.failed}
+                          </td>
+                          <td className="py-3 px-4 text-slate-500 tabular-nums whitespace-nowrap">
+                            {new Date(cmp.createdAt).toLocaleDateString('en-GB', {
+                              day: '2-digit',
+                              month: 'short',
+                              year: 'numeric',
+                            })}
+                          </td>
+                          <td className="py-3 px-4 text-right whitespace-nowrap">
+                            <div className="inline-flex items-center gap-1.5">
+                              <button
+                                type="button"
+                                onClick={() => setReportCampaign(cmp)}
+                                title="View analytics"
+                                className="inline-flex items-center gap-1 rounded-md border border-[#E2E8F0] bg-white px-2.5 py-1 text-[11px] font-semibold text-[#0F172A] hover:bg-[#F1F5F9] cursor-pointer"
+                              >
+                                <BarChart2 className="h-3 w-3 text-[#2563EB]" />
+                                Analytics
+                              </button>
+                              {isAdmin && (
+                                <button
+                                  type="button"
+                                  onClick={() => handleDuplicate(cmp.id)}
+                                  title="Duplicate campaign"
+                                  className="p-1.5 rounded-md border border-[#E2E8F0] bg-white text-slate-600 hover:bg-[#F1F5F9] cursor-pointer"
+                                >
+                                  <Copy className="h-3 w-3" />
+                                </button>
+                              )}
+                              {isAdmin && cmp.status === 'scheduled' && (
+                                <button
+                                  type="button"
+                                  onClick={() => updateCampaignStatus(cmp.id, 'paused')}
+                                  title="Pause"
+                                  className="p-1.5 rounded-md border border-[#E2E8F0] text-slate-600 hover:bg-[#F1F5F9] cursor-pointer"
+                                >
+                                  <Pause className="h-3 w-3" />
+                                </button>
+                              )}
+                              {isAdmin && cmp.status === 'paused' && (
+                                <button
+                                  type="button"
+                                  onClick={() => updateCampaignStatus(cmp.id, 'scheduled')}
+                                  title="Resume"
+                                  className="p-1.5 rounded-md border border-[#E2E8F0] text-[#2563EB] hover:bg-[#EFF6FF] cursor-pointer"
+                                >
+                                  <Play className="h-3 w-3" />
+                                </button>
+                              )}
+                            </div>
+                          </td>
+                        </tr>
+                      );
+                    })
+                  )}
+                </tbody>
+              </table>
+            </div>
+
+            {/* Pagination Footer */}
+            <div className="px-4 py-3 border-t border-[#E2E8F0] bg-[#F8FAFC] flex flex-wrap items-center justify-between gap-3 text-xs text-slate-600">
+              <span className="tabular-nums">{filteredCampaigns.length} campaign(s)</span>
+              <div className="flex items-center gap-4">
+                <div className="flex items-center gap-2">
+                  <span>Rows per page</span>
+                  <select
+                    value={pageSize}
+                    onChange={(e) => {
+                      setPageSize(Number(e.target.value) as 10 | 25 | 50);
+                      setPage(1);
+                    }}
+                    className="rounded-md border border-[#E2E8F0] bg-white px-2 py-1 text-xs cursor-pointer"
+                  >
+                    <option value={10}>10</option>
+                    <option value={25}>25</option>
+                    <option value={50}>50</option>
+                  </select>
+                </div>
+                <div className="flex items-center gap-2">
+                  <span className="tabular-nums">
+                    Page {currentPage} of {totalPages}
+                  </span>
                   <button
                     type="button"
-                    onClick={() => handleDuplicate(cmp.id)}
-                    className="text-xs font-semibold text-slate-600 cursor-pointer"
+                    disabled={currentPage <= 1}
+                    onClick={() => setPage((p) => Math.max(1, p - 1))}
+                    className="rounded-md border border-[#E2E8F0] bg-white px-2.5 py-1 font-medium disabled:opacity-50 cursor-pointer"
                   >
-                    Duplicate
+                    Previous
                   </button>
-                )}
-                <button
-                  type="button"
-                  onClick={() => setReportCampaign(cmp)}
-                  className="text-xs font-semibold text-[#2563EB] cursor-pointer"
-                >
-                  Results
-                </button>
+                  <button
+                    type="button"
+                    disabled={currentPage >= totalPages}
+                    onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
+                    className="rounded-md border border-[#E2E8F0] bg-white px-2.5 py-1 font-medium disabled:opacity-50 cursor-pointer"
+                  >
+                    Next
+                  </button>
+                </div>
               </div>
             </div>
           </div>
-        ))}
-      </div>
-
-      <div className="hidden md:block rounded-2xl border border-[#E2E8F0] bg-white overflow-hidden shadow-2xs">
-        <div className="overflow-x-auto">
-          <table className="w-full text-left border-collapse">
-            <thead>
-              <tr className="border-b border-[#E2E8F0] bg-[#F8FAFC] text-[11px] font-semibold text-slate-500 uppercase tracking-wider">
-                <th className="py-3 px-4">Campaign</th>
-                <th className="py-3 px-4">Status</th>
-                <th className="py-3 px-4 text-right">Eligible</th>
-                <th className="py-3 px-4 text-right">Delivered</th>
-                <th className="py-3 px-4 text-right">Read</th>
-                <th className="py-3 px-4 text-right">Failed</th>
-                <th className="py-3 px-4 text-right">Actions</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-[#E2E8F0] text-xs">
-              {filteredCampaigns.length === 0 ? (
-                <tr>
-                  <td colSpan={7} className="py-12 text-center text-slate-500">
-                    No campaigns in this view yet.
-                  </td>
-                </tr>
-              ) : (
-                filteredCampaigns.map((cmp) => {
-                  const tpl = templates.find((t) => t.id === cmp.templateId);
-                  return (
-                    <tr key={cmp.id} className="hover:bg-[#F8FAFC] transition-colors">
-                      <td className="py-3.5 px-4">
-                        <p className="font-semibold text-[#0F172A]">{cmp.name}</p>
-                        <p className="text-[11px] text-slate-500 mt-0.5">
-                          Message: {tpl ? formatTemplateTitle(tpl.name) : '—'}
-                        </p>
-                      </td>
-                      <td className="py-3.5 px-4 capitalize font-semibold text-slate-700">
-                        {cmp.status}
-                      </td>
-                      <td className="py-3.5 px-4 text-right font-mono tabular-nums text-[#2563EB] font-semibold">
-                        {cmp.metrics.eligible}
-                      </td>
-                      <td className="py-3.5 px-4 text-right font-mono tabular-nums">
-                        {cmp.metrics.delivered}
-                      </td>
-                      <td className="py-3.5 px-4 text-right font-mono tabular-nums">
-                        {cmp.metrics.read}
-                      </td>
-                      <td className="py-3.5 px-4 text-right font-mono tabular-nums text-[#E11D48]">
-                        {cmp.metrics.failed}
-                      </td>
-                      <td className="py-3.5 px-4 text-right whitespace-nowrap">
-                        <div className="inline-flex items-center gap-1.5">
-                          <button
-                            type="button"
-                            onClick={() => setReportCampaign(cmp)}
-                            className="inline-flex items-center gap-1 rounded-lg border border-[#E2E8F0] bg-white px-2.5 py-1 text-[11px] font-semibold text-[#0F172A] hover:bg-slate-50 cursor-pointer"
-                          >
-                            <BarChart2 className="h-3 w-3 text-[#2563EB]" />
-                            Results
-                          </button>
-                          {isAdmin && (
-                            <button
-                              type="button"
-                              onClick={() => handleDuplicate(cmp.id)}
-                              className="inline-flex items-center gap-1 rounded-lg border border-[#E2E8F0] bg-white px-2.5 py-1 text-[11px] font-semibold text-slate-700 hover:bg-slate-50 cursor-pointer"
-                              title="Duplicate campaign"
-                            >
-                              <Copy className="h-3 w-3" />
-                              Duplicate
-                            </button>
-                          )}
-                          {isAdmin && cmp.status === 'scheduled' && (
-                            <button
-                              type="button"
-                              onClick={() => updateCampaignStatus(cmp.id, 'paused')}
-                              className="p-1.5 rounded-lg border border-[#E2E8F0] text-slate-600 hover:bg-slate-50 cursor-pointer"
-                              title="Pause"
-                            >
-                              <Pause className="h-3.5 w-3.5" />
-                            </button>
-                          )}
-                          {isAdmin && cmp.status === 'paused' && (
-                            <button
-                              type="button"
-                              onClick={() => updateCampaignStatus(cmp.id, 'scheduled')}
-                              className="p-1.5 rounded-lg border border-[#E2E8F0] text-[#2563EB] hover:bg-[#EFF6FF] cursor-pointer"
-                              title="Resume"
-                            >
-                              <Play className="h-3.5 w-3.5" />
-                            </button>
-                          )}
-                        </div>
-                      </td>
-                    </tr>
-                  );
-                })
-              )}
-            </tbody>
-          </table>
-        </div>
-      </div>
         </>
       )}
 
-      {/* Campaign Results Modal */}
+      {/* Campaign Analytics Modal */}
       {reportCampaign && (
         <div
           className="fixed inset-0 z-50 bg-[#0F172A]/40 flex items-center justify-center p-4"
           onClick={() => setReportCampaign(null)}
         >
           <div
-            className="w-full max-w-xl rounded-2xl border border-[#E2E8F0] bg-white shadow-xl overflow-hidden"
+            className="w-full max-w-xl rounded-xl border border-[#E2E8F0] bg-white shadow-luxury-hover overflow-hidden"
             onClick={(e) => e.stopPropagation()}
           >
             <div className="px-5 py-4 border-b border-[#E2E8F0] flex items-center justify-between">
               <div>
-                <h3 className="font-display text-base font-bold text-[#0F172A]">
+                <h3 className="font-display text-sm font-bold text-[#0F172A]">
                   {reportCampaign.name}
                 </h3>
                 <p className="text-xs text-slate-500 capitalize">
@@ -1254,13 +1280,13 @@ export function BroadcastsPage() {
                   { label: 'Delivered', value: reportCampaign.metrics.delivered, color: 'text-emerald-700' },
                   { label: 'Read', value: reportCampaign.metrics.read, color: 'text-[#2563EB]' },
                   { label: 'Failed', value: reportCampaign.metrics.failed, color: 'text-[#E11D48]' },
-                  { label: 'Skipped (Opt-Out)', value: reportCampaign.metrics.skipped, color: 'text-amber-700' },
+                  { label: 'Skipped', value: reportCampaign.metrics.skipped, color: 'text-amber-700' },
                   { label: 'Submitted', value: reportCampaign.metrics.submitted, color: 'text-slate-600' },
                 ] as const
               ).map((stat) => (
                 <div
                   key={stat.label}
-                  className="rounded-xl border border-[#E2E8F0] bg-[#F8FAFC] p-3"
+                  className="rounded-lg border border-[#E2E8F0] bg-[#F8FAFC] p-3"
                 >
                   <p className="text-[11px] text-slate-500">{stat.label}</p>
                   <p className={`font-display text-xl font-bold tabular-nums mt-1 ${stat.color}`}>

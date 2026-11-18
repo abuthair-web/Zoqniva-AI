@@ -73,19 +73,15 @@ export function AIAssistantPage() {
       {/* Header */}
       <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-4">
         <div>
-          <div className="flex items-center gap-2">
-            <span className="h-[2px] w-5 bg-[#F4B942]" />
-            <span className="text-xs font-semibold text-amber-700">Guided Customer Assistant</span>
-          </div>
-          <h2 className="font-display text-2xl font-bold text-[#0F172A] tracking-tight mt-0.5">
+          <h1 className="font-display text-xl sm:text-2xl font-bold text-[#0F172A] tracking-tight">
             AI Assistant
-          </h2>
-          <p className="text-sm text-slate-500 mt-0.5">
+          </h1>
+          <p className="text-xs sm:text-sm text-slate-500 mt-0.5">
             Teach the assistant your business policies, choose when it steps aside for a human, and test replies safely.
           </p>
         </div>
 
-        <div className="flex items-center gap-3 rounded-xl border border-[#E2E8F0] bg-white px-4 py-2.5 self-start">
+        <div className="flex items-center gap-3 rounded-lg border border-[#E2E8F0] bg-white px-3.5 py-2 self-start">
           <Bot className="h-4 w-4 text-[#F4B942]" />
           <span className="text-xs font-semibold text-[#0F172A]">
             Live Auto-Reply:
@@ -99,7 +95,7 @@ export function AIAssistantPage() {
                 autoReplyAuthorized: !aiConfig.enabled,
               })
             }
-            className={`px-3 py-1 rounded-lg text-xs font-semibold cursor-pointer disabled:opacity-50 ${
+            className={`px-3 py-1 rounded-md text-xs font-semibold cursor-pointer disabled:opacity-50 ${
               liveActive
                 ? 'bg-[#2563EB] text-white'
                 : 'bg-[#F8FAFC] border border-[#E2E8F0] text-slate-600'
@@ -134,7 +130,7 @@ export function AIAssistantPage() {
         {/* Left 7 Cols: Plain-Language 3-Part Setup */}
         <div className="lg:col-span-7 space-y-6">
           {/* 1. What Business Info It Can Use */}
-          <div className="rounded-2xl border border-[#E2E8F0] bg-white p-5 space-y-4">
+          <div className="rounded-xl border border-[#E2E8F0] bg-white p-5 space-y-4">
             <div className="flex flex-wrap items-center justify-between gap-2">
               <div>
                 <div className="flex items-center gap-2">
@@ -151,7 +147,7 @@ export function AIAssistantPage() {
                 <button
                   type="button"
                   onClick={() => setAddFaqOpen((o) => !o)}
-                  className="inline-flex items-center gap-1.5 rounded-xl bg-[#2563EB] px-3.5 py-2 text-xs font-semibold text-white hover:bg-[#1D4ED8] cursor-pointer"
+                  className="inline-flex items-center gap-1.5 rounded-lg bg-[#2563EB] px-3.5 py-2 text-xs font-semibold text-white hover:bg-[#1D4ED8] cursor-pointer"
                 >
                   <Plus className="h-3.5 w-3.5" />
                   <span>Add Business Info</span>
@@ -242,7 +238,7 @@ export function AIAssistantPage() {
           </div>
 
           {/* 2. Assistant Style & Transfer to Human */}
-          <div className="rounded-2xl border border-[#E2E8F0] bg-white p-5 space-y-4 text-xs">
+          <div className="rounded-xl border border-[#E2E8F0] bg-white p-5 space-y-4 text-xs">
             <div className="flex items-center gap-2">
               <ShieldCheck className="h-4 w-4 text-[#2563EB]" />
               <h3 className="font-display text-sm font-bold text-[#0F172A]">
@@ -363,7 +359,7 @@ export function AIAssistantPage() {
         </div>
 
         {/* Right 5 Cols: Prominent Test Conversation Panel */}
-        <div className="lg:col-span-5 rounded-2xl border border-[#E2E8F0] bg-white p-5 flex flex-col gap-4 h-fit lg:sticky lg:top-20">
+        <div className="lg:col-span-5 rounded-xl border border-[#E2E8F0] bg-white p-5 flex flex-col gap-4 h-fit lg:sticky lg:top-20">
           <div>
             <div className="flex items-center gap-2">
               <MessageCircle className="h-4 w-4 text-[#2563EB]" />

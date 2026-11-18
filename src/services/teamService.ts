@@ -55,19 +55,23 @@ function buildConversationStats(
   return { activeConversations, resolvedToday };
 }
 
-export async function fetchBusinessTeamMembers(params: {
+/**
+ * Fetches basic workspace staff memberships (business_members + RLS-permitted profiles)
+ * without invoking any Edge Function. Safe for global workspace load across all CRM pages.
+ */
+export async function fetchBasicWorkspaceTeamMembers(params: {
   businessId: string;
   currentUserId: string;
-  currentUserRole: StaffRole;
   currentUserEmail?: string;
   currentUserFullName?: string;
   conversations?: Conversation[];
-}): Promise<FetchTeamMembersResult> {
+}): Promise<FetchTeamMembersResult & { isActiveAdmin: boolean }> {
   if (!supabase || !UUID_REGEX.test(params.businessId)) {
     return {
       ok: false,
       members: [],
       error: 'Supabase workspace is not configured.',
+      isActiveAdmin: false,
     };
   }
 
@@ -86,6 +90,7 @@ export async function fetchBusinessTeamMembers(params: {
       ok: false,
       members: [],
       error: `Unable to load business team memberships: ${memberErr.message}`,
+      isActiveAdmin: false,
     };
   }
 
@@ -117,7 +122,7 @@ export async function fetchBusinessTeamMembers(params: {
     }
   }
 
-  const baseMembers: TeamMember[] = rows.map((m) => {
+  const members: TeamMember[] = rows.map((m) => {
     const uid = String(m.user_id ?? '');
     const isSelf = uid === params.currentUserId;
     const profile = profilesMap.get(uid);
@@ -139,36 +144,73 @@ export async function fetchBusinessTeamMembers(params: {
     };
   });
 
-  // 3. Verify caller is an active business administrator before requesting Auth emails via backend Edge Function
   const callerRow = rows.find(
     (m) => String(m.user_id ?? '') === params.currentUserId && m.is_active === true
   );
-  const isActiveAdmin =
-    callerRow?.role === 'admin' ||
-    (callerRow === undefined && params.currentUserRole === 'admin');
+  const isActiveAdmin = callerRow?.role === 'admin';
 
-  if (!isActiveAdmin) {
-    return {
-      ok: true,
-      members: baseMembers,
-      error: null,
-    };
+  return {
+    ok: true,
+    members,
+    error: null,
+    isActiveAdmin,
+  };
+}
+
+/**
+ * On-demand administrator directory fetch.
+ * Calls the `team-members` Edge Function ONLY for verified active business admins
+ * when viewing Team Management or Settings -> Team.
+ */
+export async function fetchAdminTeamDirectory(params: {
+  businessId: string;
+  currentUserId: string;
+  currentUserRole: StaffRole;
+  currentUserEmail?: string;
+  currentUserFullName?: string;
+  conversations?: Conversation[];
+}): Promise<FetchTeamMembersResult> {
+  const basic = await fetchBasicWorkspaceTeamMembers({
+    businessId: params.businessId,
+    currentUserId: params.currentUserId,
+    currentUserEmail: params.currentUserEmail,
+    currentUserFullName: params.currentUserFullName,
+    conversations: params.conversations,
+  });
+
+  if (!basic.ok) {
+    return { ok: false, members: basic.members, error: basic.error };
   }
 
-  // 4. For active administrators, call secure backend endpoint to retrieve authorized team details + Auth emails
+  const isAdmin =
+    basic.isActiveAdmin ||
+    (basic.members.length === 0 && params.currentUserRole === 'admin');
+
+  if (!isAdmin || !supabase) {
+    return { ok: true, members: basic.members, error: null };
+  }
+
+  const convList = params.conversations ?? [];
+
   try {
-    const { data, error } = await client.functions.invoke('team-members', {
+    const { data, error } = await supabase.functions.invoke('team-members', {
       body: { businessId: params.businessId },
     });
 
     if (error) {
-      const serverMsg = await extractEdgeErrorMessage(error);
+      const rawMsg = await extractEdgeErrorMessage(error);
+      const isTransportOrMissing =
+        !rawMsg ||
+        rawMsg.toLowerCase().includes('failed to send a request') ||
+        rawMsg.toLowerCase().includes('fetch') ||
+        rawMsg.toLowerCase().includes('cors');
+
       return {
         ok: false,
-        members: baseMembers,
-        error: serverMsg
-          ? `Could not load administrator team directory: ${serverMsg}`
-          : `Could not load administrator team directory (${(error as Error).message || 'Edge Function unavailable'}).`,
+        members: basic.members,
+        error: isTransportOrMissing
+          ? 'The team-members Edge Function is not deployed or unreachable. Showing workspace membership roster without team emails.'
+          : `Could not load administrator team directory: ${rawMsg}`,
       };
     }
 
@@ -181,7 +223,7 @@ export async function fetchBusinessTeamMembers(params: {
     if (!payload.ok || !Array.isArray(payload.members)) {
       return {
         ok: false,
-        members: baseMembers,
+        members: basic.members,
         error: payload.error || 'Team directory endpoint returned an unexpected response.',
       };
     }
@@ -208,7 +250,7 @@ export async function fetchBusinessTeamMembers(params: {
   } catch (err) {
     return {
       ok: false,
-      members: baseMembers,
+      members: basic.members,
       error:
         err instanceof Error
           ? `Could not load administrator team directory: ${err.message}`

@@ -1,12 +1,10 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { NavLink, Outlet, useLocation, useNavigate } from 'react-router-dom';
 import {
   AlertTriangle,
   BarChart3,
   Bot,
   Calendar,
-  ChevronLeft,
-  ChevronRight,
   ExternalLink,
   FileText,
   Inbox,
@@ -15,6 +13,8 @@ import {
   Megaphone,
   Menu,
   MoreHorizontal,
+  PanelLeftClose,
+  PanelLeftOpen,
   Search,
   Settings,
   Users,
@@ -25,6 +25,8 @@ import {
 import { BrandLogo } from '@/components/BrandLogo';
 import { useApp } from '@/context/AppContext';
 import { formatRelativeTime } from '@/lib/phone';
+
+const SIDEBAR_STORAGE_KEY = 'zoqniva_sidebar_collapsed';
 
 interface NavItem {
   label: string;
@@ -39,16 +41,16 @@ interface NavGroup {
 }
 
 const PAGE_TITLES: Record<string, { title: string; section: string }> = {
-  '/app': { title: 'Overview', section: 'Daily Work' },
-  '/app/inbox': { title: 'Team Inbox', section: 'Customer Chats' },
-  '/app/contacts': { title: 'Customers', section: 'Customer List' },
-  '/app/broadcasts': { title: 'Broadcasts', section: 'Outreach' },
+  '/app': { title: 'Dashboard', section: 'Workspace' },
+  '/app/inbox': { title: 'Team Inbox', section: 'Conversations' },
+  '/app/contacts': { title: 'Contacts', section: 'Directory' },
+  '/app/broadcasts': { title: 'Campaigns', section: 'Outreach' },
   '/app/templates': { title: 'Message Templates', section: 'Outreach' },
-  '/app/automation': { title: 'Automation', section: 'Automatic Replies' },
-  '/app/ai-assistant': { title: 'AI Assistant', section: 'Guided Assistant' },
-  '/app/analytics': { title: 'Analytics', section: 'Business Results' },
-  '/app/team': { title: 'Team Management', section: 'Workspace' },
-  '/app/settings': { title: 'Settings', section: 'Workspace Setup' },
+  '/app/automation': { title: 'Automation', section: 'Workflows' },
+  '/app/ai-assistant': { title: 'AI Assistant', section: 'Assistant' },
+  '/app/analytics': { title: 'Analytics', section: 'Reporting' },
+  '/app/team': { title: 'Team Members', section: 'Workspace' },
+  '/app/settings': { title: 'Settings', section: 'Configuration' },
 };
 
 const DATE_RANGE_LABELS: Record<'today' | '7d' | '30d', string> = {
@@ -85,27 +87,43 @@ export function AppShell() {
   const location = useLocation();
   const navigate = useNavigate();
 
-  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  // Default to compact icon-first rail (68px), persisted in localStorage
+  const [sidebarCollapsed, setSidebarCollapsed] = useState<boolean>(() => {
+    try {
+      const saved = localStorage.getItem(SIDEBAR_STORAGE_KEY);
+      return saved === null ? true : saved === 'true';
+    } catch {
+      return true;
+    }
+  });
   const [mobileDrawerOpen, setMobileDrawerOpen] = useState(false);
   const [searchOpen, setSearchOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
   const [notifOpen, setNotifOpen] = useState(false);
   const [profileOpen, setProfileOpen] = useState(false);
 
+  useEffect(() => {
+    try {
+      localStorage.setItem(SIDEBAR_STORAGE_KEY, String(sidebarCollapsed));
+    } catch {
+      // Ignore storage failures
+    }
+  }, [sidebarCollapsed]);
+
   const navGroups: NavGroup[] = [
     {
-      heading: 'Daily Work',
+      heading: 'Messaging',
       items: [
-        { label: 'Overview', to: '/app', icon: LayoutDashboard },
-        { label: 'Team Inbox', to: '/app/inbox', icon: Inbox, badge: totalUnreadCount },
-        { label: 'Customers', to: '/app/contacts', icon: UserSquare2 },
+        { label: 'Dashboard', to: '/app', icon: LayoutDashboard },
+        { label: 'Inbox', to: '/app/inbox', icon: Inbox, badge: totalUnreadCount },
+        { label: 'Contacts', to: '/app/contacts', icon: UserSquare2 },
       ],
     },
     {
       heading: 'Outreach',
       items: [
-        { label: 'Broadcasts', to: '/app/broadcasts', icon: Megaphone },
-        { label: 'Message Templates', to: '/app/templates', icon: FileText },
+        { label: 'Campaigns', to: '/app/broadcasts', icon: Megaphone },
+        { label: 'Templates', to: '/app/templates', icon: FileText },
       ],
     },
     {
@@ -119,7 +137,7 @@ export function AppShell() {
       heading: 'Workspace',
       items: [
         { label: 'Analytics', to: '/app/analytics', icon: BarChart3 },
-        { label: 'Team Management', to: '/app/team', icon: Users },
+        { label: 'Team Members', to: '/app/team', icon: Users },
         { label: 'Settings', to: '/app/settings', icon: Settings },
       ],
     },
@@ -137,30 +155,30 @@ export function AppShell() {
     switch (business.metaConnectionState) {
       case 'connected':
         return {
-          label: 'WhatsApp Connected',
+          label: business.messagingMode === 'test' ? 'WhatsApp · Test Mode' : 'WhatsApp Connected',
           dotClass: 'bg-emerald-500',
           boxClass: 'border-emerald-200 bg-emerald-50 text-emerald-800',
         };
       case 'error':
         return {
-          label: 'Connection Error',
+          label: 'WhatsApp Error',
           dotClass: 'bg-[#E11D48]',
           boxClass: 'border-rose-200 bg-rose-50 text-[#E11D48]',
         };
       case 'connecting':
         return {
-          label: 'Connecting WhatsApp',
+          label: 'Connecting...',
           dotClass: 'bg-[#F4B942]',
           boxClass: 'border-amber-200 bg-amber-50 text-amber-900',
         };
       default:
         return {
-          label: 'Not Connected',
+          label: 'WhatsApp Not Connected',
           dotClass: 'bg-slate-400',
-          boxClass: 'border-[#E2E8F0] bg-[#F8FAFC] text-slate-700',
+          boxClass: 'border-[#E2E8F0] bg-[#F8FAFC] text-slate-600',
         };
     }
-  }, [business.metaConnectionState]);
+  }, [business.metaConnectionState, business.messagingMode]);
 
   const searchResults = useMemo(() => {
     const q = searchQuery.trim().toLowerCase();
@@ -204,53 +222,61 @@ export function AppShell() {
     const isCollapsed = !isMobile && sidebarCollapsed;
     return (
       <div className="flex h-full flex-col bg-white border-r border-[#E2E8F0]">
-        {/* Brand Header */}
-        <div className="h-16 px-4 flex items-center justify-between border-b border-[#E2E8F0] shrink-0">
+        {/* Brand & Collapse Header */}
+        <div
+          className={`h-14 flex items-center border-b border-[#E2E8F0] shrink-0 ${
+            isCollapsed ? 'justify-center px-2' : 'justify-between px-3.5'
+          }`}
+        >
           <button
             type="button"
             onClick={() => {
               navigate('/app');
               if (isMobile) setMobileDrawerOpen(false);
             }}
-            className="text-left cursor-pointer"
+            className="text-left cursor-pointer flex items-center min-w-0"
+            title={isCollapsed ? 'Zoqniva AI Dashboard' : undefined}
           >
-            <BrandLogo collapsed={isCollapsed} showTagline={!isCollapsed} />
+            <BrandLogo collapsed={isCollapsed} size="sm" showTagline={!isCollapsed} />
           </button>
+
           {isMobile ? (
             <button
               type="button"
               onClick={() => setMobileDrawerOpen(false)}
-              className="p-2 rounded-lg text-slate-500 hover:bg-[#F8FAFC] hover:text-[#0F172A] cursor-pointer"
+              className="p-1.5 rounded-lg text-slate-500 hover:bg-[#F1F5F9] hover:text-[#0F172A] cursor-pointer"
               aria-label="Close navigation"
             >
               <X className="h-5 w-5" />
             </button>
-          ) : (
+          ) : !isCollapsed ? (
             <button
               type="button"
-              onClick={() => setSidebarCollapsed((s) => !s)}
-              className="p-1.5 rounded-lg text-slate-400 hover:bg-[#F8FAFC] hover:text-[#0F172A] transition-colors cursor-pointer"
-              aria-label={sidebarCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}
-              title={sidebarCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+              onClick={() => setSidebarCollapsed(true)}
+              className="p-1.5 rounded-lg text-slate-400 hover:bg-[#F1F5F9] hover:text-[#0F172A] transition-colors cursor-pointer"
+              aria-label="Collapse sidebar"
+              title="Collapse sidebar"
             >
-              {sidebarCollapsed ? (
-                <ChevronRight className="h-4 w-4" />
-              ) : (
-                <ChevronLeft className="h-4 w-4" />
-              )}
+              <PanelLeftClose className="h-4 w-4" />
             </button>
-          )}
+          ) : null}
         </div>
 
-        {/* Grouped Navigation Links */}
-        <nav className="flex-1 overflow-y-auto px-3 py-4 space-y-5" aria-label="Primary Sidebar">
-          {navGroups.map((group) => (
-            <div key={group.heading} className="space-y-1">
-              {!isCollapsed && (
-                <p className="px-3 text-[10px] font-semibold uppercase tracking-wider text-slate-400 mb-1.5">
+        {/* Navigation Links */}
+        <nav
+          className={`flex-1 overflow-y-auto py-3 space-y-4 ${isCollapsed ? 'px-2' : 'px-2.5'}`}
+          aria-label="Primary Sidebar"
+        >
+          {navGroups.map((group, groupIdx) => (
+            <div key={group.heading} className="space-y-0.5">
+              {!isCollapsed ? (
+                <p className="px-2.5 text-[10px] font-semibold uppercase tracking-wider text-slate-400 mb-1">
                   {group.heading}
                 </p>
+              ) : (
+                groupIdx > 0 && <div className="mx-2 my-2 border-t border-[#E2E8F0]" />
               )}
+
               {group.items.map((item) => {
                 const Icon = item.icon;
                 return (
@@ -261,29 +287,36 @@ export function AppShell() {
                     onClick={() => isMobile && setMobileDrawerOpen(false)}
                     title={isCollapsed ? item.label : undefined}
                     className={({ isActive }) =>
-                      `group flex items-center justify-between rounded-xl px-3 py-2.5 text-[13px] font-medium transition-all whitespace-nowrap ${
+                      `group relative flex items-center rounded-lg text-[13px] font-medium transition-colors whitespace-nowrap ${
+                        isCollapsed ? 'justify-center h-10 w-full' : 'justify-between px-2.5 py-2'
+                      } ${
                         isActive
-                          ? 'bg-[#EFF6FF] text-[#2563EB] font-semibold shadow-2xs'
-                          : 'text-slate-600 hover:bg-[#F8FAFC] hover:text-[#0F172A]'
+                          ? 'bg-[#EFF6FF] text-[#2563EB] font-semibold'
+                          : 'text-slate-600 hover:bg-[#F1F5F9] hover:text-[#0F172A]'
                       }`
                     }
                   >
                     {({ isActive }) => (
                       <>
-                        <span className="flex items-center gap-3 min-w-0">
+                        <span className="flex items-center gap-2.5 min-w-0">
                           <Icon
                             className={`h-[18px] w-[18px] shrink-0 transition-colors ${
                               isActive
                                 ? 'text-[#2563EB]'
-                                : 'text-slate-400 group-hover:text-slate-600'
+                                : 'text-slate-500 group-hover:text-[#0F172A]'
                             }`}
                           />
                           {!isCollapsed && <span className="truncate">{item.label}</span>}
                         </span>
+
                         {!isCollapsed && typeof item.badge === 'number' && item.badge > 0 && (
                           <span className="ml-2 inline-flex items-center justify-center rounded-md bg-[#E11D48] px-1.5 py-0.5 text-[10px] font-bold text-white tabular-nums">
                             {item.badge}
                           </span>
+                        )}
+
+                        {isCollapsed && typeof item.badge === 'number' && item.badge > 0 && (
+                          <span className="absolute top-1.5 right-1.5 h-2 w-2 rounded-full bg-[#E11D48]" />
                         )}
                       </>
                     )}
@@ -294,33 +327,67 @@ export function AppShell() {
           ))}
         </nav>
 
-        {/* Bottom Profile & Sign Out */}
-        <div className="p-3 border-t border-[#E2E8F0] space-y-2 shrink-0">
-          {!isCollapsed && (
-            <div className="rounded-xl bg-[#F8FAFC] border border-[#E2E8F0] px-3 py-2.5">
-              <div className="flex items-center gap-2.5">
-                <div className="h-8 w-8 rounded-lg bg-[#2563EB] text-white flex items-center justify-center text-xs font-bold shrink-0">
-                  {initials}
-                </div>
-                <div className="min-w-0 flex-1">
-                  <p className="text-xs font-semibold text-[#0F172A] truncate">
-                    {currentUser?.fullName}
-                  </p>
-                  <p className="text-[11px] text-slate-500 capitalize truncate">
-                    {currentUser?.role} · {business.name}
-                  </p>
+        {/* Bottom Expand Trigger + User Profile */}
+        <div className="p-2 border-t border-[#E2E8F0] space-y-1.5 shrink-0">
+          {!isMobile && isCollapsed && (
+            <button
+              type="button"
+              onClick={() => setSidebarCollapsed(false)}
+              className="w-full h-9 flex items-center justify-center rounded-lg text-slate-500 hover:bg-[#F1F5F9] hover:text-[#0F172A] transition-colors cursor-pointer"
+              aria-label="Expand sidebar"
+              title="Expand sidebar"
+            >
+              <PanelLeftOpen className="h-4 w-4" />
+            </button>
+          )}
+
+          {isCollapsed ? (
+            <div className="flex flex-col items-center gap-1.5">
+              <button
+                type="button"
+                onClick={() => navigate('/app/settings')}
+                title={`${currentUser?.fullName} (${currentUser?.role}) · ${business.name}`}
+                className="h-9 w-9 rounded-lg bg-[#0F172A] text-white flex items-center justify-center text-xs font-bold hover:bg-[#2563EB] transition-colors cursor-pointer"
+              >
+                {initials}
+              </button>
+              <button
+                type="button"
+                onClick={handleLogout}
+                title="Sign Out"
+                aria-label="Sign Out"
+                className="w-full h-8 flex items-center justify-center rounded-lg text-slate-500 hover:bg-rose-50 hover:text-[#E11D48] transition-colors cursor-pointer"
+              >
+                <LogOut className="h-4 w-4" />
+              </button>
+            </div>
+          ) : (
+            <>
+              <div className="rounded-lg bg-[#F8FAFC] border border-[#E2E8F0] px-2.5 py-2">
+                <div className="flex items-center gap-2.5">
+                  <div className="h-8 w-8 rounded-lg bg-[#0F172A] text-white flex items-center justify-center text-xs font-bold shrink-0">
+                    {initials}
+                  </div>
+                  <div className="min-w-0 flex-1">
+                    <p className="text-xs font-semibold text-[#0F172A] truncate">
+                      {currentUser?.fullName}
+                    </p>
+                    <p className="text-[11px] text-slate-500 capitalize truncate">
+                      {currentUser?.role} · {business.name}
+                    </p>
+                  </div>
                 </div>
               </div>
-            </div>
+              <button
+                type="button"
+                onClick={handleLogout}
+                className="w-full flex items-center justify-center gap-2 rounded-lg px-2.5 py-2 text-xs font-medium text-slate-600 hover:bg-rose-50 hover:text-[#E11D48] transition-colors cursor-pointer"
+              >
+                <LogOut className="h-4 w-4 shrink-0" />
+                <span>Sign Out</span>
+              </button>
+            </>
           )}
-          <button
-            type="button"
-            onClick={handleLogout}
-            className="w-full flex items-center justify-center gap-2 rounded-xl px-3 py-2 text-xs font-medium text-slate-600 hover:bg-rose-50 hover:text-[#E11D48] transition-colors cursor-pointer"
-          >
-            <LogOut className="h-4 w-4 shrink-0" />
-            {!isCollapsed && <span>Sign Out</span>}
-          </button>
         </div>
       </div>
     );
@@ -331,7 +398,7 @@ export function AppShell() {
       {/* Desktop Sidebar */}
       <aside
         className={`hidden lg:block shrink-0 transition-all duration-200 ${
-          sidebarCollapsed ? 'w-[76px]' : 'w-[256px]'
+          sidebarCollapsed ? 'w-[68px]' : 'w-[248px]'
         } sticky top-0 h-screen z-30`}
       >
         {renderSidebarContent(false)}
@@ -350,64 +417,64 @@ export function AppShell() {
 
       {/* Main Content Area */}
       <div className="flex-1 flex flex-col min-w-0">
-        {/* Compact Dashboard Header */}
-        <header className="sticky top-0 z-20 h-14 lg:h-16 bg-white/95 backdrop-blur-md border-b border-[#E2E8F0] px-4 lg:px-6 flex items-center justify-between gap-4">
-          <div className="flex items-center gap-3 min-w-0">
+        {/* Compact Workspace Header (56px) */}
+        <header className="sticky top-0 z-20 h-14 bg-white border-b border-[#E2E8F0] px-4 lg:px-6 flex items-center justify-between gap-3">
+          <div className="flex items-center gap-2.5 min-w-0">
             <button
               type="button"
               onClick={() => setMobileDrawerOpen(true)}
-              className="lg:hidden p-1.5 rounded-lg text-slate-600 hover:bg-[#F8FAFC] cursor-pointer"
+              className="lg:hidden p-1.5 rounded-lg text-slate-600 hover:bg-[#F1F5F9] cursor-pointer"
               aria-label="Open menu"
             >
               <Menu className="h-5 w-5" />
             </button>
-            <div className="min-w-0">
-              <div className="hidden sm:flex items-center gap-2 text-[11px] text-slate-500">
-                <span className="font-medium text-[#2563EB] truncate">{business.name}</span>
-                <span aria-hidden="true">/</span>
-                <span className="truncate">{pageMeta.section}</span>
-              </div>
-              <h1 className="font-display text-base sm:text-lg font-bold text-[#0F172A] truncate leading-tight">
+            <div className="min-w-0 flex items-baseline gap-2.5">
+              <h1 className="font-display text-base font-bold text-[#0F172A] truncate leading-tight">
                 {location.pathname === '/app'
                   ? `${getGreeting()}, ${firstName}`
                   : pageMeta.title}
               </h1>
+              <span className="hidden sm:inline text-xs text-slate-400 truncate">
+                {business.name} · {pageMeta.section}
+              </span>
             </div>
           </div>
 
           <div className="flex items-center gap-2 shrink-0">
-            {/* Global Date Range Selector (Today / 7D / 30D) */}
-            <div className="hidden xl:inline-flex items-center gap-1 rounded-xl border border-[#E2E8F0] bg-[#F8FAFC] p-0.5">
-              <Calendar className="h-3.5 w-3.5 text-slate-400 ml-2 mr-1" />
-              {(['today', '7d', '30d'] as const).map((r) => (
-                <button
-                  key={r}
-                  type="button"
-                  onClick={() => setDateRange(r)}
-                  className={`px-2.5 py-1 rounded-lg text-[11px] font-semibold transition-colors cursor-pointer ${
-                    dateRange === r
-                      ? 'bg-white text-[#2563EB] shadow-2xs'
-                      : 'text-slate-500 hover:text-[#0F172A]'
-                  }`}
-                >
-                  {DATE_RANGE_LABELS[r]}
-                </button>
-              ))}
-            </div>
+            {/* Global Date Range Selector on Dashboard / Analytics */}
+            {(location.pathname === '/app' || location.pathname === '/app/analytics') && (
+              <div className="hidden md:inline-flex items-center gap-0.5 rounded-lg border border-[#E2E8F0] bg-[#F8FAFC] p-0.5">
+                <Calendar className="h-3.5 w-3.5 text-slate-400 ml-2 mr-1" />
+                {(['today', '7d', '30d'] as const).map((r) => (
+                  <button
+                    key={r}
+                    type="button"
+                    onClick={() => setDateRange(r)}
+                    className={`px-2 py-1 rounded-md text-[11px] font-semibold transition-colors cursor-pointer ${
+                      dateRange === r
+                        ? 'bg-white text-[#2563EB] shadow-2xs'
+                        : 'text-slate-500 hover:text-[#0F172A]'
+                    }`}
+                  >
+                    {DATE_RANGE_LABELS[r]}
+                  </button>
+                ))}
+              </div>
+            )}
 
             <button
               type="button"
               onClick={() => setSearchOpen(true)}
-              className="hidden sm:flex items-center gap-2 rounded-xl border border-[#E2E8F0] bg-[#F8FAFC] px-3 py-1.5 text-xs text-slate-500 hover:border-slate-300 hover:text-[#0F172A] transition-colors cursor-pointer"
+              className="hidden sm:flex items-center gap-2 rounded-lg border border-[#E2E8F0] bg-[#F8FAFC] px-2.5 py-1.5 text-xs text-slate-500 hover:border-slate-300 hover:text-[#0F172A] transition-colors cursor-pointer"
             >
               <Search className="h-3.5 w-3.5" />
-              <span className="whitespace-nowrap">Search...</span>
+              <span className="whitespace-nowrap">Search workspace...</span>
             </button>
 
             <button
               type="button"
               onClick={() => setSearchOpen(true)}
-              className="sm:hidden p-2 rounded-lg border border-[#E2E8F0] text-slate-600 hover:bg-[#F8FAFC] cursor-pointer"
+              className="sm:hidden p-1.5 rounded-lg border border-[#E2E8F0] text-slate-600 hover:bg-[#F1F5F9] cursor-pointer"
               aria-label="Search"
             >
               <Search className="h-4 w-4" />
@@ -417,7 +484,7 @@ export function AppShell() {
             <button
               type="button"
               onClick={() => navigate('/app/settings')}
-              className={`hidden md:inline-flex items-center gap-2 rounded-xl border px-3 py-1.5 text-xs font-medium transition-colors whitespace-nowrap shrink-0 cursor-pointer ${connectionBadge.boxClass}`}
+              className={`hidden md:inline-flex items-center gap-2 rounded-lg border px-2.5 py-1.5 text-xs font-medium transition-colors whitespace-nowrap shrink-0 cursor-pointer ${connectionBadge.boxClass}`}
             >
               <span className={`h-2 w-2 rounded-full ${connectionBadge.dotClass}`} />
               <span>{connectionBadge.label}</span>
@@ -431,7 +498,7 @@ export function AppShell() {
                   setNotifOpen((o) => !o);
                   setProfileOpen(false);
                 }}
-                className="relative p-2 rounded-xl border border-[#E2E8F0] bg-white text-slate-600 hover:bg-[#F8FAFC] hover:text-[#0F172A] transition-colors cursor-pointer"
+                className="relative p-1.5 rounded-lg border border-[#E2E8F0] bg-white text-slate-600 hover:bg-[#F1F5F9] hover:text-[#0F172A] transition-colors cursor-pointer"
                 aria-label="Notifications"
               >
                 <svg
@@ -454,7 +521,7 @@ export function AppShell() {
               </button>
 
               {notifOpen && (
-                <div className="absolute right-0 mt-2 w-80 sm:w-96 rounded-2xl border border-[#E2E8F0] bg-white shadow-luxury-hover z-40 overflow-hidden">
+                <div className="absolute right-0 mt-2 w-80 sm:w-96 rounded-xl border border-[#E2E8F0] bg-white shadow-luxury-hover z-40 overflow-hidden">
                   <div className="px-4 py-3 border-b border-[#E2E8F0] flex items-center justify-between">
                     <span className="text-xs font-bold text-[#0F172A]">Notifications</span>
                     {unreadNotifs > 0 && (
@@ -500,7 +567,7 @@ export function AppShell() {
                               <p className="text-xs font-semibold text-[#0F172A] truncate">
                                 {n.title}
                               </p>
-                              <span className="text-[11px] text-slate-400 shrink-0">
+                              <span className="text-[11px] text-slate-400 shrink-0 tabular-nums">
                                 {formatRelativeTime(n.createdAt)}
                               </span>
                             </div>
@@ -524,7 +591,7 @@ export function AppShell() {
                   setProfileOpen((o) => !o);
                   setNotifOpen(false);
                 }}
-                className="flex items-center gap-2 rounded-xl border border-[#E2E8F0] bg-white px-2.5 py-1.5 hover:bg-[#F8FAFC] transition-colors cursor-pointer"
+                className="flex items-center gap-2 rounded-lg border border-[#E2E8F0] bg-white px-2 py-1 hover:bg-[#F1F5F9] transition-colors cursor-pointer"
               >
                 <div className="h-6 w-6 rounded-md bg-[#2563EB] text-white text-[11px] font-bold flex items-center justify-center">
                   {initials}
@@ -535,7 +602,7 @@ export function AppShell() {
               </button>
 
               {profileOpen && (
-                <div className="absolute right-0 mt-2 w-64 rounded-2xl border border-[#E2E8F0] bg-white shadow-luxury-hover z-40 p-2">
+                <div className="absolute right-0 mt-2 w-64 rounded-xl border border-[#E2E8F0] bg-white shadow-luxury-hover z-40 p-2">
                   <div className="px-3 py-2 border-b border-[#E2E8F0] mb-1">
                     <p className="text-xs font-bold text-[#0F172A]">{currentUser?.fullName}</p>
                     <p className="text-[11px] text-slate-500 truncate">{currentUser?.email}</p>
@@ -550,7 +617,7 @@ export function AppShell() {
                       setProfileOpen(false);
                       navigate('/');
                     }}
-                    className="w-full text-left px-3 py-2 rounded-lg text-xs font-medium text-slate-700 hover:bg-[#F8FAFC] flex items-center justify-between cursor-pointer"
+                    className="w-full text-left px-3 py-2 rounded-lg text-xs font-medium text-slate-700 hover:bg-[#F1F5F9] flex items-center justify-between cursor-pointer"
                   >
                     <span>Public Website</span>
                     <ExternalLink className="h-3 w-3 text-slate-400" />
@@ -561,7 +628,7 @@ export function AppShell() {
                       setProfileOpen(false);
                       navigate('/app/settings');
                     }}
-                    className="w-full text-left px-3 py-2 rounded-lg text-xs font-medium text-slate-700 hover:bg-[#F8FAFC] cursor-pointer"
+                    className="w-full text-left px-3 py-2 rounded-lg text-xs font-medium text-slate-700 hover:bg-[#F1F5F9] cursor-pointer"
                   >
                     Workspace Settings
                   </button>
@@ -593,10 +660,10 @@ export function AppShell() {
         className="lg:hidden fixed bottom-0 inset-x-0 h-14 bg-white border-t border-[#E2E8F0] z-30 grid grid-cols-5"
       >
         {[
-          { label: 'Overview', to: '/app', icon: LayoutDashboard, end: true },
+          { label: 'Dashboard', to: '/app', icon: LayoutDashboard, end: true },
           { label: 'Inbox', to: '/app/inbox', icon: Inbox, badge: totalUnreadCount },
-          { label: 'Customers', to: '/app/contacts', icon: UserSquare2 },
-          { label: 'Broadcasts', to: '/app/broadcasts', icon: Megaphone },
+          { label: 'Contacts', to: '/app/contacts', icon: UserSquare2 },
+          { label: 'Campaigns', to: '/app/broadcasts', icon: Megaphone },
         ].map((item) => {
           const Icon = item.icon;
           return (
@@ -640,7 +707,7 @@ export function AppShell() {
           onClick={() => setSearchOpen(false)}
         >
           <div
-            className="w-full max-w-xl rounded-2xl border border-[#E2E8F0] bg-white shadow-xl overflow-hidden"
+            className="w-full max-w-xl rounded-xl border border-[#E2E8F0] bg-white shadow-luxury-hover overflow-hidden"
             onClick={(e) => e.stopPropagation()}
           >
             <div className="flex items-center gap-3 px-4 py-3 border-b border-[#E2E8F0]">
@@ -650,7 +717,7 @@ export function AppShell() {
                 autoFocus
                 value={searchQuery}
                 onChange={(e) => setSearchQuery(e.target.value)}
-                placeholder="Search customers, phone numbers, messages, templates, campaigns..."
+                placeholder="Search contacts, phone numbers, messages, templates, campaigns..."
                 className="flex-1 text-sm text-[#0F172A] placeholder:text-slate-400 focus:outline-none"
               />
               <button
@@ -665,14 +732,14 @@ export function AppShell() {
             <div className="max-h-96 overflow-y-auto p-3 space-y-4">
               {!searchQuery.trim() ? (
                 <p className="text-xs text-slate-500 text-center py-6">
-                  Type a customer name, phone number, template, or campaign name.
+                  Type a contact name, phone number, template, or campaign name.
                 </p>
               ) : (
                 <>
                   {searchResults.contacts.length > 0 && (
                     <div>
                       <p className="px-2 text-[11px] font-semibold text-slate-400 uppercase tracking-wider mb-1">
-                        Customers
+                        Contacts
                       </p>
                       {searchResults.contacts.map((c) => (
                         <button
@@ -682,7 +749,7 @@ export function AppShell() {
                             setSearchOpen(false);
                             navigate('/app/contacts');
                           }}
-                          className="w-full text-left px-3 py-2 rounded-lg hover:bg-[#F8FAFC] flex items-center justify-between text-xs cursor-pointer"
+                          className="w-full text-left px-3 py-2 rounded-lg hover:bg-[#F1F5F9] flex items-center justify-between text-xs cursor-pointer"
                         >
                           <span className="font-semibold text-[#0F172A]">{c.fullName}</span>
                           <span className="font-mono text-slate-500">{c.phoneE164}</span>
@@ -707,7 +774,7 @@ export function AppShell() {
                               setSearchOpen(false);
                               navigate('/app/inbox');
                             }}
-                            className="w-full text-left px-3 py-2 rounded-lg hover:bg-[#F8FAFC] text-xs cursor-pointer"
+                            className="w-full text-left px-3 py-2 rounded-lg hover:bg-[#F1F5F9] text-xs cursor-pointer"
                           >
                             <p className="font-semibold text-[#0F172A]">{ct?.fullName}</p>
                             <p className="text-slate-500 truncate">{cv.lastMessagePreview}</p>
@@ -730,7 +797,7 @@ export function AppShell() {
                             setSearchOpen(false);
                             navigate('/app/templates');
                           }}
-                          className="w-full text-left px-3 py-2 rounded-lg hover:bg-[#F8FAFC] text-xs flex items-center justify-between cursor-pointer"
+                          className="w-full text-left px-3 py-2 rounded-lg hover:bg-[#F1F5F9] text-xs flex items-center justify-between cursor-pointer"
                         >
                           <span className="font-mono text-[#0F172A]">{t.name}</span>
                           <span className="text-slate-500">{t.approvalStatus}</span>
@@ -752,7 +819,7 @@ export function AppShell() {
                             setSearchOpen(false);
                             navigate('/app/broadcasts');
                           }}
-                          className="w-full text-left px-3 py-2 rounded-lg hover:bg-[#F8FAFC] text-xs flex items-center justify-between cursor-pointer"
+                          className="w-full text-left px-3 py-2 rounded-lg hover:bg-[#F1F5F9] text-xs flex items-center justify-between cursor-pointer"
                         >
                           <span className="font-semibold text-[#0F172A]">{cp.name}</span>
                           <span className="text-slate-500 capitalize">{cp.status}</span>

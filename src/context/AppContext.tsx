@@ -28,7 +28,10 @@ import {
   normalizeWhatsAppConnectionStatus,
   saveBusinessWhatsAppConfiguration,
 } from '@/services/whatsappService';
-import { fetchBusinessTeamMembers } from '@/services/teamService';
+import {
+  fetchAdminTeamDirectory,
+  fetchBasicWorkspaceTeamMembers,
+} from '@/services/teamService';
 import type { User } from '@supabase/supabase-js';
 import type {
   AIAutomationLog,
@@ -109,6 +112,7 @@ interface AppContextValue {
   teamMembers: TeamMember[];
   teamMembersLoading: boolean;
   teamMembersError: string | null;
+  ensureTeamDirectoryLoaded: () => Promise<void>;
   refreshTeamMembers: () => Promise<void>;
   tags: Tag[];
   contacts: Contact[];
@@ -346,10 +350,17 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     teamMembersRef.current = teamMembers;
   }, [teamMembers]);
 
+  const conversationsRef = useRef<Conversation[]>([]);
+  useEffect(() => {
+    conversationsRef.current = conversations;
+  }, [conversations]);
+
   const currentUserIdRef = useRef<string | null>(null);
   const authStatusRef = useRef<AuthGateStatus>('loading');
   const resolvingUserPromiseRef = useRef<{ userId: string; promise: Promise<void> } | null>(null);
   const teamRefreshPromiseRef = useRef<Promise<void> | null>(null);
+  const teamDirectoryLoadedKeyRef = useRef<string | null>(null);
+  const teamDirectoryFailedKeyRef = useRef<string | null>(null);
   useEffect(() => {
     currentUserIdRef.current = currentUser?.id ?? null;
   }, [currentUser]);
@@ -364,6 +375,8 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     setTeamMembers([]);
     setTeamMembersLoading(false);
     setTeamMembersError(null);
+    teamDirectoryLoadedKeyRef.current = null;
+    teamDirectoryFailedKeyRef.current = null;
     setTags([]);
     setContacts([]);
     setConversations([]);
@@ -446,10 +459,9 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             .order('created_at', { ascending: true })
             .limit(1)
             .maybeSingle(),
-          fetchBusinessTeamMembers({
+          fetchBasicWorkspaceTeamMembers({
             businessId,
             currentUserId: userId,
-            currentUserRole: callerRole ?? 'agent',
             currentUserEmail: callerMeta?.email,
             currentUserFullName: callerMeta?.fullName,
           }),
@@ -556,15 +568,26 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       }));
       setConversations(convList);
 
-      const memberList: TeamMember[] = teamRes.members.map((tm) => ({
-        ...tm,
-        activeConversations: convList.filter(
-          (cv) => cv.assignedToId === tm.id && cv.status !== 'resolved'
-        ).length,
-        resolvedToday: convList.filter(
-          (cv) => cv.assignedToId === tm.id && cv.status === 'resolved'
-        ).length,
-      }));
+      const dirKey = `${businessId}:${userId}`;
+      const prevById =
+        teamDirectoryLoadedKeyRef.current === dirKey
+          ? new Map(teamMembersRef.current.map((m) => [m.id, m]))
+          : null;
+
+      const memberList: TeamMember[] = teamRes.members.map((tm) => {
+        const cached = prevById?.get(tm.id);
+        return {
+          ...tm,
+          fullName: cached?.fullName || tm.fullName,
+          email: tm.email || cached?.email || '',
+          activeConversations: convList.filter(
+            (cv) => cv.assignedToId === tm.id && cv.status !== 'resolved'
+          ).length,
+          resolvedToday: convList.filter(
+            (cv) => cv.assignedToId === tm.id && cv.status === 'resolved'
+          ).length,
+        };
+      });
       setTeamMembers(memberList);
       setTeamMembersError(teamRes.error);
 
@@ -2137,6 +2160,64 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   // ============================================================================
   // TEAM & SETTINGS
   // ============================================================================
+  const ensureTeamDirectoryLoaded = useCallback(async () => {
+    if (
+      !supabase ||
+      !isSupabaseConfigured ||
+      !currentUser?.id ||
+      !UUID_REGEX.test(business.id) ||
+      currentUser.role !== 'admin'
+    ) {
+      return;
+    }
+
+    const dirKey = `${business.id}:${currentUser.id}`;
+    if (
+      teamDirectoryLoadedKeyRef.current === dirKey ||
+      teamDirectoryFailedKeyRef.current === dirKey
+    ) {
+      return;
+    }
+    if (teamRefreshPromiseRef.current) {
+      return teamRefreshPromiseRef.current;
+    }
+
+    const task = (async () => {
+      setTeamMembersLoading(true);
+      try {
+        const res = await fetchAdminTeamDirectory({
+          businessId: business.id,
+          currentUserId: currentUser.id,
+          currentUserRole: currentUser.role,
+          currentUserEmail: currentUser.email,
+          currentUserFullName: currentUser.fullName,
+          conversations: conversationsRef.current,
+        });
+        if (res.ok) {
+          teamDirectoryLoadedKeyRef.current = dirKey;
+          teamDirectoryFailedKeyRef.current = null;
+        } else {
+          teamDirectoryFailedKeyRef.current = dirKey;
+        }
+        if (res.members.length > 0 || res.ok) {
+          setTeamMembers(res.members);
+        }
+        setTeamMembersError(res.error);
+      } finally {
+        setTeamMembersLoading(false);
+      }
+    })();
+
+    teamRefreshPromiseRef.current = task;
+    try {
+      await task;
+    } finally {
+      if (teamRefreshPromiseRef.current === task) {
+        teamRefreshPromiseRef.current = null;
+      }
+    }
+  }, [business.id, currentUser]);
+
   const refreshTeamMembers = useCallback(async () => {
     if (
       !supabase ||
@@ -2150,17 +2231,39 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       return teamRefreshPromiseRef.current;
     }
 
+    const dirKey = `${business.id}:${currentUser.id}`;
+    teamDirectoryLoadedKeyRef.current = null;
+    teamDirectoryFailedKeyRef.current = null;
+
     const task = (async () => {
       setTeamMembersLoading(true);
       try {
-        const res = await fetchBusinessTeamMembers({
-          businessId: business.id,
-          currentUserId: currentUser.id,
-          currentUserRole: currentUser.role,
-          currentUserEmail: currentUser.email,
-          currentUserFullName: currentUser.fullName,
-          conversations,
-        });
+        const res =
+          currentUser.role === 'admin'
+            ? await fetchAdminTeamDirectory({
+                businessId: business.id,
+                currentUserId: currentUser.id,
+                currentUserRole: currentUser.role,
+                currentUserEmail: currentUser.email,
+                currentUserFullName: currentUser.fullName,
+                conversations: conversationsRef.current,
+              })
+            : await fetchBasicWorkspaceTeamMembers({
+                businessId: business.id,
+                currentUserId: currentUser.id,
+                currentUserEmail: currentUser.email,
+                currentUserFullName: currentUser.fullName,
+                conversations: conversationsRef.current,
+              });
+
+        if (res.ok) {
+          if (currentUser.role === 'admin') {
+            teamDirectoryLoadedKeyRef.current = dirKey;
+          }
+          teamDirectoryFailedKeyRef.current = null;
+        } else if (currentUser.role === 'admin') {
+          teamDirectoryFailedKeyRef.current = dirKey;
+        }
         setTeamMembers(res.members);
         setTeamMembersError(res.error);
       } finally {
@@ -2176,7 +2279,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         teamRefreshPromiseRef.current = null;
       }
     }
-  }, [business.id, conversations, currentUser]);
+  }, [business.id, currentUser]);
 
   const inviteTeamMember = (
     fullName: string,
@@ -2425,6 +2528,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     teamMembers,
     teamMembersLoading,
     teamMembersError,
+    ensureTeamDirectoryLoaded,
     refreshTeamMembers,
     tags,
     contacts,

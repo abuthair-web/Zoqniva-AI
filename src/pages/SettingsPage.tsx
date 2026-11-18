@@ -32,6 +32,7 @@ export function SettingsPage() {
     teamMembers,
     teamMembersLoading,
     teamMembersError,
+    ensureTeamDirectoryLoaded,
     refreshTeamMembers,
     webhookEvents,
     webhookCallbackUrl,
@@ -47,6 +48,12 @@ export function SettingsPage() {
   } = useApp();
 
   const [tab, setTab] = useState<SettingsTab>('whatsapp');
+
+  useEffect(() => {
+    if (tab === 'team') {
+      void ensureTeamDirectoryLoaded();
+    }
+  }, [tab, ensureTeamDirectoryLoaded]);
   const [bizName, setBizName] = useState(business.name);
   const [bizIndustry, setBizIndustry] = useState(business.industry);
   const [bizTimezone, setBizTimezone] = useState(business.timezone);
@@ -263,14 +270,10 @@ export function SettingsPage() {
   return (
     <div className="p-4 sm:p-6 lg:p-8 pb-20 lg:pb-8 max-w-[1440px] mx-auto space-y-6">
       <div>
-        <div className="flex items-center gap-2">
-          <span className="h-[2px] w-5 bg-[#F4B942]" />
-          <span className="text-xs font-semibold text-[#2563EB]">Workspace Setup</span>
-        </div>
-        <h2 className="font-display text-2xl font-bold text-[#0F172A] tracking-tight mt-0.5">
+        <h1 className="font-display text-xl sm:text-2xl font-bold text-[#0F172A] tracking-tight">
           Settings
-        </h2>
-        <p className="text-sm text-slate-500 mt-0.5">
+        </h1>
+        <p className="text-xs sm:text-sm text-slate-500 mt-0.5">
           Update your business details, WhatsApp connection, team access, and notification preferences.
         </p>
       </div>
@@ -286,10 +289,10 @@ export function SettingsPage() {
                 key={t.key}
                 type="button"
                 onClick={() => setTab(t.key)}
-                className={`flex items-center gap-2.5 rounded-xl px-3.5 py-2.5 text-xs font-semibold transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                className={`flex items-center gap-2.5 rounded-lg px-3 py-2 text-xs font-semibold transition-colors whitespace-nowrap shrink-0 cursor-pointer border ${
                   active
-                    ? 'bg-[#EFF6FF] text-[#2563EB]'
-                    : 'text-slate-600 hover:bg-white hover:text-[#0F172A]'
+                    ? 'bg-[#EFF6FF] text-[#2563EB] border-[#BFDBFE]'
+                    : 'text-slate-600 border-transparent hover:bg-white hover:text-[#0F172A]'
                 }`}
               >
                 <Icon className="h-4 w-4 shrink-0" />
@@ -300,7 +303,7 @@ export function SettingsPage() {
         </nav>
 
         {/* Active Panel */}
-        <div className="flex-1 rounded-2xl border border-[#E2E8F0] bg-white p-5 sm:p-6 text-xs">
+        <div className="flex-1 rounded-xl border border-[#E2E8F0] bg-white p-5 sm:p-6 text-xs">
           {/* 1. Business Profile */}
           {tab === 'business' && (
             <form onSubmit={handleSaveBusiness} className="space-y-4 max-w-lg">
@@ -392,7 +395,7 @@ export function SettingsPage() {
                 </p>
               </div>
 
-              <div className={`rounded-2xl border p-4 ${metaStatusMeta.color}`}>
+              <div className={`rounded-xl border p-4 ${metaStatusMeta.color}`}>
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <div className="flex items-center gap-2 font-bold text-sm">
                     {business.metaConnectionState === 'connected' ? (
@@ -403,7 +406,7 @@ export function SettingsPage() {
                     <span>{metaStatusMeta.label}</span>
                   </div>
                   <span
-                    className={`rounded-lg px-2.5 py-1 text-[11px] font-semibold ${
+                    className={`rounded-md px-2.5 py-1 text-[11px] font-semibold ${
                       business.messagingMode === 'test'
                         ? 'bg-amber-100 text-amber-900'
                         : 'bg-emerald-100 text-emerald-900'
@@ -441,7 +444,7 @@ export function SettingsPage() {
               </div>
 
               {/* Plain-language 3-step guide */}
-              <div className="rounded-2xl border border-[#E2E8F0] bg-[#F8FAFC] p-4 space-y-3">
+              <div className="rounded-xl border border-[#E2E8F0] bg-[#F8FAFC] p-4 space-y-3">
                 <p className="font-semibold text-[#0F172A]">How to connect WhatsApp in 3 steps</p>
                 <ol className="space-y-2 text-slate-600 list-decimal pl-4">
                   <li>
@@ -457,7 +460,7 @@ export function SettingsPage() {
               </div>
 
               {/* Technical / API Settings Collapsible Section */}
-              <div className="rounded-2xl border border-[#E2E8F0] bg-white overflow-hidden">
+              <div className="rounded-xl border border-[#E2E8F0] bg-white overflow-hidden">
                 <button
                   type="button"
                   onClick={() => setShowTechnicalApi((s) => !s)}
