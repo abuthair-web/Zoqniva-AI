@@ -35,6 +35,19 @@ import {
   fetchAdminTeamDirectory,
   fetchBasicWorkspaceTeamMembers,
 } from '@/services/teamService';
+import {
+  bulkTagContactsInDb,
+  createCampaignInDb,
+  createContactInDb,
+  createTagInDb,
+  deleteContactInDb,
+  importContactsBatchInDb,
+  mapDbCampaignRow,
+  mapDbContactRow,
+  seedTableColumnsFromRows,
+  updateCampaignStatusInDb,
+  updateContactInDb,
+} from '@/services/crmPersistenceService';
 import type { User } from '@supabase/supabase-js';
 import type {
   AIAutomationLog,
@@ -167,15 +180,18 @@ interface AppContextValue {
     phone: string;
     email: string;
     company: string;
-    city: string;
-    country: string;
+    city?: string;
+    country?: string;
     marketingOptIn: boolean;
     tagIds: string[];
     notes: string;
-  }) => { ok: boolean; error?: string; contact?: Contact };
-  updateContact: (id: string, updates: Partial<Contact>) => { ok: boolean; error?: string };
-  deleteContact: (id: string) => void;
-  bulkTagContacts: (contactIds: string[], tagId: string) => void;
+  }) => Promise<{ ok: boolean; error?: string; warning?: string; contact?: Contact }>;
+  updateContact: (
+    id: string,
+    updates: Partial<Contact>
+  ) => Promise<{ ok: boolean; error?: string; contact?: Contact }>;
+  deleteContact: (id: string) => Promise<{ ok: boolean; error?: string }>;
+  bulkTagContacts: (contactIds: string[], tagId: string) => Promise<{ ok: boolean; error?: string }>;
   importContactsBatch: (
     rows: Array<{
       fullName: string;
@@ -186,8 +202,11 @@ interface AppContextValue {
       country: string;
       marketingOptIn: boolean;
     }>
-  ) => number;
-  createTag: (name: string, color: string) => Tag;
+  ) => Promise<{ ok: boolean; importedCount: number; error?: string }>;
+  createTag: (
+    name: string,
+    color: string
+  ) => Promise<{ ok: boolean; tag?: Tag; error?: string }>;
   openOrCreateConversationForContact: (contactId: string) => string;
 
   // Broadcasts & Templates
@@ -203,9 +222,12 @@ interface AppContextValue {
     selectedCount: number;
     eligibleCount: number;
     skippedCount: number;
-  }) => Campaign;
-  duplicateCampaign: (id: string) => Campaign | null;
-  updateCampaignStatus: (id: string, status: Campaign['status']) => void;
+  }) => Promise<{ ok: boolean; campaign?: Campaign; error?: string }>;
+  duplicateCampaign: (id: string) => Promise<{ ok: boolean; campaign?: Campaign; error?: string }>;
+  updateCampaignStatus: (
+    id: string,
+    status: Campaign['status']
+  ) => Promise<{ ok: boolean; error?: string }>;
   createTemplateDraft: (
     input: Omit<MessageTemplate, 'id' | 'approvalStatus'>
   ) => Promise<{ ok: boolean; template?: MessageTemplate; error?: string }>;
@@ -614,23 +636,10 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         tagMap.set(ct.contact_id, list);
       }
 
+      const rawContactRows = (contactsRes.data ?? []) as Array<Record<string, unknown>>;
+      seedTableColumnsFromRows('contacts', rawContactRows);
       setContacts(
-        (contactsRes.data ?? []).map((c: Record<string, unknown>) => ({
-          id: String(c.id),
-          fullName: String(c.full_name),
-          phoneE164: String(c.phone_e164),
-          waId: c.wa_id ? String(c.wa_id) : undefined,
-          email: String(c.email ?? ''),
-          company: String(c.company ?? ''),
-          city: String(c.city ?? ''),
-          country: String(c.country ?? ''),
-          marketingOptIn: Boolean(c.marketing_opt_in),
-          optedOutAt: c.opted_out_at ? String(c.opted_out_at) : undefined,
-          tagIds: tagMap.get(String(c.id)) ?? [],
-          notes: String(c.notes ?? ''),
-          lastContactedAt: c.last_contacted_at ? String(c.last_contacted_at) : undefined,
-          createdAt: String(c.created_at ?? new Date().toISOString()),
-        }))
+        rawContactRows.map((c) => mapDbContactRow(c, tagMap.get(String(c.id)) ?? []))
       );
 
       const loadedMsgs = [...(msgsRes.data ?? [])]
@@ -659,28 +668,9 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         (tplsRes.data ?? []).map((t) => mapDbTemplateRow(t as Record<string, unknown>))
       );
 
-      setCampaigns(
-        (cmpsRes.data ?? []).map((cp: Record<string, unknown>) => ({
-          id: String(cp.id),
-          name: String(cp.name),
-          templateId: String(cp.template_id),
-          status: (cp.status as Campaign['status']) ?? 'draft',
-          targetTagIds: Array.isArray(cp.target_tag_ids) ? cp.target_tag_ids.map(String) : [],
-          variableMapping: (cp.variable_mapping as Record<string, string>) ?? {},
-          scheduledFor: cp.scheduled_for ? String(cp.scheduled_for) : undefined,
-          createdAt: String(cp.created_at ?? new Date().toISOString()),
-          metrics: {
-            selected: Number(cp.selected_count ?? 0),
-            eligible: Number(cp.eligible_count ?? 0),
-            submitted: Number(cp.submitted_count ?? 0),
-            sent: Number(cp.sent_count ?? 0),
-            delivered: Number(cp.delivered_count ?? 0),
-            read: Number(cp.read_count ?? 0),
-            failed: Number(cp.failed_count ?? 0),
-            skipped: Number(cp.skipped_count ?? 0),
-          },
-        }))
-      );
+      const rawCampaignRows = (cmpsRes.data ?? []) as Array<Record<string, unknown>>;
+      seedTableColumnsFromRows('campaigns', rawCampaignRows);
+      setCampaigns(rawCampaignRows.map((cp) => mapDbCampaignRow(cp)));
 
       setAutomationRules(
         (rulesRes.data ?? []).map((r: Record<string, unknown>) => {
@@ -1064,26 +1054,20 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           filter: `business_id=eq.${businessId}`,
         },
         (payload) => {
+          if (payload.eventType === 'DELETE') {
+            const oldRow = (payload.old as Record<string, unknown> | null) ?? null;
+            if (oldRow?.id) {
+              const removedId = String(oldRow.id);
+              setContacts((prev) => prev.filter((item) => item.id !== removedId));
+            }
+            return;
+          }
           const c = (payload.new as Record<string, unknown> | null) ?? null;
-          if (!c) return;
+          if (!c || !c.id) return;
+          seedTableColumnsFromRows('contacts', [c]);
           setContacts((prev) => {
             const existing = prev.find((item) => item.id === String(c.id));
-            const mappedContact: Contact = {
-              id: String(c.id),
-              fullName: String(c.full_name),
-              phoneE164: String(c.phone_e164),
-              waId: c.wa_id ? String(c.wa_id) : undefined,
-              email: String(c.email ?? ''),
-              company: String(c.company ?? ''),
-              city: String(c.city ?? ''),
-              country: String(c.country ?? ''),
-              marketingOptIn: Boolean(c.marketing_opt_in),
-              optedOutAt: c.opted_out_at ? String(c.opted_out_at) : undefined,
-              tagIds: existing?.tagIds ?? [],
-              notes: String(c.notes ?? ''),
-              lastContactedAt: c.last_contacted_at ? String(c.last_contacted_at) : undefined,
-              createdAt: String(c.created_at ?? new Date().toISOString()),
-            };
+            const mappedContact = mapDbContactRow(c, existing?.tagIds ?? []);
             if (existing) {
               return prev.map((item) => (item.id === mappedContact.id ? mappedContact : item));
             }
@@ -1654,9 +1638,13 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   };
 
   // ============================================================================
-  // CONTACTS CRUD, CSV IMPORT & TAGGING
+  // CONTACTS CRUD, CSV IMPORT & TAGGING (Real Supabase persistence + read-back)
   // ============================================================================
-  const addContact: AppContextValue['addContact'] = (input) => {
+  const addContact: AppContextValue['addContact'] = async (input) => {
+    const cleanName = input.fullName.trim();
+    if (!cleanName) {
+      return { ok: false, error: 'Please enter the contact full name.' };
+    }
     const normalized = normalizePhoneE164(input.phone);
     if (!normalized) {
       return {
@@ -1667,141 +1655,148 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     if (contacts.some((c) => c.phoneE164 === normalized)) {
       return {
         ok: false,
-        error: `A contact with phone number ${normalized} already exists.`,
+        error: `A contact with phone number ${normalized} already exists in this workspace.`,
       };
     }
-    const contactId = crypto.randomUUID();
+
+    if (supabase && isSupabaseConfigured) {
+      if (!UUID_REGEX.test(business.id)) {
+        return {
+          ok: false,
+          error: 'Active business workspace could not be verified. Refresh and sign in again.',
+        };
+      }
+
+      const dbRes = await createContactInDb({
+        businessId: business.id,
+        fullName: cleanName,
+        phone: normalized,
+        email: input.email,
+        company: input.company,
+        city: input.city,
+        country: input.country,
+        marketingOptIn: input.marketingOptIn,
+        tagIds: input.tagIds,
+        notes: input.notes,
+        createdBy: currentUser?.id ?? null,
+      });
+
+      if (!dbRes.ok || !dbRes.contact) {
+        return { ok: false, error: dbRes.error || 'Could not save contact to Supabase.' };
+      }
+
+      const persisted = dbRes.contact;
+      setContacts((prev) => {
+        const exists = prev.some((c) => c.id === persisted.id);
+        return exists
+          ? prev.map((c) => (c.id === persisted.id ? persisted : c))
+          : [persisted, ...prev];
+      });
+      appendAudit('Created Contact', 'contact', `${persisted.fullName} (${persisted.phoneE164})`);
+      return { ok: true, contact: persisted, warning: dbRes.warning };
+    }
+
+    // Non-Supabase local fallback (only when VITE_SUPABASE_* is intentionally unconfigured)
     const created: Contact = {
-      id: contactId,
-      fullName: input.fullName.trim(),
+      id: crypto.randomUUID(),
+      fullName: cleanName,
       phoneE164: normalized,
       waId: normalized.replace('+', ''),
       email: input.email.trim(),
       company: input.company.trim(),
-      city: input.city.trim(),
-      country: input.country.trim(),
+      city: (input.city ?? '').trim(),
+      country: (input.country ?? '').trim(),
       marketingOptIn: input.marketingOptIn,
       tagIds: input.tagIds,
       notes: input.notes.trim(),
       createdAt: new Date().toISOString(),
     };
     setContacts((prev) => [created, ...prev]);
-
-    if (supabase && isSupabaseConfigured && UUID_REGEX.test(business.id)) {
-      const client = supabase;
-      void client
-        .from('contacts')
-        .insert({
-          id: contactId,
-          business_id: business.id,
-          full_name: created.fullName,
-          phone_e164: created.phoneE164,
-          wa_id: created.waId,
-          email: created.email || null,
-          company: created.company || null,
-          city: created.city || null,
-          country: created.country || null,
-          marketing_opt_in: created.marketingOptIn,
-          notes: created.notes,
-          created_by: currentUser?.id ?? null,
-        })
-        .then(({ error }) => {
-          if (!error && created.tagIds.length > 0) {
-            void client.from('contact_tags').insert(
-              created.tagIds
-                .filter((tid) => UUID_REGEX.test(tid))
-                .map((tid) => ({ contact_id: contactId, tag_id: tid }))
-            );
-          }
-        });
-    }
-
     appendAudit('Created Contact', 'contact', `${created.fullName} (${created.phoneE164})`);
     return { ok: true, contact: created };
   };
 
-  const updateContact: AppContextValue['updateContact'] = (id, updates) => {
-    if (updates.phoneE164) {
-      const normalized = normalizePhoneE164(updates.phoneE164);
+  const updateContact: AppContextValue['updateContact'] = async (id, updates) => {
+    const cleanUpdates: Partial<Contact> = { ...updates };
+    if (cleanUpdates.phoneE164 !== undefined) {
+      const normalized = normalizePhoneE164(cleanUpdates.phoneE164);
       if (!normalized) {
         return { ok: false, error: 'Invalid international E.164 phone format.' };
       }
       if (contacts.some((c) => c.id !== id && c.phoneE164 === normalized)) {
         return { ok: false, error: `Phone ${normalized} belongs to another contact.` };
       }
-      updates.phoneE164 = normalized;
-      updates.waId = normalized.replace('+', '');
+      cleanUpdates.phoneE164 = normalized;
+      cleanUpdates.waId = normalized.replace('+', '');
     }
 
     const existing = contacts.find((c) => c.id === id);
     const nextOptOut =
-      updates.marketingOptIn === false && existing?.marketingOptIn
+      cleanUpdates.marketingOptIn === false && existing?.marketingOptIn
         ? new Date().toISOString()
-        : updates.marketingOptIn === true
+        : cleanUpdates.marketingOptIn === true
         ? undefined
         : existing?.optedOutAt;
+
+    if (supabase && isSupabaseConfigured) {
+      if (!UUID_REGEX.test(business.id) || !UUID_REGEX.test(id)) {
+        return { ok: false, error: 'Active workspace or contact identifier is invalid.' };
+      }
+
+      const dbRes = await updateContactInDb({
+        businessId: business.id,
+        contactId: id,
+        updates: { ...cleanUpdates, optedOutAt: nextOptOut ?? null },
+        existingTagIds: existing?.tagIds ?? [],
+      });
+
+      if (!dbRes.ok || !dbRes.contact) {
+        return { ok: false, error: dbRes.error || 'Failed to update contact in Supabase.' };
+      }
+
+      const persisted = dbRes.contact;
+      setContacts((prev) => prev.map((c) => (c.id === id ? persisted : c)));
+      return { ok: true, contact: persisted };
+    }
 
     setContacts((prev) =>
       prev.map((c) => {
         if (c.id !== id) return c;
-        return { ...c, ...updates, optedOutAt: nextOptOut };
+        return { ...c, ...cleanUpdates, optedOutAt: nextOptOut };
       })
     );
-
-    if (supabase && isSupabaseConfigured && UUID_REGEX.test(id)) {
-      const client = supabase;
-      const dbPatch: Record<string, unknown> = {};
-      if (updates.fullName !== undefined) dbPatch.full_name = updates.fullName;
-      if (updates.phoneE164 !== undefined) {
-        dbPatch.phone_e164 = updates.phoneE164;
-        dbPatch.wa_id = updates.phoneE164.replace('+', '');
-      }
-      if (updates.email !== undefined) dbPatch.email = updates.email || null;
-      if (updates.company !== undefined) dbPatch.company = updates.company || null;
-      if (updates.city !== undefined) dbPatch.city = updates.city || null;
-      if (updates.country !== undefined) dbPatch.country = updates.country || null;
-      if (updates.notes !== undefined) dbPatch.notes = updates.notes;
-      if (updates.marketingOptIn !== undefined) {
-        dbPatch.marketing_opt_in = updates.marketingOptIn;
-        dbPatch.opted_out_at = nextOptOut ?? null;
-      }
-
-      if (Object.keys(dbPatch).length > 0) {
-        void client.from('contacts').update(dbPatch).eq('id', id);
-      }
-
-      if (updates.tagIds !== undefined) {
-        const validTags = updates.tagIds.filter((tid) => UUID_REGEX.test(tid));
-        void client
-          .from('contact_tags')
-          .delete()
-          .eq('contact_id', id)
-          .then(() => {
-            if (validTags.length > 0) {
-              void client
-                .from('contact_tags')
-                .insert(validTags.map((tid) => ({ contact_id: id, tag_id: tid })));
-            }
-          });
-      }
-    }
-
     return { ok: true };
   };
 
-  const deleteContact = (id: string) => {
+  const deleteContact: AppContextValue['deleteContact'] = async (id) => {
     const target = contacts.find((c) => c.id === id);
+
+    if (supabase && isSupabaseConfigured) {
+      if (!UUID_REGEX.test(business.id) || !UUID_REGEX.test(id)) {
+        return { ok: false, error: 'Active workspace or contact identifier is invalid.' };
+      }
+      const dbRes = await deleteContactInDb({ businessId: business.id, contactId: id });
+      if (!dbRes.ok) {
+        return { ok: false, error: dbRes.error || 'Could not delete contact in Supabase.' };
+      }
+    }
+
     setContacts((prev) => prev.filter((c) => c.id !== id));
     setConversations((prev) => prev.filter((cv) => cv.contactId !== id));
-    if (supabase && isSupabaseConfigured && UUID_REGEX.test(id)) {
-      void supabase.from('contacts').delete().eq('id', id);
-    }
     if (target) {
       appendAudit('Deleted Contact', 'contact', `${target.fullName} (${target.phoneE164})`);
     }
+    return { ok: true };
   };
 
-  const bulkTagContacts = (contactIds: string[], tagId: string) => {
+  const bulkTagContacts: AppContextValue['bulkTagContacts'] = async (contactIds, tagId) => {
+    if (supabase && isSupabaseConfigured) {
+      const dbRes = await bulkTagContactsInDb({ contactIds, tagId });
+      if (!dbRes.ok) {
+        return { ok: false, error: dbRes.error || 'Failed to apply tag in Supabase.' };
+      }
+    }
+
     const idSet = new Set(contactIds);
     setContacts((prev) =>
       prev.map((c) =>
@@ -1810,85 +1805,115 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           : c
       )
     );
-    if (supabase && isSupabaseConfigured && UUID_REGEX.test(tagId)) {
-      const pairs = contactIds
-        .filter((cid) => UUID_REGEX.test(cid))
-        .map((cid) => ({ contact_id: cid, tag_id: tagId }));
-      if (pairs.length > 0) {
-        void supabase.from('contact_tags').upsert(pairs, { onConflict: 'contact_id,tag_id' });
-      }
-    }
     const tagName = tags.find((t) => t.id === tagId)?.name ?? tagId;
     appendAudit('Bulk Tagged Contacts', 'contact', `Applied "${tagName}" to ${contactIds.length} contacts`);
+    return { ok: true };
   };
 
-  const importContactsBatch: AppContextValue['importContactsBatch'] = (rows) => {
+  const importContactsBatch: AppContextValue['importContactsBatch'] = async (rows) => {
     const existing = new Set(contacts.map((c) => c.phoneE164));
-    const toAdd: Contact[] = [];
-
+    const uniqueRows: typeof rows = [];
     for (const row of rows) {
-      if (!existing.has(row.phoneE164)) {
-        existing.add(row.phoneE164);
-        toAdd.push({
-          id: crypto.randomUUID(),
-          fullName: row.fullName,
-          phoneE164: row.phoneE164,
-          waId: row.phoneE164.replace('+', ''),
-          email: row.email,
-          company: row.company,
-          city: row.city,
-          country: row.country,
-          marketingOptIn: row.marketingOptIn,
-          tagIds: [],
-          notes: 'Imported via CSV',
-          createdAt: new Date().toISOString(),
-        });
+      const normalized = normalizePhoneE164(row.phoneE164);
+      if (normalized && !existing.has(normalized) && row.fullName.trim().length > 0) {
+        existing.add(normalized);
+        uniqueRows.push({ ...row, phoneE164: normalized, fullName: row.fullName.trim() });
       }
     }
 
-    if (toAdd.length > 0) {
-      setContacts((prev) => [...toAdd, ...prev]);
-      if (supabase && isSupabaseConfigured && UUID_REGEX.test(business.id)) {
-        void supabase.from('contacts').insert(
-          toAdd.map((c) => ({
-            id: c.id,
-            business_id: business.id,
-            full_name: c.fullName,
-            phone_e164: c.phoneE164,
-            wa_id: c.waId,
-            email: c.email || null,
-            company: c.company || null,
-            city: c.city || null,
-            country: c.country || null,
-            marketing_opt_in: c.marketingOptIn,
-            notes: c.notes,
-            created_by: currentUser?.id ?? null,
-          }))
-        );
-      }
-      appendAudit('Imported Contacts CSV', 'contact', `Imported ${toAdd.length} normalized contacts`);
+    if (uniqueRows.length === 0) {
+      return { ok: false, importedCount: 0, error: 'No new valid contacts to import.' };
     }
-    return toAdd.length;
+
+    if (supabase && isSupabaseConfigured) {
+      if (!UUID_REGEX.test(business.id)) {
+        return {
+          ok: false,
+          importedCount: 0,
+          error: 'Active business workspace could not be verified.',
+        };
+      }
+      const dbRes = await importContactsBatchInDb({
+        businessId: business.id,
+        rows: uniqueRows,
+        createdBy: currentUser?.id ?? null,
+      });
+      if (!dbRes.ok) {
+        return {
+          ok: false,
+          importedCount: 0,
+          error: dbRes.error || 'Failed to import contacts into Supabase.',
+        };
+      }
+
+      const persistedMap = new Map(dbRes.contacts.map((c) => [c.id, c]));
+      setContacts((prev) => [
+        ...dbRes.contacts,
+        ...prev.filter((c) => !persistedMap.has(c.id)),
+      ]);
+      appendAudit(
+        'Imported Contacts CSV',
+        'contact',
+        `Imported ${dbRes.contacts.length} normalized contacts`
+      );
+      return { ok: true, importedCount: dbRes.contacts.length };
+    }
+
+    const toAdd: Contact[] = uniqueRows.map((row) => ({
+      id: crypto.randomUUID(),
+      fullName: row.fullName,
+      phoneE164: row.phoneE164,
+      waId: row.phoneE164.replace('+', ''),
+      email: row.email,
+      company: row.company,
+      city: row.city,
+      country: row.country,
+      marketingOptIn: row.marketingOptIn,
+      tagIds: [],
+      notes: 'Imported via CSV',
+      createdAt: new Date().toISOString(),
+    }));
+    setContacts((prev) => [...toAdd, ...prev]);
+    appendAudit('Imported Contacts CSV', 'contact', `Imported ${toAdd.length} normalized contacts`);
+    return { ok: true, importedCount: toAdd.length };
   };
 
-  const createTag = (name: string, color: string): Tag => {
-    const existing = tags.find((t) => t.name.toLowerCase() === name.trim().toLowerCase());
-    if (existing) return existing;
+  const createTag: AppContextValue['createTag'] = async (name, color) => {
+    const cleanName = name.trim();
+    if (!cleanName) {
+      return { ok: false, error: 'Tag name cannot be empty.' };
+    }
+    const existing = tags.find((t) => t.name.toLowerCase() === cleanName.toLowerCase());
+    if (existing) {
+      return { ok: true, tag: existing };
+    }
+
+    if (supabase && isSupabaseConfigured) {
+      if (!UUID_REGEX.test(business.id)) {
+        return { ok: false, error: 'Active business workspace could not be verified.' };
+      }
+      const dbRes = await createTagInDb({
+        businessId: business.id,
+        name: cleanName,
+        color,
+      });
+      if (!dbRes.ok || !dbRes.tag) {
+        return { ok: false, error: dbRes.error || 'Could not create tag in Supabase.' };
+      }
+      const persistedTag = dbRes.tag;
+      setTags((prev) =>
+        prev.some((t) => t.id === persistedTag.id) ? prev : [...prev, persistedTag]
+      );
+      return { ok: true, tag: persistedTag };
+    }
+
     const tag: Tag = {
       id: crypto.randomUUID(),
-      name: name.trim(),
+      name: cleanName,
       color,
     };
     setTags((prev) => [...prev, tag]);
-    if (supabase && isSupabaseConfigured && UUID_REGEX.test(business.id)) {
-      void supabase.from('tags').insert({
-        id: tag.id,
-        business_id: business.id,
-        name: tag.name,
-        color: tag.color,
-      });
-    }
-    return tag;
+    return { ok: true, tag };
   };
 
   const openOrCreateConversationForContact = (contactId: string): string => {
@@ -1935,20 +1960,67 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   };
 
   // ============================================================================
-  // BROADCASTS & TEMPLATES (Disabled from live execution in Test Mode)
+  // BROADCASTS & TEMPLATES (Real Supabase persistence; saving a draft NEVER sends WhatsApp)
   // ============================================================================
-  const createCampaign: AppContextValue['createCampaign'] = (input) => {
+  const createCampaign: AppContextValue['createCampaign'] = async (input) => {
     const isMetaLive =
       business.metaConnectionState === 'connected' && business.messagingMode === 'live';
+    // Never mark a draft as running or trigger any WhatsApp dispatch from campaign creation
     const nextStatus: Campaign['status'] =
       input.scheduleMode === 'draft' || !isMetaLive
         ? 'draft'
         : input.scheduleMode === 'scheduled'
         ? 'scheduled'
-        : 'running';
+        : 'draft';
+
+    const scheduledForValue = nextStatus === 'scheduled' ? input.scheduledFor : undefined;
+
+    if (supabase && isSupabaseConfigured) {
+      if (!UUID_REGEX.test(business.id)) {
+        return {
+          ok: false,
+          error: 'Active business workspace could not be verified. Refresh and sign in again.',
+        };
+      }
+
+      const dbRes = await createCampaignInDb({
+        businessId: business.id,
+        name: input.name,
+        templateId: input.templateId,
+        status: nextStatus,
+        audienceMode: input.audienceMode ?? 'groups',
+        targetTagIds: input.targetTagIds,
+        targetContactIds: input.targetContactIds,
+        variableMapping: input.variableMapping,
+        scheduledFor: scheduledForValue,
+        selectedCount: input.selectedCount,
+        eligibleCount: input.eligibleCount,
+        skippedCount: input.skippedCount,
+        createdBy: currentUser?.id ?? null,
+      });
+
+      if (!dbRes.ok || !dbRes.campaign) {
+        return {
+          ok: false,
+          error: dbRes.error || 'Could not save campaign draft to Supabase.',
+        };
+      }
+
+      const persisted = dbRes.campaign;
+      setCampaigns((prev) => [persisted, ...prev.filter((c) => c.id !== persisted.id)]);
+      setRecentTemplateIds((prev) =>
+        [input.templateId, ...prev.filter((tid) => tid !== input.templateId)].slice(0, 5)
+      );
+      appendAudit(
+        persisted.status === 'draft' ? 'Saved Campaign Draft' : 'Created Broadcast Campaign',
+        'campaign',
+        `${persisted.name} (${persisted.metrics.eligible} eligible)`
+      );
+      return { ok: true, campaign: persisted };
+    }
 
     const campaign: Campaign = {
-      id: `cmp-${Date.now()}`,
+      id: crypto.randomUUID(),
       name: input.name.trim(),
       templateId: input.templateId,
       status: nextStatus,
@@ -1956,7 +2028,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       targetTagIds: input.targetTagIds,
       targetContactIds: input.targetContactIds,
       variableMapping: input.variableMapping,
-      scheduledFor: input.scheduledFor,
+      scheduledFor: scheduledForValue,
       createdAt: new Date().toISOString(),
       metrics: {
         selected: input.selectedCount,
@@ -1973,16 +2045,52 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     setRecentTemplateIds((prev) =>
       [input.templateId, ...prev.filter((tid) => tid !== input.templateId)].slice(0, 5)
     );
-    appendAudit('Created Broadcast Campaign', 'campaign', `${campaign.name} (${campaign.metrics.eligible} eligible)`);
-    return campaign;
+    appendAudit(
+      'Saved Campaign Draft',
+      'campaign',
+      `${campaign.name} (${campaign.metrics.eligible} eligible)`
+    );
+    return { ok: true, campaign };
   };
 
-  const duplicateCampaign = (id: string): Campaign | null => {
+  const duplicateCampaign: AppContextValue['duplicateCampaign'] = async (id) => {
     const source = campaigns.find((c) => c.id === id);
-    if (!source) return null;
+    if (!source) {
+      return { ok: false, error: 'Source campaign not found.' };
+    }
+
+    if (supabase && isSupabaseConfigured) {
+      if (!UUID_REGEX.test(business.id)) {
+        return { ok: false, error: 'Active business workspace could not be verified.' };
+      }
+      const dbRes = await createCampaignInDb({
+        businessId: business.id,
+        name: `${source.name} (Copy)`,
+        templateId: source.templateId,
+        status: 'draft',
+        audienceMode: source.audienceMode,
+        targetTagIds: source.targetTagIds,
+        targetContactIds: source.targetContactIds,
+        variableMapping: source.variableMapping,
+        selectedCount: source.metrics.selected,
+        eligibleCount: source.metrics.eligible,
+        skippedCount: source.metrics.skipped,
+        createdBy: currentUser?.id ?? null,
+      });
+
+      if (!dbRes.ok || !dbRes.campaign) {
+        return { ok: false, error: dbRes.error || 'Could not duplicate campaign in Supabase.' };
+      }
+
+      const persisted = dbRes.campaign;
+      setCampaigns((prev) => [persisted, ...prev.filter((c) => c.id !== persisted.id)]);
+      appendAudit('Duplicated Campaign', 'campaign', `Duplicated ${source.name}`);
+      return { ok: true, campaign: persisted };
+    }
+
     const copy: Campaign = {
       ...source,
-      id: `cmp-${Date.now()}`,
+      id: crypto.randomUUID(),
       name: `${source.name} (Copy)`,
       status: 'draft',
       createdAt: new Date().toISOString(),
@@ -2000,11 +2108,30 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     };
     setCampaigns((prev) => [copy, ...prev]);
     appendAudit('Duplicated Campaign', 'campaign', `Duplicated ${source.name}`);
-    return copy;
+    return { ok: true, campaign: copy };
   };
 
-  const updateCampaignStatus = (id: string, status: Campaign['status']) => {
+  const updateCampaignStatus: AppContextValue['updateCampaignStatus'] = async (id, status) => {
+    if (supabase && isSupabaseConfigured) {
+      if (!UUID_REGEX.test(business.id) || !UUID_REGEX.test(id)) {
+        return { ok: false, error: 'Active workspace or campaign identifier is invalid.' };
+      }
+      const dbRes = await updateCampaignStatusInDb({
+        businessId: business.id,
+        campaignId: id,
+        status,
+      });
+      if (!dbRes.ok) {
+        return { ok: false, error: dbRes.error || 'Could not update campaign status in Supabase.' };
+      }
+      setCampaigns((prev) =>
+        prev.map((c) => (c.id === id ? { ...c, status: dbRes.campaign?.status ?? status } : c))
+      );
+      return { ok: true };
+    }
+
     setCampaigns((prev) => prev.map((c) => (c.id === id ? { ...c, status } : c)));
+    return { ok: true };
   };
 
   const createTemplateDraft: AppContextValue['createTemplateDraft'] = async (input) => {

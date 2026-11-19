@@ -11,6 +11,7 @@ import {
   ChevronDown,
   Copy,
   FileText,
+  Loader2,
   Megaphone,
   Pause,
   Play,
@@ -64,7 +65,8 @@ export function BroadcastsPage() {
   const [pageSize, setPageSize] = useState<10 | 25 | 50>(10);
 
   const [reportCampaign, setReportCampaign] = useState<Campaign | null>(null);
-  const [bannerFeedback, setBannerFeedback] = useState<string | null>(null);
+  const [bannerFeedback, setBannerFeedback] = useState<{ ok: boolean; text: string } | null>(null);
+  const [composeError, setComposeError] = useState<string | null>(null);
 
   const approvedTemplates = useMemo(() => {
     const approved = templates.filter((t) => t.approvalStatus === 'APPROVED');
@@ -265,6 +267,7 @@ export function BroadcastsPage() {
   const handleOpenNewWizard = () => {
     setWizardStage(1);
     setConsentConfirmed(false);
+    setComposeError(null);
     setViewMode('compose');
   };
 
@@ -275,54 +278,87 @@ export function BroadcastsPage() {
       ? 'WhatsApp is not connected — confirming saves this campaign as a draft only.'
       : null;
 
-  const handleSubmitBroadcast = (asDraft: boolean) => {
+  const handleSubmitBroadcast = async (asDraft: boolean) => {
     if (submitting || !selectedTemplate) return;
     if (!asDraft && (!consentConfirmed || audienceStats.eligibleCount === 0)) return;
 
+    setComposeError(null);
     setSubmitting(true);
-    const created = createCampaign({
-      name: customName.trim() || autoCampaignName,
-      templateId: selectedTemplate.id,
-      audienceMode,
-      targetTagIds: audienceMode === 'groups' ? selectedTagIds : [],
-      targetContactIds: audienceMode === 'specific' ? selectedContactIds : undefined,
-      variableMapping: varMapping,
-      scheduleMode: asDraft ? 'draft' : scheduleMode,
-      scheduledFor:
-        !asDraft && scheduleMode === 'scheduled'
-          ? new Date(scheduledFor).toISOString()
-          : undefined,
-      selectedCount: audienceStats.selectedCount,
-      eligibleCount: audienceStats.eligibleCount,
-      skippedCount: audienceStats.skippedCount,
-    });
 
-    localStorage.removeItem(DRAFT_STORAGE_KEY);
-    setCustomName('');
-    setConsentConfirmed(false);
-    setWizardStage(1);
-    setSubmitting(false);
-    setViewMode('list');
+    try {
+      const res = await createCampaign({
+        name: customName.trim() || autoCampaignName,
+        templateId: selectedTemplate.id,
+        audienceMode,
+        targetTagIds: audienceMode === 'groups' ? selectedTagIds : [],
+        targetContactIds: audienceMode === 'specific' ? selectedContactIds : undefined,
+        variableMapping: varMapping,
+        scheduleMode: asDraft ? 'draft' : scheduleMode,
+        scheduledFor:
+          !asDraft && scheduleMode === 'scheduled'
+            ? new Date(scheduledFor).toISOString()
+            : undefined,
+        selectedCount: audienceStats.selectedCount,
+        eligibleCount: audienceStats.eligibleCount,
+        skippedCount: audienceStats.skippedCount,
+      });
 
-    if (asDraft || dispatchDisabledReason) {
-      setBannerFeedback(
-        `Saved "${created.name}" as a draft (${created.metrics.eligible} opted-in recipient${
-          created.metrics.eligible === 1 ? '' : 's'
-        }).`
-      );
-    } else {
-      setBannerFeedback(
-        scheduleMode === 'scheduled'
-          ? `Scheduled "${created.name}" for ${new Date(scheduledFor).toLocaleString()}.`
-          : `Created campaign "${created.name}".`
-      );
+      if (!res.ok || !res.campaign) {
+        // Keep composer open and retain all entered campaign details on error
+        setComposeError(res.error ?? 'Could not save campaign draft in Supabase.');
+        return;
+      }
+
+      const created = res.campaign;
+      localStorage.removeItem(DRAFT_STORAGE_KEY);
+      setCustomName('');
+      setConsentConfirmed(false);
+      setWizardStage(1);
+      setViewMode('list');
+
+      if (created.status === 'draft') {
+        setBannerFeedback({
+          ok: true,
+          text: `Saved "${created.name}" as a draft in Supabase (${created.metrics.eligible} opted-in recipient${
+            created.metrics.eligible === 1 ? '' : 's'
+          }). No WhatsApp messages were sent.`,
+        });
+      } else {
+        setBannerFeedback({
+          ok: true,
+          text:
+            created.status === 'scheduled' && created.scheduledFor
+              ? `Scheduled "${created.name}" in Supabase for ${new Date(created.scheduledFor).toLocaleString()}.`
+              : `Saved campaign "${created.name}" in Supabase.`,
+        });
+      }
+    } finally {
+      setSubmitting(false);
     }
   };
 
-  const handleDuplicate = (id: string) => {
-    const copy = duplicateCampaign(id);
-    if (copy) {
-      setBannerFeedback(`Created editable copy "${copy.name}".`);
+  const handleDuplicate = async (id: string) => {
+    const res = await duplicateCampaign(id);
+    if (!res.ok || !res.campaign) {
+      setBannerFeedback({
+        ok: false,
+        text: res.error ?? 'Could not duplicate campaign in Supabase.',
+      });
+      return;
+    }
+    setBannerFeedback({
+      ok: true,
+      text: `Created draft copy "${res.campaign.name}" in Supabase.`,
+    });
+  };
+
+  const handleUpdateCampaignStatus = async (id: string, status: CampaignStatus) => {
+    const res = await updateCampaignStatus(id, status);
+    if (!res.ok) {
+      setBannerFeedback({
+        ok: false,
+        text: res.error ?? 'Could not update campaign status in Supabase.',
+      });
     }
   };
 
@@ -381,11 +417,29 @@ export function BroadcastsPage() {
             type="button"
             onClick={() => handleSubmitBroadcast(true)}
             disabled={submitting || !selectedTemplate}
-            className="rounded-lg border border-[#E2E8F0] bg-white px-3.5 py-2 text-xs font-semibold text-[#0F172A] hover:bg-[#F1F5F9] cursor-pointer disabled:opacity-50"
+            className="inline-flex items-center gap-1.5 rounded-lg border border-[#E2E8F0] bg-white px-3.5 py-2 text-xs font-semibold text-[#0F172A] hover:bg-[#F1F5F9] cursor-pointer disabled:opacity-50"
           >
-            Save as Draft
+            {submitting && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+            <span>{submitting ? 'Saving Draft...' : 'Save as Draft'}</span>
           </button>
         </div>
+
+        {composeError && (
+          <div className="rounded-xl border border-[#E11D48]/30 bg-rose-50 px-4 py-3 text-xs text-[#E11D48] flex items-start justify-between gap-3">
+            <span className="flex items-start gap-2 font-medium">
+              <AlertCircle className="h-4 w-4 shrink-0 mt-0.5" />
+              <span>{composeError}</span>
+            </span>
+            <button
+              type="button"
+              onClick={() => setComposeError(null)}
+              className="cursor-pointer shrink-0"
+              aria-label="Dismiss error"
+            >
+              <X className="h-3.5 w-3.5" />
+            </button>
+          </div>
+        )}
 
         {/* Two-Column Wizard: Persistent Left Stage Rail + Active Stage Panel */}
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-5 items-start">
@@ -896,13 +950,19 @@ export function BroadcastsPage() {
                         onClick={() => handleSubmitBroadcast(false)}
                         className="w-full inline-flex items-center justify-center gap-2 rounded-lg bg-[#E11D48] py-2.5 text-xs font-semibold text-white hover:bg-rose-700 disabled:opacity-45 transition-colors cursor-pointer"
                       >
-                        <Megaphone className="h-3.5 w-3.5" />
+                        {submitting ? (
+                          <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                        ) : (
+                          <Megaphone className="h-3.5 w-3.5" />
+                        )}
                         <span>
-                          {dispatchDisabledReason
+                          {submitting
+                            ? 'Saving to Supabase...'
+                            : dispatchDisabledReason
                             ? 'Save Campaign Draft'
                             : scheduleMode === 'scheduled'
                             ? 'Schedule Campaign'
-                            : 'Create Campaign'}
+                            : 'Save Campaign Draft'}
                         </span>
                       </button>
                       <button
@@ -963,10 +1023,20 @@ export function BroadcastsPage() {
       )}
 
       {bannerFeedback && (
-        <div className="rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-2.5 text-xs text-emerald-900 flex items-center justify-between gap-2">
+        <div
+          className={`rounded-xl border px-4 py-2.5 text-xs flex items-center justify-between gap-2 ${
+            bannerFeedback.ok
+              ? 'border-emerald-200 bg-emerald-50 text-emerald-900'
+              : 'border-[#E11D48]/30 bg-rose-50 text-[#E11D48]'
+          }`}
+        >
           <span className="flex items-center gap-2 font-medium">
-            <CheckCircle2 className="h-4 w-4 shrink-0" />
-            {bannerFeedback}
+            {bannerFeedback.ok ? (
+              <CheckCircle2 className="h-4 w-4 shrink-0" />
+            ) : (
+              <AlertCircle className="h-4 w-4 shrink-0" />
+            )}
+            {bannerFeedback.text}
           </span>
           <button type="button" onClick={() => setBannerFeedback(null)} className="cursor-pointer">
             <X className="h-3.5 w-3.5" />
@@ -1169,7 +1239,7 @@ export function BroadcastsPage() {
                               {isAdmin && cmp.status === 'scheduled' && (
                                 <button
                                   type="button"
-                                  onClick={() => updateCampaignStatus(cmp.id, 'paused')}
+                                  onClick={() => handleUpdateCampaignStatus(cmp.id, 'paused')}
                                   title="Pause"
                                   className="p-1.5 rounded-md border border-[#E2E8F0] text-slate-600 hover:bg-[#F1F5F9] cursor-pointer"
                                 >
@@ -1179,7 +1249,7 @@ export function BroadcastsPage() {
                               {isAdmin && cmp.status === 'paused' && (
                                 <button
                                   type="button"
-                                  onClick={() => updateCampaignStatus(cmp.id, 'scheduled')}
+                                  onClick={() => handleUpdateCampaignStatus(cmp.id, 'scheduled')}
                                   title="Resume"
                                   className="p-1.5 rounded-md border border-[#E2E8F0] text-[#2563EB] hover:bg-[#EFF6FF] cursor-pointer"
                                 >

@@ -1,6 +1,8 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
 import {
+  AlertCircle,
+  CheckCircle2,
   CheckSquare,
   ChevronDown,
   Download,
@@ -22,6 +24,7 @@ import {
   parseContactsCsv,
   type ParsedCsvRow,
 } from '@/lib/phone';
+import { tableHasConfirmedColumn } from '@/services/crmPersistenceService';
 import type { Contact } from '@/types/crm';
 
 const QUICK_ADD_DRAFT_KEY = 'zoqniva_quick_add_contact_draft';
@@ -86,11 +89,18 @@ export function ContactsPage() {
   const [formNotes, setFormNotes] = useState('');
   const [formError, setFormError] = useState<string | null>(null);
   const [newTagName, setNewTagName] = useState('');
+  const [savingContact, setSavingContact] = useState(false);
+  const [deletingContact, setDeletingContact] = useState(false);
+  const [creatingTag, setCreatingTag] = useState(false);
+  const [importingCsv, setImportingCsv] = useState(false);
+  const [actionBanner, setActionBanner] = useState<{ ok: boolean; text: string } | null>(null);
 
   // CSV Bulk Upload State
   const [csvText, setCsvText] = useState('');
   const [csvPreviewRows, setCsvPreviewRows] = useState<ParsedCsvRow[]>([]);
-  const [importFeedback, setImportFeedback] = useState<string | null>(null);
+  const [importFeedback, setImportFeedback] = useState<{ ok: boolean; text: string } | null>(null);
+
+  const supportsCityColumn = tableHasConfirmedColumn('contacts', 'city');
 
   useEffect(() => {
     const state = location.state as { openAdd?: boolean } | null;
@@ -194,7 +204,7 @@ export function ContactsPage() {
     if (formPhone.trim().startsWith('+') || !countryCode) {
       return normalizePhoneE164(formPhone);
     }
-    const digits = formPhone.replace(/\D/g, '');
+    const digits = formPhone.replace(/\D/g, '').replace(/^0+/, '');
     if (!digits) return null;
     return normalizePhoneE164(`+${countryCode}${digits}`, countryCode);
   }, [formPhone, countryCode]);
@@ -209,8 +219,9 @@ export function ContactsPage() {
     [normalizedPhonePreview, contacts, editingContact?.id]
   );
 
-  const handleSaveContact = (e: React.FormEvent) => {
+  const handleSaveContact = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (savingContact) return;
     setFormError(null);
 
     if (!formName.trim()) {
@@ -219,51 +230,78 @@ export function ContactsPage() {
     }
 
     const finalPhone = normalizedPhonePreview ?? formPhone;
+    setSavingContact(true);
 
-    if (editingContact) {
-      const res = updateContact(editingContact.id, {
-        fullName: formName.trim(),
-        phoneE164: finalPhone,
-        email: formEmail.trim(),
-        company: formCompany.trim(),
-        city: formCity.trim(),
-        country: formCountry.trim(),
-        marketingOptIn: formOptIn,
-        tagIds: formTags,
-        notes: formNotes.trim(),
-      });
-      if (!res.ok) {
-        setFormError(res.error ?? 'Could not save contact.');
-        return;
+    try {
+      if (editingContact) {
+        const res = await updateContact(editingContact.id, {
+          fullName: formName.trim(),
+          phoneE164: finalPhone,
+          email: formEmail.trim(),
+          company: formCompany.trim(),
+          ...(supportsCityColumn ? { city: formCity.trim() } : {}),
+          country: formCountry.trim(),
+          marketingOptIn: formOptIn,
+          tagIds: formTags,
+          notes: formNotes.trim(),
+        });
+        if (!res.ok) {
+          setFormError(res.error ?? 'Could not save contact changes.');
+          return;
+        }
+        setFormDrawerOpen(false);
+        setActionBanner({
+          ok: true,
+          text: `Saved changes for ${res.contact?.fullName ?? formName.trim()}.`,
+        });
+      } else {
+        const res = await addContact({
+          fullName: formName,
+          phone: finalPhone,
+          email: formEmail,
+          company: formCompany,
+          ...(supportsCityColumn ? { city: formCity } : {}),
+          country: formCountry,
+          marketingOptIn: formOptIn,
+          tagIds: formTags,
+          notes: formNotes,
+        });
+        if (!res.ok || !res.contact) {
+          // Retain all entered form details on error
+          setFormError(res.error ?? 'Could not add contact.');
+          return;
+        }
+        localStorage.removeItem(QUICK_ADD_DRAFT_KEY);
+        setFormDrawerOpen(false);
+        setActionBanner({
+          ok: true,
+          text: res.warning
+            ? `Saved ${res.contact.fullName} (${res.contact.phoneE164}). ${res.warning}`
+            : `Saved ${res.contact.fullName} (${res.contact.phoneE164}) to Supabase.`,
+        });
       }
-    } else {
-      const res = addContact({
-        fullName: formName,
-        phone: finalPhone,
-        email: formEmail,
-        company: formCompany,
-        city: formCity,
-        country: formCountry,
-        marketingOptIn: formOptIn,
-        tagIds: formTags,
-        notes: formNotes,
-      });
-      if (!res.ok) {
-        setFormError(res.error ?? 'Could not add contact.');
-        return;
-      }
-      localStorage.removeItem(QUICK_ADD_DRAFT_KEY);
+    } finally {
+      setSavingContact(false);
     }
-    setFormDrawerOpen(false);
   };
 
-  const handleCreateInlineTag = () => {
-    if (!newTagName.trim()) return;
-    const created = createTag(newTagName, '#2563EB');
-    if (!formTags.includes(created.id)) {
-      setFormTags((prev) => [...prev, created.id]);
+  const handleCreateInlineTag = async () => {
+    if (!newTagName.trim() || creatingTag) return;
+    setCreatingTag(true);
+    setFormError(null);
+    try {
+      const res = await createTag(newTagName, '#2563EB');
+      if (!res.ok || !res.tag) {
+        setFormError(res.error ?? 'Could not create tag in Supabase.');
+        return;
+      }
+      if (!formTags.includes(res.tag.id)) {
+        setFormTags((prev) => [...prev, res.tag!.id]);
+      }
+      setNewTagName('');
+    } finally {
+      setCreatingTag(false);
     }
-    setNewTagName('');
   };
 
   const toggleSelectAllOnPage = () => {
@@ -276,11 +314,20 @@ export function ContactsPage() {
     }
   };
 
-  const handleApplyBulkTag = () => {
+  const handleApplyBulkTag = async () => {
     if (!bulkTagId || selectedIds.length === 0) return;
-    bulkTagContacts(selectedIds, bulkTagId);
+    const res = await bulkTagContacts(selectedIds, bulkTagId);
+    if (!res.ok) {
+      setActionBanner({ ok: false, text: res.error ?? 'Could not apply tag to contacts.' });
+      return;
+    }
+    const count = selectedIds.length;
     setBulkTagId('');
     setSelectedIds([]);
+    setActionBanner({
+      ok: true,
+      text: `Applied tag to ${count} contact${count === 1 ? '' : 's'}.`,
+    });
   };
 
   const handleExportCsv = () => {
@@ -320,23 +367,39 @@ export function ContactsPage() {
     );
   };
 
-  const handleConfirmCsvImport = () => {
+  const handleConfirmCsvImport = async () => {
     const valid = csvPreviewRows.filter((r) => !r.error && r.normalizedPhone);
-    if (valid.length === 0) return;
-    const count = importContactsBatch(
-      valid.map((v) => ({
-        fullName: v.fullName,
-        phoneE164: v.normalizedPhone!,
-        email: v.email,
-        company: v.company,
-        city: v.city,
-        country: v.country,
-        marketingOptIn: v.marketingOptIn,
-      }))
-    );
-    setImportFeedback(`Added ${count} contact${count === 1 ? '' : 's'} to your directory.`);
-    setCsvPreviewRows([]);
-    setCsvText('');
+    if (valid.length === 0 || importingCsv) return;
+    setImportingCsv(true);
+    setImportFeedback(null);
+    try {
+      const res = await importContactsBatch(
+        valid.map((v) => ({
+          fullName: v.fullName,
+          phoneE164: v.normalizedPhone!,
+          email: v.email,
+          company: v.company,
+          city: v.city,
+          country: v.country,
+          marketingOptIn: v.marketingOptIn,
+        }))
+      );
+      if (!res.ok) {
+        setImportFeedback({
+          ok: false,
+          text: res.error ?? 'Could not import contacts to Supabase.',
+        });
+        return;
+      }
+      setImportFeedback({
+        ok: true,
+        text: `Saved ${res.importedCount} contact${res.importedCount === 1 ? '' : 's'} to Supabase.`,
+      });
+      setCsvPreviewRows([]);
+      setCsvText('');
+    } finally {
+      setImportingCsv(false);
+    }
   };
 
   const getInitials = (name: string) =>
@@ -396,6 +459,33 @@ export function ContactsPage() {
           </button>
         </div>
       </div>
+
+      {actionBanner && (
+        <div
+          className={`rounded-xl border px-4 py-2.5 text-xs flex items-center justify-between gap-2 ${
+            actionBanner.ok
+              ? 'border-emerald-200 bg-emerald-50 text-emerald-900'
+              : 'border-[#E11D48]/30 bg-rose-50 text-[#E11D48]'
+          }`}
+        >
+          <span className="flex items-center gap-2 font-medium">
+            {actionBanner.ok ? (
+              <CheckCircle2 className="h-4 w-4 shrink-0" />
+            ) : (
+              <AlertCircle className="h-4 w-4 shrink-0" />
+            )}
+            {actionBanner.text}
+          </span>
+          <button
+            type="button"
+            onClick={() => setActionBanner(null)}
+            className="cursor-pointer"
+            aria-label="Dismiss notification"
+          >
+            <X className="h-3.5 w-3.5" />
+          </button>
+        </div>
+      )}
 
       {workspaceLoading && contacts.length === 0 ? (
         <div className="rounded-xl border border-[#E2E8F0] bg-white p-12 text-center space-y-2.5">
@@ -1004,10 +1094,17 @@ export function ContactsPage() {
                     />
                     <button
                       type="button"
+                      disabled={creatingTag || !newTagName.trim()}
                       onClick={handleCreateInlineTag}
-                      className="rounded-lg border border-[#E2E8F0] bg-[#F8FAFC] px-3 py-1.5 font-semibold text-[#0F172A] hover:bg-[#F1F5F9] cursor-pointer"
+                      className="rounded-lg border border-[#E2E8F0] bg-[#F8FAFC] px-3 py-1.5 font-semibold text-[#0F172A] hover:bg-[#F1F5F9] disabled:opacity-50 cursor-pointer"
                     >
-                      <Plus className="h-3.5 w-3.5 inline" /> Add
+                      {creatingTag ? (
+                        <Loader2 className="h-3.5 w-3.5 inline animate-spin" />
+                      ) : (
+                        <>
+                          <Plus className="h-3.5 w-3.5 inline" /> Add
+                        </>
+                      )}
                     </button>
                   </div>
                 </div>
@@ -1039,7 +1136,7 @@ export function ContactsPage() {
                           className="w-full rounded-lg border border-[#E2E8F0] px-3 py-2"
                         />
                       </div>
-                      <div className="grid grid-cols-2 gap-2.5">
+                      <div className={supportsCityColumn ? 'grid grid-cols-2 gap-2.5' : ''}>
                         <div>
                           <label className="block font-semibold text-[#0F172A] mb-1">Company</label>
                           <input
@@ -1049,15 +1146,17 @@ export function ContactsPage() {
                             className="w-full rounded-lg border border-[#E2E8F0] px-3 py-2"
                           />
                         </div>
-                        <div>
-                          <label className="block font-semibold text-[#0F172A] mb-1">City</label>
-                          <input
-                            type="text"
-                            value={formCity}
-                            onChange={(e) => setFormCity(e.target.value)}
-                            className="w-full rounded-lg border border-[#E2E8F0] px-3 py-2"
-                          />
-                        </div>
+                        {supportsCityColumn && (
+                          <div>
+                            <label className="block font-semibold text-[#0F172A] mb-1">City</label>
+                            <input
+                              type="text"
+                              value={formCity}
+                              onChange={(e) => setFormCity(e.target.value)}
+                              className="w-full rounded-lg border border-[#E2E8F0] px-3 py-2"
+                            />
+                          </div>
+                        )}
                       </div>
                       <div>
                         <label className="block font-semibold text-[#0F172A] mb-1">Notes</label>
@@ -1119,10 +1218,17 @@ export function ContactsPage() {
                     </button>
                     <button
                       type="submit"
-                      disabled={Boolean(duplicateMatch)}
-                      className="rounded-lg bg-[#2563EB] px-4 py-2 font-semibold text-white hover:bg-[#1D4ED8] disabled:opacity-50 cursor-pointer"
+                      disabled={savingContact || Boolean(duplicateMatch)}
+                      className="inline-flex items-center gap-1.5 rounded-lg bg-[#2563EB] px-4 py-2 font-semibold text-white hover:bg-[#1D4ED8] disabled:opacity-50 cursor-pointer"
                     >
-                      {editingContact ? 'Save Changes' : 'Add Contact'}
+                      {savingContact && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+                      <span>
+                        {savingContact
+                          ? 'Saving...'
+                          : editingContact
+                          ? 'Save Changes'
+                          : 'Add Contact'}
+                      </span>
                     </button>
                   </div>
                 </div>
@@ -1131,8 +1237,14 @@ export function ContactsPage() {
               /* Bulk Upload Tab inside Right Drawer */
               <div className="flex-1 overflow-y-auto p-5 space-y-4 text-xs">
                 {importFeedback && (
-                  <div className="rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2.5 text-emerald-800 font-medium">
-                    {importFeedback}
+                  <div
+                    className={`rounded-lg border px-3 py-2.5 font-medium ${
+                      importFeedback.ok
+                        ? 'border-emerald-200 bg-emerald-50 text-emerald-800'
+                        : 'border-[#E11D48]/30 bg-rose-50 text-[#E11D48]'
+                    }`}
+                  >
+                    {importFeedback.text}
                   </div>
                 )}
 
@@ -1221,12 +1333,16 @@ export function ContactsPage() {
                   </button>
                   <button
                     type="button"
-                    disabled={csvPreviewRows.filter((r) => !r.error).length === 0}
+                    disabled={importingCsv || csvPreviewRows.filter((r) => !r.error).length === 0}
                     onClick={handleConfirmCsvImport}
                     className="inline-flex items-center gap-1.5 rounded-lg bg-[#2563EB] px-4 py-2 font-semibold text-white hover:bg-[#1D4ED8] disabled:opacity-50 cursor-pointer"
                   >
-                    <CheckSquare className="h-3.5 w-3.5" />
-                    <span>Import Valid Rows</span>
+                    {importingCsv ? (
+                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                    ) : (
+                      <CheckSquare className="h-3.5 w-3.5" />
+                    )}
+                    <span>{importingCsv ? 'Importing...' : 'Import Valid Rows'}</span>
                   </button>
                 </div>
               </div>
@@ -1239,7 +1355,7 @@ export function ContactsPage() {
       {deleteTarget && (
         <div
           className="fixed inset-0 z-50 bg-[#0F172A]/40 flex items-center justify-center p-4"
-          onClick={() => setDeleteTarget(null)}
+          onClick={() => !deletingContact && setDeleteTarget(null)}
         >
           <div
             className="w-full max-w-md rounded-xl border border-[#E2E8F0] bg-white p-5 shadow-luxury-hover"
@@ -1253,20 +1369,41 @@ export function ContactsPage() {
             <div className="mt-5 flex justify-end gap-2">
               <button
                 type="button"
+                disabled={deletingContact}
                 onClick={() => setDeleteTarget(null)}
-                className="rounded-lg border border-[#E2E8F0] px-3.5 py-2 text-xs font-semibold text-slate-700 cursor-pointer"
+                className="rounded-lg border border-[#E2E8F0] px-3.5 py-2 text-xs font-semibold text-slate-700 cursor-pointer disabled:opacity-50"
               >
                 Cancel
               </button>
               <button
                 type="button"
-                onClick={() => {
-                  deleteContact(deleteTarget.id);
-                  setDeleteTarget(null);
+                disabled={deletingContact}
+                onClick={async () => {
+                  const target = deleteTarget;
+                  if (!target) return;
+                  setDeletingContact(true);
+                  try {
+                    const res = await deleteContact(target.id);
+                    setDeleteTarget(null);
+                    if (!res.ok) {
+                      setActionBanner({
+                        ok: false,
+                        text: res.error ?? 'Could not delete contact in Supabase.',
+                      });
+                    } else {
+                      setActionBanner({
+                        ok: true,
+                        text: `Deleted ${target.fullName} (${target.phoneE164}).`,
+                      });
+                    }
+                  } finally {
+                    setDeletingContact(false);
+                  }
                 }}
-                className="rounded-lg bg-[#E11D48] px-3.5 py-2 text-xs font-semibold text-white hover:bg-rose-700 cursor-pointer"
+                className="inline-flex items-center gap-1.5 rounded-lg bg-[#E11D48] px-3.5 py-2 text-xs font-semibold text-white hover:bg-rose-700 disabled:opacity-50 cursor-pointer"
               >
-                Delete Contact
+                {deletingContact && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+                <span>{deletingContact ? 'Deleting...' : 'Delete Contact'}</span>
               </button>
             </div>
           </div>

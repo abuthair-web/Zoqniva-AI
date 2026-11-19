@@ -25,6 +25,7 @@ import {
 } from 'lucide-react';
 import { useApp } from '@/context/AppContext';
 import { formatPhoneDisplay, formatRelativeTime, getWindowStatus } from '@/lib/phone';
+import { tableHasConfirmedColumn } from '@/services/crmPersistenceService';
 import type { DeliveryStatus } from '@/types/crm';
 
 const COMMON_EMOJIS = ['👋', '✅', '📦', '🙏', '✨', '📄', '🕒', '💬'];
@@ -323,10 +324,12 @@ export function TeamInboxPage() {
     }
   };
 
-  const handleToggleOptIn = () => {
+  const supportsCityColumn = tableHasConfirmedColumn('contacts', 'city');
+
+  const handleToggleOptIn = async () => {
     if (!activeContact) return;
     const nextVal = !activeContact.marketingOptIn;
-    const res = updateContact(activeContact.id, { marketingOptIn: nextVal });
+    const res = await updateContact(activeContact.id, { marketingOptIn: nextVal });
     setDetailsFeedback(
       res.ok
         ? { ok: true, text: nextVal ? 'Marketing opt-in enabled.' : 'Marked as opted out.' }
@@ -334,13 +337,13 @@ export function TeamInboxPage() {
     );
   };
 
-  const handleSaveCustomDetails = (e: React.FormEvent) => {
+  const handleSaveCustomDetails = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!activeContact) return;
-    const res = updateContact(activeContact.id, {
+    const res = await updateContact(activeContact.id, {
       email: detailEmail.trim(),
       company: detailCompany.trim(),
-      city: detailCity.trim(),
+      ...(supportsCityColumn ? { city: detailCity.trim() } : {}),
     });
     if (res.ok) {
       setEditingDetails(false);
@@ -350,12 +353,12 @@ export function TeamInboxPage() {
     }
   };
 
-  const handleSaveContactNote = () => {
+  const handleSaveContactNote = async () => {
     if (!activeContact || !noteInput.trim()) return;
     const combined = activeContact.notes
       ? `${activeContact.notes}\n• ${noteInput.trim()}`
       : `• ${noteInput.trim()}`;
-    const res = updateContact(activeContact.id, { notes: combined });
+    const res = await updateContact(activeContact.id, { notes: combined });
     if (res.ok) {
       setNoteInput('');
       setDetailsFeedback({ ok: true, text: 'Comment added to contact.' });
@@ -364,26 +367,36 @@ export function TeamInboxPage() {
     }
   };
 
-  const toggleContactTag = (tagId: string) => {
+  const toggleContactTag = async (tagId: string) => {
     if (!activeContact) return;
     const exists = activeContact.tagIds.includes(tagId);
     const next = exists
       ? activeContact.tagIds.filter((t) => t !== tagId)
       : [...activeContact.tagIds, tagId];
-    const res = updateContact(activeContact.id, { tagIds: next });
+    const res = await updateContact(activeContact.id, { tagIds: next });
     if (!res.ok) {
       setDetailsFeedback({ ok: false, text: res.error || 'Could not update tags.' });
     }
   };
 
-  const handleAddInlineTag = () => {
+  const handleAddInlineTag = async () => {
     if (!activeContact || !newTagInput.trim()) return;
-    const created = createTag(newTagInput.trim(), '#2563EB');
-    if (!activeContact.tagIds.includes(created.id)) {
-      updateContact(activeContact.id, { tagIds: [...activeContact.tagIds, created.id] });
+    const tagRes = await createTag(newTagInput.trim(), '#2563EB');
+    if (!tagRes.ok || !tagRes.tag) {
+      setDetailsFeedback({ ok: false, text: tagRes.error || 'Could not create tag.' });
+      return;
+    }
+    if (!activeContact.tagIds.includes(tagRes.tag.id)) {
+      const updRes = await updateContact(activeContact.id, {
+        tagIds: [...activeContact.tagIds, tagRes.tag.id],
+      });
+      if (!updRes.ok) {
+        setDetailsFeedback({ ok: false, text: updRes.error || 'Tag created but could not be applied.' });
+        return;
+      }
     }
     setNewTagInput('');
-    setDetailsFeedback({ ok: true, text: `Tag "${created.name}" applied.` });
+    setDetailsFeedback({ ok: true, text: `Tag "${tagRes.tag.name}" applied.` });
   };
 
   const renderDeliveryIndicator = (status: DeliveryStatus) => {
@@ -1262,16 +1275,18 @@ export function TeamInboxPage() {
                       className="w-full rounded-lg border border-[#E2E8F0] px-2.5 py-1.5 text-xs"
                     />
                   </div>
-                  <div>
-                    <label className="block text-[11px] text-slate-500 mb-0.5">City</label>
-                    <input
-                      type="text"
-                      value={detailCity}
-                      onChange={(e) => setDetailCity(e.target.value)}
-                      placeholder="City"
-                      className="w-full rounded-lg border border-[#E2E8F0] px-2.5 py-1.5 text-xs"
-                    />
-                  </div>
+                  {supportsCityColumn && (
+                    <div>
+                      <label className="block text-[11px] text-slate-500 mb-0.5">City</label>
+                      <input
+                        type="text"
+                        value={detailCity}
+                        onChange={(e) => setDetailCity(e.target.value)}
+                        placeholder="City"
+                        className="w-full rounded-lg border border-[#E2E8F0] px-2.5 py-1.5 text-xs"
+                      />
+                    </div>
+                  )}
                   <button
                     type="submit"
                     className="w-full rounded-lg bg-[#2563EB] py-1.5 font-semibold text-white hover:bg-[#1D4ED8] cursor-pointer"
@@ -1295,10 +1310,12 @@ export function TeamInboxPage() {
                     <span className="text-slate-500">Company</span>
                     <span className="text-[#0F172A] truncate">{activeContact.company || '—'}</span>
                   </div>
-                  <div className="flex items-center justify-between gap-2">
-                    <span className="text-slate-500">City</span>
-                    <span className="text-[#0F172A] truncate">{activeContact.city || '—'}</span>
-                  </div>
+                  {supportsCityColumn && (
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-slate-500">City</span>
+                      <span className="text-[#0F172A] truncate">{activeContact.city || '—'}</span>
+                    </div>
+                  )}
                 </div>
               )}
             </div>
