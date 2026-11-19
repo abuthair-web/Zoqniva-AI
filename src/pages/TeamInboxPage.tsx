@@ -76,8 +76,13 @@ export function TeamInboxPage() {
   const [newChatSearch, setNewChatSearch] = useState('');
 
   const [sendError, setSendError] = useState<string | null>(null);
+  const [sendErrorCode, setSendErrorCode] = useState<string | null>(null);
   const [isSending, setIsSending] = useState(false);
   const [loadingOlder, setLoadingOlder] = useState(false);
+  const [startingChatContactId, setStartingChatContactId] = useState<string | null>(null);
+  const [newChatError, setNewChatError] = useState<string | null>(null);
+  const [updatingConversation, setUpdatingConversation] = useState(false);
+  const [conversationActionError, setConversationActionError] = useState<string | null>(null);
   const [mobileView, setMobileView] = useState<'list' | 'chat'>('list');
 
   // Desktop default open for 3-column commercial CRM feel when a conversation is active
@@ -169,6 +174,8 @@ export function TeamInboxPage() {
     }
     setDraftText(draftsByConvRef.current[convId] ?? '');
     setSendError(null);
+    setSendErrorCode(null);
+    setConversationActionError(null);
     setDetailsFeedback(null);
     setEditingDetails(false);
   }, [activeConversation?.id]);
@@ -230,19 +237,93 @@ export function TeamInboxPage() {
       .slice(0, 30);
   }, [contacts, newChatSearch]);
 
+  const assignableTeamMembers = useMemo(() => {
+    const active = teamMembers.filter((m) => m.status === 'active');
+    if (currentUser?.role === 'agent') {
+      return active.filter((m) => m.id === currentUser.id);
+    }
+    return active;
+  }, [teamMembers, currentUser]);
+
   const handleSelectConversation = (convId: string) => {
     setSelectedConversationId(convId);
-    markConversationRead(convId);
     setSendError(null);
+    setSendErrorCode(null);
+    setConversationActionError(null);
     setMobileView('chat');
+    void markConversationRead(convId);
   };
 
-  const handleStartChatWithContact = (contactId: string) => {
-    const convId = openOrCreateConversationForContact(contactId);
-    setNewChatModalOpen(false);
-    setNewChatSearch('');
-    setSelectedConversationId(convId);
-    setMobileView('chat');
+  const handleStartChatWithContact = async (contactId: string) => {
+    if (startingChatContactId) return;
+    setNewChatError(null);
+    setStartingChatContactId(contactId);
+
+    try {
+      const res = await openOrCreateConversationForContact(contactId);
+      if (!res.ok || !res.conversation) {
+        setNewChatError(res.error ?? 'Could not create conversation in Supabase.');
+        return;
+      }
+
+      setNewChatModalOpen(false);
+      setNewChatSearch('');
+      setNewChatError(null);
+      setSelectedConversationId(res.conversation.id);
+      setSendError(null);
+      setSendErrorCode(null);
+      setConversationActionError(null);
+      setMobileView('chat');
+    } finally {
+      setStartingChatContactId(null);
+    }
+  };
+
+  const handleAssignConversation = async (memberId: string | null) => {
+    if (!activeConversation || updatingConversation) return;
+    setConversationActionError(null);
+    setUpdatingConversation(true);
+    try {
+      const res = await assignConversation(activeConversation.id, memberId);
+      if (!res.ok) {
+        setConversationActionError(res.error ?? 'Could not update conversation assignment.');
+      }
+    } finally {
+      setUpdatingConversation(false);
+    }
+  };
+
+  const handleToggleStatus = async () => {
+    if (!activeConversation || updatingConversation) return;
+    setConversationActionError(null);
+    setUpdatingConversation(true);
+    try {
+      const nextStatus = activeConversation.status === 'resolved' ? 'open' : 'resolved';
+      const res = await updateConversationStatus(activeConversation.id, nextStatus);
+      if (!res.ok) {
+        setConversationActionError(res.error ?? 'Could not update conversation status.');
+      }
+    } finally {
+      setUpdatingConversation(false);
+    }
+  };
+
+  const handleToggleHandoff = async () => {
+    if (!activeConversation || updatingConversation) return;
+    setOverflowOpen(false);
+    setConversationActionError(null);
+    setUpdatingConversation(true);
+    try {
+      const res = await toggleHumanHandoff(
+        activeConversation.id,
+        !activeConversation.humanHandoffRequested
+      );
+      if (!res.ok) {
+        setConversationActionError(res.error ?? 'Could not update human handoff flag.');
+      }
+    } finally {
+      setUpdatingConversation(false);
+    }
   };
 
   const handleLoadOlder = async () => {
@@ -255,6 +336,7 @@ export function TeamInboxPage() {
   const submitCurrentMessage = async () => {
     if (!activeConversation || isSending || !draftText.trim()) return;
     setSendError(null);
+    setSendErrorCode(null);
     setIsSending(true);
 
     const msgType = composerMode === 'internal_note' ? 'internal_note' : 'text';
@@ -269,6 +351,7 @@ export function TeamInboxPage() {
 
       if (!res.ok) {
         setSendError(res.error ?? 'Could not send message.');
+        setSendErrorCode(res.code ?? null);
         return;
       }
 
@@ -298,23 +381,28 @@ export function TeamInboxPage() {
     const tpl = approvedTemplates.find((t) => t.id === selectedTemplateId);
     if (!tpl) return;
     setSendError(null);
+    setSendErrorCode(null);
     setIsSending(true);
 
     try {
-      const renderedBody = tpl.bodyText.replace(
-        /\{\{1\}\}/g,
-        activeContact?.fullName.split(' ')[0] ?? 'Customer'
-      );
+      const firstName = activeContact?.fullName.split(' ')[0] ?? 'Customer';
+      const hasSingleParam = tpl.variablesCount === 1;
+      const renderedBody = tpl.bodyText
+        ? tpl.bodyText.replace(/\{\{1\}\}/g, firstName)
+        : undefined;
 
       const res = await sendMessage({
         conversationId: activeConversation.id,
         body: renderedBody,
         messageType: 'template',
         templateName: tpl.name,
+        language: tpl.language,
+        templateParameters: hasSingleParam ? [firstName] : undefined,
       });
 
       if (!res.ok) {
         setSendError(res.error ?? 'Could not send template.');
+        setSendErrorCode(res.code ?? null);
       } else {
         setTemplateModalOpen(false);
         setSelectedTemplateId('');
@@ -780,35 +868,28 @@ export function TeamInboxPage() {
                   {/* Assigned Agent */}
                   <select
                     aria-label="Assign agent"
+                    disabled={updatingConversation}
                     value={activeConversation.assignedToId ?? ''}
-                    onChange={(e) =>
-                      assignConversation(activeConversation.id, e.target.value || null)
-                    }
-                    className="hidden sm:block rounded-lg border border-[#E2E8F0] bg-white px-2.5 py-1.5 text-xs font-medium text-[#0F172A] cursor-pointer"
+                    onChange={(e) => void handleAssignConversation(e.target.value || null)}
+                    className="hidden sm:block rounded-lg border border-[#E2E8F0] bg-white px-2.5 py-1.5 text-xs font-medium text-[#0F172A] cursor-pointer disabled:opacity-50"
                   >
                     <option value="">Unassigned</option>
-                    {teamMembers
-                      .filter((m) => m.status === 'active')
-                      .map((m) => (
-                        <option key={m.id} value={m.id}>
-                          {m.fullName}
-                          {lastAssignedMemberId === m.id && !activeConversation.assignedToId
-                            ? ' (Recent)'
-                            : ''}
-                        </option>
-                      ))}
+                    {assignableTeamMembers.map((m) => (
+                      <option key={m.id} value={m.id}>
+                        {m.fullName}
+                        {lastAssignedMemberId === m.id && !activeConversation.assignedToId
+                          ? ' (Recent)'
+                          : ''}
+                      </option>
+                    ))}
                   </select>
 
                   {/* Resolve / Reopen */}
                   <button
                     type="button"
-                    onClick={() =>
-                      updateConversationStatus(
-                        activeConversation.id,
-                        activeConversation.status === 'resolved' ? 'open' : 'resolved'
-                      )
-                    }
-                    className={`rounded-lg px-3 py-1.5 text-xs font-semibold whitespace-nowrap cursor-pointer transition-colors ${
+                    disabled={updatingConversation}
+                    onClick={() => void handleToggleStatus()}
+                    className={`rounded-lg px-3 py-1.5 text-xs font-semibold whitespace-nowrap cursor-pointer transition-colors disabled:opacity-50 ${
                       activeConversation.status === 'resolved'
                         ? 'border border-[#E2E8F0] bg-white text-[#0F172A] hover:bg-[#F1F5F9]'
                         : 'bg-[#2563EB] text-white hover:bg-[#1D4ED8]'
@@ -845,14 +926,9 @@ export function TeamInboxPage() {
                       <div className="absolute right-0 mt-1.5 w-52 rounded-xl border border-[#E2E8F0] bg-white shadow-luxury-hover z-30 p-1.5 text-xs">
                         <button
                           type="button"
-                          onClick={() => {
-                            toggleHumanHandoff(
-                              activeConversation.id,
-                              !activeConversation.humanHandoffRequested
-                            );
-                            setOverflowOpen(false);
-                          }}
-                          className="w-full text-left px-3 py-2 rounded-lg hover:bg-[#F1F5F9] flex items-center gap-2 cursor-pointer"
+                          disabled={updatingConversation}
+                          onClick={() => void handleToggleHandoff()}
+                          className="w-full text-left px-3 py-2 rounded-lg hover:bg-[#F1F5F9] flex items-center gap-2 cursor-pointer disabled:opacity-50"
                         >
                           <UserCheck className="h-3.5 w-3.5 text-[#2563EB]" />
                           <span>
@@ -883,6 +959,20 @@ export function TeamInboxPage() {
                   </div>
                 </div>
               </div>
+
+              {conversationActionError && (
+                <div className="bg-rose-50 border-b border-[#E11D48]/30 px-4 py-2 text-xs text-[#E11D48] flex items-center justify-between gap-2 shrink-0">
+                  <span>{conversationActionError}</span>
+                  <button
+                    type="button"
+                    onClick={() => setConversationActionError(null)}
+                    className="cursor-pointer shrink-0"
+                    aria-label="Dismiss conversation error"
+                  >
+                    <X className="h-3.5 w-3.5" />
+                  </button>
+                </div>
+              )}
 
               {/* Honest Connection / Test Mode Guardrails */}
               {business.metaConnectionState !== 'connected' ? (
@@ -1049,11 +1139,32 @@ export function TeamInboxPage() {
                 )}
 
                 {sendError && (
-                  <div className="mb-2 rounded-lg border border-[#E11D48]/30 bg-rose-50 px-3 py-2 text-xs text-[#E11D48] flex items-center justify-between">
-                    <span>{sendError}</span>
-                    <button type="button" onClick={() => setSendError(null)} className="cursor-pointer">
-                      <X className="h-3.5 w-3.5" />
-                    </button>
+                  <div className="mb-2 rounded-lg border border-[#E11D48]/30 bg-rose-50 px-3 py-2 text-xs text-[#E11D48] flex items-center justify-between gap-2">
+                    <span className="flex-1">{sendError}</span>
+                    <div className="flex items-center gap-2 shrink-0">
+                      {sendErrorCode === 'CONVERSATION_NOT_FOUND' && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setNewChatError(null);
+                            setNewChatModalOpen(true);
+                          }}
+                          className="rounded-md bg-[#2563EB] px-2.5 py-1 text-[11px] font-semibold text-white hover:bg-[#1D4ED8] cursor-pointer"
+                        >
+                          Start New Conversation
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setSendError(null);
+                          setSendErrorCode(null);
+                        }}
+                        className="cursor-pointer"
+                      >
+                        <X className="h-3.5 w-3.5" />
+                      </button>
+                    </div>
                   </div>
                 )}
 
@@ -1430,7 +1541,12 @@ export function TeamInboxPage() {
       {newChatModalOpen && (
         <div
           className="fixed inset-0 z-50 bg-[#0F172A]/40 flex items-center justify-center p-4"
-          onClick={() => setNewChatModalOpen(false)}
+          onClick={() => {
+            if (!startingChatContactId) {
+              setNewChatError(null);
+              setNewChatModalOpen(false);
+            }
+          }}
         >
           <div
             className="w-full max-w-md rounded-xl border border-[#E2E8F0] bg-white shadow-luxury-hover overflow-hidden"
@@ -1447,14 +1563,18 @@ export function TeamInboxPage() {
               </div>
               <button
                 type="button"
-                onClick={() => setNewChatModalOpen(false)}
-                className="p-1 text-slate-400 hover:text-[#0F172A] cursor-pointer"
+                disabled={Boolean(startingChatContactId)}
+                onClick={() => {
+                  setNewChatError(null);
+                  setNewChatModalOpen(false);
+                }}
+                className="p-1 text-slate-400 hover:text-[#0F172A] cursor-pointer disabled:opacity-50"
               >
                 <X className="h-4 w-4" />
               </button>
             </div>
 
-            <div className="p-3 border-b border-[#E2E8F0]">
+            <div className="p-3 border-b border-[#E2E8F0] space-y-2">
               <div className="relative">
                 <Search className="h-3.5 w-3.5 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
                 <input
@@ -1466,6 +1586,18 @@ export function TeamInboxPage() {
                   className="w-full rounded-lg border border-[#E2E8F0] bg-[#F8FAFC] pl-8 pr-3 py-2 text-xs focus:border-[#2563EB] focus:bg-white focus:outline-none"
                 />
               </div>
+              {newChatError && (
+                <div className="rounded-lg border border-[#E11D48]/30 bg-rose-50 px-3 py-2 text-xs text-[#E11D48] flex items-center justify-between gap-2">
+                  <span>{newChatError}</span>
+                  <button
+                    type="button"
+                    onClick={() => setNewChatError(null)}
+                    className="cursor-pointer shrink-0"
+                  >
+                    <X className="h-3.5 w-3.5" />
+                  </button>
+                </div>
+              )}
             </div>
 
             <div className="max-h-72 overflow-y-auto divide-y divide-[#E2E8F0]">
@@ -1475,6 +1607,7 @@ export function TeamInboxPage() {
                   <button
                     type="button"
                     onClick={() => {
+                      setNewChatError(null);
                       setNewChatModalOpen(false);
                       navigate('/app/contacts', { state: { openAdd: true } });
                     }}
@@ -1484,24 +1617,28 @@ export function TeamInboxPage() {
                   </button>
                 </div>
               ) : (
-                contactsForNewChat.map((ct) => (
-                  <button
-                    key={ct.id}
-                    type="button"
-                    onClick={() => handleStartChatWithContact(ct.id)}
-                    className="w-full text-left px-4 py-2.5 hover:bg-[#F1F5F9] flex items-center justify-between gap-3 cursor-pointer"
-                  >
-                    <div className="min-w-0">
-                      <p className="text-xs font-semibold text-[#0F172A] truncate">
-                        {ct.fullName}
-                      </p>
-                      <p className="text-[11px] font-mono text-slate-500">{ct.phoneE164}</p>
-                    </div>
-                    <span className="text-[11px] font-semibold text-[#2563EB] shrink-0">
-                      Open Chat
-                    </span>
-                  </button>
-                ))
+                contactsForNewChat.map((ct) => {
+                  const isCreatingThis = startingChatContactId === ct.id;
+                  return (
+                    <button
+                      key={ct.id}
+                      type="button"
+                      disabled={Boolean(startingChatContactId)}
+                      onClick={() => void handleStartChatWithContact(ct.id)}
+                      className="w-full text-left px-4 py-2.5 hover:bg-[#F1F5F9] flex items-center justify-between gap-3 cursor-pointer disabled:opacity-60"
+                    >
+                      <div className="min-w-0">
+                        <p className="text-xs font-semibold text-[#0F172A] truncate">
+                          {ct.fullName}
+                        </p>
+                        <p className="text-[11px] font-mono text-slate-500">{ct.phoneE164}</p>
+                      </div>
+                      <span className="text-[11px] font-semibold text-[#2563EB] shrink-0">
+                        {isCreatingThis ? 'Opening...' : 'Open Chat'}
+                      </span>
+                    </button>
+                  );
+                })
               )}
             </div>
           </div>

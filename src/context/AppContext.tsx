@@ -48,6 +48,14 @@ import {
   updateCampaignStatusInDb,
   updateContactInDb,
 } from '@/services/crmPersistenceService';
+import {
+  canUserAccessConversation,
+  mapDbConversationRow,
+  openOrCreateConversationInDb,
+  seedConversationColumnsFromRows,
+  updateConversationInDb,
+  verifyConversationInDb,
+} from '@/services/conversationPersistenceService';
 import type { User } from '@supabase/supabase-js';
 import type {
   AIAutomationLog,
@@ -160,19 +168,32 @@ interface AppContextValue {
   // Inbox Actions
   sendMessage: (params: {
     conversationId: string;
-    body: string;
+    body?: string;
     messageType: MessageType;
     templateName?: string;
+    language?: string;
+    templateParameters?: string[];
     mediaFilename?: string;
     clientRequestId?: string;
   }) => Promise<{ ok: boolean; error?: string; code?: string }>;
   retryFailedMessage: (messageId: string) => Promise<{ ok: boolean; error?: string }>;
   loadOlderMessages: (conversationId: string) => Promise<{ loaded: number; hasMore: boolean }>;
   hasMoreMessagesMap: Record<string, boolean>;
-  markConversationRead: (conversationId: string) => void;
-  assignConversation: (conversationId: string, memberId: string | null) => void;
-  updateConversationStatus: (conversationId: string, status: ConversationStatus) => void;
-  toggleHumanHandoff: (conversationId: string, requested: boolean) => void;
+  markConversationRead: (
+    conversationId: string
+  ) => Promise<{ ok: boolean; conversation?: Conversation; error?: string; code?: string }>;
+  assignConversation: (
+    conversationId: string,
+    memberId: string | null
+  ) => Promise<{ ok: boolean; conversation?: Conversation; error?: string; code?: string }>;
+  updateConversationStatus: (
+    conversationId: string,
+    status: ConversationStatus
+  ) => Promise<{ ok: boolean; conversation?: Conversation; error?: string; code?: string }>;
+  toggleHumanHandoff: (
+    conversationId: string,
+    requested: boolean
+  ) => Promise<{ ok: boolean; conversation?: Conversation; error?: string; code?: string }>;
 
   // Contacts Actions
   addContact: (input: {
@@ -207,7 +228,15 @@ interface AppContextValue {
     name: string,
     color: string
   ) => Promise<{ ok: boolean; tag?: Tag; error?: string }>;
-  openOrCreateConversationForContact: (contactId: string) => string;
+  openOrCreateConversationForContact: (
+    contactId: string
+  ) => Promise<{
+    ok: boolean;
+    conversation?: Conversation;
+    created?: boolean;
+    error?: string;
+    code?: string;
+  }>;
 
   // Broadcasts & Templates
   createCampaign: (input: {
@@ -386,6 +415,9 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   }, [conversations]);
 
   const currentUserIdRef = useRef<string | null>(null);
+  const currentUserRoleRef = useRef<StaffRole | null>(null);
+  const selectedConversationIdRef = useRef<string | null>(null);
+  const businessIdRef = useRef<string>('');
   const authStatusRef = useRef<AuthGateStatus>('loading');
   const resolvingUserPromiseRef = useRef<{ userId: string; promise: Promise<void> } | null>(null);
   const teamRefreshPromiseRef = useRef<Promise<void> | null>(null);
@@ -393,10 +425,56 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const teamDirectoryFailedKeyRef = useRef<string | null>(null);
   useEffect(() => {
     currentUserIdRef.current = currentUser?.id ?? null;
+    currentUserRoleRef.current = currentUser?.role ?? null;
   }, [currentUser]);
+  useEffect(() => {
+    selectedConversationIdRef.current = selectedConversationId;
+  }, [selectedConversationId]);
+  useEffect(() => {
+    businessIdRef.current = business.id;
+  }, [business.id]);
   useEffect(() => {
     authStatusRef.current = authStatus;
   }, [authStatus]);
+
+  const persistSelectedConversationHint = useCallback((bizId: string, convId: string | null) => {
+    if (!UUID_REGEX.test(bizId)) return;
+    const key = `zoqniva_selected_conv:${bizId}`;
+    try {
+      if (convId && UUID_REGEX.test(convId)) {
+        sessionStorage.setItem(key, convId);
+      } else {
+        sessionStorage.removeItem(key);
+      }
+    } catch {
+      // Ignore storage quota / privacy mode restrictions
+    }
+  }, []);
+
+  const handleSetSelectedConversationId = useCallback(
+    (id: string | null) => {
+      if (id !== null && !conversationsRef.current.some((c) => c.id === id)) {
+        setSelectedConversationId(null);
+        persistSelectedConversationHint(businessIdRef.current, null);
+        return;
+      }
+      setSelectedConversationId(id);
+      persistSelectedConversationHint(businessIdRef.current, id);
+    },
+    [persistSelectedConversationHint]
+  );
+
+  const removeStaleConversationFromState = useCallback(
+    (conversationId: string) => {
+      setConversations((prev) => prev.filter((c) => c.id !== conversationId));
+      setMessages((prev) => prev.filter((m) => m.conversationId !== conversationId));
+      if (selectedConversationIdRef.current === conversationId) {
+        setSelectedConversationId(null);
+        persistSelectedConversationHint(businessIdRef.current, null);
+      }
+    },
+    [persistSelectedConversationHint]
+  );
 
   const webhookCallbackUrl = useMemo(() => getWebhookCallbackUrl(), []);
 
@@ -537,6 +615,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           industry: String(bizData.industry ?? ''),
           timezone: String(bizData.timezone ?? 'UTC'),
           website: String(bizData.website ?? ''),
+          whatsappAccountId: waData?.id ? String(waData.id) : undefined,
           whatsappDisplayName: String(waData?.display_name ?? ''),
           whatsappPhoneE164: String(waData?.phone_number_e164 ?? waData?.phone_number ?? ''),
           metaPhoneNumberId: loadedPhoneId,
@@ -584,18 +663,12 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         }
       }
 
-      const convList: Conversation[] = (convsRes.data ?? []).map((c: Record<string, unknown>) => ({
-        id: String(c.id),
-        contactId: String(c.contact_id),
-        assignedToId: c.assigned_to ? String(c.assigned_to) : null,
-        status: (c.status as ConversationStatus) ?? 'open',
-        unreadCount: Number(c.unread_count ?? 0),
-        humanHandoffRequested: Boolean(c.human_handoff_requested),
-        lastCustomerMessageAt: String(c.last_customer_message_at ?? c.created_at ?? new Date().toISOString()),
-        windowExpiresAt: String(c.window_expires_at ?? new Date(0).toISOString()),
-        lastMessagePreview: String(c.last_message_preview ?? ''),
-        lastMessageAt: String(c.last_message_at ?? c.created_at ?? new Date().toISOString()),
-      }));
+      const rawConvRows = (convsRes.data ?? []) as Array<Record<string, unknown>>;
+      seedConversationColumnsFromRows(rawConvRows);
+      const effectiveRole: StaffRole = callerRole ?? 'agent';
+      const convList: Conversation[] = rawConvRows
+        .map((c) => mapDbConversationRow(c))
+        .filter((conv) => canUserAccessConversation(conv, { id: userId, role: effectiveRole }));
       setConversations(convList);
 
       const dirKey = `${businessId}:${userId}`;
@@ -638,13 +711,38 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
       const rawContactRows = (contactsRes.data ?? []) as Array<Record<string, unknown>>;
       seedTableColumnsFromRows('contacts', rawContactRows);
-      setContacts(
-        rawContactRows.map((c) => mapDbContactRow(c, tagMap.get(String(c.id)) ?? []))
+      const mappedContacts = rawContactRows.map((c) =>
+        mapDbContactRow(c, tagMap.get(String(c.id)) ?? [])
       );
+      setContacts(mappedContacts);
 
+      // Preserve selected conversation ONLY if it exists in Supabase and is accessible to this user
+      const authorizedConvIds = new Set(convList.map((cv) => cv.id));
+      const contactIds = new Set(mappedContacts.map((ct) => ct.id));
+      let savedHintId: string | null = null;
+      try {
+        savedHintId = sessionStorage.getItem(`zoqniva_selected_conv:${businessId}`);
+      } catch {
+        savedHintId = null;
+      }
+      const candidateSelectedId = selectedConversationIdRef.current ?? savedHintId;
+      const matchingSelectedConv = candidateSelectedId
+        ? convList.find((cv) => cv.id === candidateSelectedId && contactIds.has(cv.contactId))
+        : null;
+
+      if (matchingSelectedConv) {
+        setSelectedConversationId(matchingSelectedConv.id);
+        persistSelectedConversationHint(businessId, matchingSelectedConv.id);
+      } else {
+        setSelectedConversationId(null);
+        persistSelectedConversationHint(businessId, null);
+      }
+
+      // Only retain messages belonging to loaded authorized DB conversations (never synthesize artificial threads)
       const loadedMsgs = [...(msgsRes.data ?? [])]
         .reverse()
-        .map((m) => mapDbMessageRow(m as Record<string, unknown>, memberList));
+        .map((m) => mapDbMessageRow(m as Record<string, unknown>, memberList))
+        .filter((m) => authorizedConvIds.has(m.conversationId));
       setMessages(loadedMsgs);
 
       const hasMoreInitial: Record<string, boolean> = {};
@@ -1019,22 +1117,28 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           filter: `business_id=eq.${businessId}`,
         },
         (payload) => {
+          if (payload.eventType === 'DELETE') {
+            const oldRow = (payload.old as Record<string, unknown> | null) ?? null;
+            if (oldRow?.id) {
+              removeStaleConversationFromState(String(oldRow.id));
+            }
+            return;
+          }
           const c = (payload.new as Record<string, unknown> | null) ?? null;
-          if (!c) return;
-          const mappedConv: Conversation = {
-            id: String(c.id),
-            contactId: String(c.contact_id),
-            assignedToId: c.assigned_to ? String(c.assigned_to) : null,
-            status: (c.status as ConversationStatus) ?? 'open',
-            unreadCount: Number(c.unread_count ?? 0),
-            humanHandoffRequested: Boolean(c.human_handoff_requested),
-            lastCustomerMessageAt: String(
-              c.last_customer_message_at ?? c.created_at ?? new Date().toISOString()
-            ),
-            windowExpiresAt: String(c.window_expires_at ?? new Date(0).toISOString()),
-            lastMessagePreview: String(c.last_message_preview ?? ''),
-            lastMessageAt: String(c.last_message_at ?? c.created_at ?? new Date().toISOString()),
-          };
+          if (!c || !c.id) return;
+          seedConversationColumnsFromRows([c]);
+          const mappedConv = mapDbConversationRow(c);
+
+          const activeUid = currentUserIdRef.current;
+          const activeRole = currentUserRoleRef.current;
+          if (
+            activeUid &&
+            activeRole &&
+            !canUserAccessConversation(mappedConv, { id: activeUid, role: activeRole })
+          ) {
+            removeStaleConversationFromState(mappedConv.id);
+            return;
+          }
 
           setConversations((prev) => {
             const exists = prev.some((item) => item.id === mappedConv.id);
@@ -1332,54 +1436,103 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     body,
     messageType,
     templateName,
+    language,
+    templateParameters,
     mediaFilename,
     clientRequestId: providedRequestId,
   }) => {
-    const conv = conversations.find((c) => c.id === conversationId);
-    if (!conv) return { ok: false, error: 'Conversation not found.' };
-
-    const trimmed = body.trim();
-    if (!trimmed) return { ok: false, error: 'Message content cannot be empty.' };
-    if (trimmed.length > 4096) {
-      return { ok: false, error: 'WhatsApp messages cannot exceed 4,096 characters.' };
+    if (!UUID_REGEX.test(conversationId)) {
+      return {
+        ok: false,
+        code: 'INVALID_CONVERSATION_ID',
+        error:
+          'Selected conversation does not have a valid Supabase UUID. Reopen or start a new conversation with this contact before sending.',
+      };
     }
 
-    // Internal Team Note (written directly under strict RLS policy)
-    if (messageType === 'internal_note') {
-      const noteId = crypto.randomUUID();
-      const nowIso = new Date().toISOString();
-      const noteMsg: Message = {
-        id: noteId,
-        conversationId,
-        senderType: 'agent',
-        senderName: currentUser?.fullName ?? 'Agent',
-        senderId: currentUser?.id,
-        direction: 'internal',
-        messageType: 'internal_note',
-        body: trimmed,
-        deliveryStatus: 'internal',
-        createdAt: nowIso,
+    if (!supabase || !isSupabaseConfigured || !UUID_REGEX.test(business.id)) {
+      return {
+        ok: false,
+        code: 'SUPABASE_NOT_CONFIGURED',
+        error: 'Supabase workspace configuration is required to send messages.',
       };
-      setMessages((prev) => [...prev, noteMsg]);
+    }
 
-      if (supabase && isSupabaseConfigured && UUID_REGEX.test(business.id)) {
-        const { error: noteErr } = await supabase.from('messages').insert({
-          id: noteId,
+    const trimmed = typeof body === 'string' ? body.trim() : '';
+    if (messageType !== 'template') {
+      if (!trimmed) return { ok: false, code: 'EMPTY_MESSAGE', error: 'Message content cannot be empty.' };
+      if (trimmed.length > 4096) {
+        return {
+          ok: false,
+          code: 'MESSAGE_TOO_LONG',
+          error: 'WhatsApp messages cannot exceed 4,096 characters.',
+        };
+      }
+    } else if (!templateName?.trim()) {
+      return {
+        ok: false,
+        code: 'TEMPLATE_REQUIRED',
+        error: 'Select an approved WhatsApp template before sending.',
+      };
+    }
+
+    // Strictly verify the conversation exists in Supabase public.conversations BEFORE invoking Edge Functions or writing notes
+    const convVerify = await verifyConversationInDb({
+      businessId: business.id,
+      conversationId,
+      userId: currentUser?.id,
+      role: currentUser?.role,
+    });
+
+    if (!convVerify.ok || !convVerify.exists || !convVerify.conversation) {
+      if (!convVerify.exists) {
+        removeStaleConversationFromState(conversationId);
+      }
+      return {
+        ok: false,
+        code: convVerify.code ?? 'CONVERSATION_NOT_FOUND',
+        error:
+          convVerify.error ||
+          'This conversation does not exist in Supabase. Reopen or start a new conversation with this contact before sending.',
+      };
+    }
+
+    const verifiedConv = convVerify.conversation;
+    setConversations((prev) =>
+      prev.some((c) => c.id === verifiedConv.id)
+        ? prev.map((c) => (c.id === verifiedConv.id ? verifiedConv : c))
+        : [verifiedConv, ...prev]
+    );
+
+    // Internal Team Note (written directly under strict RLS policy; only added to UI after DB confirms)
+    if (messageType === 'internal_note') {
+      const { data: insertedNote, error: noteErr } = await supabase
+        .from('messages')
+        .insert({
           business_id: business.id,
-          conversation_id: conversationId,
+          conversation_id: verifiedConv.id,
           sender_type: 'agent',
           sender_profile_id: currentUser?.id ?? null,
           direction: 'internal',
           message_type: 'internal_note',
           body: trimmed,
           delivery_status: 'internal',
-          created_at: nowIso,
-        });
-        if (noteErr) {
-          setMessages((prev) => prev.filter((m) => m.id !== noteId));
-          return { ok: false, error: noteErr.message };
-        }
+        })
+        .select('*')
+        .single();
+
+      if (noteErr || !insertedNote) {
+        return {
+          ok: false,
+          code: noteErr?.code ?? 'INTERNAL_NOTE_FAILED',
+          error: noteErr?.message || 'Could not save internal note in Supabase.',
+        };
       }
+
+      const persistedNote = mapDbMessageRow(insertedNote as Record<string, unknown>, teamMembers);
+      setMessages((prev) =>
+        prev.some((m) => m.id === persistedNote.id) ? prev : [...prev, persistedNote]
+      );
       return { ok: true };
     }
 
@@ -1401,7 +1554,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       };
     }
 
-    const contact = contacts.find((c) => c.id === conv.contactId);
+    const contact = contacts.find((c) => c.id === verifiedConv.contactId);
     if (business.messagingMode === 'test' && contact) {
       const normalizedRecipient = normalizePhoneE164(contact.phoneE164);
       const allowed = business.testAllowlist
@@ -1417,7 +1570,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       }
     }
 
-    const windowState = getWindowStatus(conv.windowExpiresAt);
+    const windowState = getWindowStatus(verifiedConv.windowExpiresAt);
     if (messageType === 'text' && !windowState.isOpen) {
       return {
         ok: false,
@@ -1427,23 +1580,59 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       };
     }
 
-    if (!supabase || !isSupabaseConfigured) {
-      return { ok: false, error: 'Supabase configuration is required to send WhatsApp messages.' };
+    let tplObj: MessageTemplate | undefined;
+    if (messageType === 'template') {
+      const cleanTemplateName = templateName!.trim();
+      tplObj = templates.find(
+        (t) =>
+          t.name === cleanTemplateName &&
+          t.approvalStatus === 'APPROVED' &&
+          Boolean(t.metaTemplateId) &&
+          (!language || t.language.toLowerCase() === language.trim().toLowerCase())
+      );
+
+      if (!tplObj) {
+        return {
+          ok: false,
+          code: 'TEMPLATE_NOT_APPROVED',
+          error: `Template "${cleanTemplateName}" is not synced and approved in Meta. Sync templates before sending.`,
+        };
+      }
+
+      if (contact?.optedOutAt) {
+        return {
+          ok: false,
+          code: 'CONTACT_OPTED_OUT',
+          error: 'This customer has opted out of outbound WhatsApp template messages.',
+        };
+      }
+
+      if (tplObj.category === 'MARKETING' && contact && !contact.marketingOptIn) {
+        return {
+          ok: false,
+          code: 'CONTACT_OPTED_OUT',
+          error: 'This customer has not opted in to marketing template messages.',
+        };
+      }
     }
 
     const clientRequestId = providedRequestId || crypto.randomUUID();
     const optimisticId = `pending-${clientRequestId}`;
     const optimisticNow = new Date().toISOString();
+    const displayPreviewBody =
+      messageType === 'template'
+        ? trimmed || tplObj?.bodyText || `[WhatsApp Template: ${templateName}]`
+        : trimmed;
 
     const optimisticMsg: Message = {
       id: optimisticId,
-      conversationId,
+      conversationId: verifiedConv.id,
       senderType: 'agent',
       senderName: currentUser?.fullName ?? 'Agent',
       senderId: currentUser?.id,
       direction: 'outbound',
       messageType,
-      body: trimmed,
+      body: displayPreviewBody,
       templateName,
       mediaFilename,
       clientRequestId,
@@ -1453,16 +1642,13 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
     setMessages((prev) => [...prev, optimisticMsg]);
 
-    const tplObj = templateName
-      ? templates.find((t) => t.name === templateName && t.approvalStatus === 'APPROVED')
-      : undefined;
-
     const result = await invokeSendWhatsAppMessage({
-      conversationId,
+      conversationId: verifiedConv.id,
       messageType,
-      body: trimmed,
+      ...(messageType === 'text' ? { body: trimmed } : {}),
       templateName,
-      language: tplObj?.language ?? 'en_US',
+      language: language ?? tplObj?.language ?? 'en_US',
+      ...(templateParameters && templateParameters.length > 0 ? { templateParameters } : {}),
       clientRequestId,
     });
 
@@ -1475,7 +1661,6 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             ? authoritativeMsg
             : m
         );
-        // Deduplicate if Realtime inserted it concurrently
         const seen = new Set<string>();
         return replaced.filter((m) => {
           if (seen.has(m.id)) return false;
@@ -1484,6 +1669,15 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         });
       });
     } else if (!result.ok) {
+      if (result.errorCode === 'CONVERSATION_NOT_FOUND') {
+        removeStaleConversationFromState(verifiedConv.id);
+        return {
+          ok: false,
+          code: 'CONVERSATION_NOT_FOUND',
+          error:
+            'This conversation could not be found in Supabase. Reopen or start a new conversation with this contact before sending.',
+        };
+      }
       setMessages((prev) =>
         prev.map((m) =>
           m.id === optimisticId
@@ -1507,12 +1701,17 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       };
     }
 
+    const previewBody =
+      result.messageRow && typeof result.messageRow.body === 'string'
+        ? result.messageRow.body
+        : displayPreviewBody;
+
     setConversations((prev) =>
       prev.map((c) =>
-        c.id === conversationId
+        c.id === verifiedConv.id
           ? {
               ...c,
-              lastMessagePreview: trimmed.slice(0, 140),
+              lastMessagePreview: previewBody.slice(0, 140),
               lastMessageAt: optimisticNow,
               unreadCount: 0,
             }
@@ -1585,56 +1784,167 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     return { loaded: older.length, hasMore };
   };
 
-  const markConversationRead = (conversationId: string) => {
+  const markConversationRead: AppContextValue['markConversationRead'] = async (conversationId) => {
     const target = conversations.find((c) => c.id === conversationId);
-    setConversations((prev) =>
-      prev.map((c) => (c.id === conversationId ? { ...c, unreadCount: 0 } : c))
-    );
+    if (target && target.unreadCount === 0) {
+      return { ok: true, conversation: target };
+    }
+
+    if (!supabase || !isSupabaseConfigured || !UUID_REGEX.test(business.id)) {
+      return {
+        ok: false,
+        code: 'SUPABASE_NOT_CONFIGURED',
+        error: 'Supabase workspace configuration is required to update conversations.',
+      };
+    }
+
+    const dbRes = await updateConversationInDb({
+      businessId: business.id,
+      conversationId,
+      action: 'mark_read',
+    });
+
+    if (!dbRes.ok || !dbRes.conversation) {
+      if (dbRes.notFound) {
+        removeStaleConversationFromState(conversationId);
+      }
+      return {
+        ok: false,
+        code: dbRes.code,
+        error: dbRes.error || 'Could not mark conversation as read in Supabase.',
+      };
+    }
+
+    const persisted = dbRes.conversation;
+    setConversations((prev) => prev.map((c) => (c.id === persisted.id ? persisted : c)));
+    return { ok: true, conversation: persisted };
+  };
+
+  const assignConversation: AppContextValue['assignConversation'] = async (
+    conversationId,
+    memberId
+  ) => {
+    if (!supabase || !isSupabaseConfigured || !UUID_REGEX.test(business.id)) {
+      return {
+        ok: false,
+        code: 'SUPABASE_NOT_CONFIGURED',
+        error: 'Supabase workspace configuration is required to assign conversations.',
+      };
+    }
+
+    const dbRes = await updateConversationInDb({
+      businessId: business.id,
+      conversationId,
+      action: 'assign',
+      assignedToId: memberId,
+    });
+
+    if (!dbRes.ok || !dbRes.conversation) {
+      if (dbRes.notFound) {
+        removeStaleConversationFromState(conversationId);
+      }
+      return {
+        ok: false,
+        code: dbRes.code,
+        error: dbRes.error || 'Could not persist conversation assignment in Supabase.',
+      };
+    }
+
+    const persisted = dbRes.conversation;
+    if (persisted.assignedToId) setLastAssignedMemberId(persisted.assignedToId);
+
     if (
-      target &&
-      target.unreadCount > 0 &&
-      supabase &&
-      isSupabaseConfigured &&
-      UUID_REGEX.test(conversationId)
+      currentUser &&
+      !canUserAccessConversation(persisted, { id: currentUser.id, role: currentUser.role })
     ) {
-      void supabase.from('conversations').update({ unread_count: 0 }).eq('id', conversationId);
+      removeStaleConversationFromState(persisted.id);
+    } else {
+      setConversations((prev) => prev.map((c) => (c.id === persisted.id ? persisted : c)));
     }
+
+    const memberName =
+      teamMembers.find((m) => m.id === persisted.assignedToId)?.fullName ?? 'Unassigned';
+    appendAudit(
+      'Assigned Conversation',
+      'conversation',
+      `Assigned ${persisted.id} to ${memberName}`
+    );
+    return { ok: true, conversation: persisted };
   };
 
-  const assignConversation = (conversationId: string, memberId: string | null) => {
-    setConversations((prev) =>
-      prev.map((c) => (c.id === conversationId ? { ...c, assignedToId: memberId } : c))
-    );
-    if (memberId) setLastAssignedMemberId(memberId);
-    if (supabase && isSupabaseConfigured && UUID_REGEX.test(conversationId)) {
-      void supabase.from('conversations').update({ assigned_to: memberId }).eq('id', conversationId);
+  const updateConversationStatus: AppContextValue['updateConversationStatus'] = async (
+    conversationId,
+    status
+  ) => {
+    if (!supabase || !isSupabaseConfigured || !UUID_REGEX.test(business.id)) {
+      return {
+        ok: false,
+        code: 'SUPABASE_NOT_CONFIGURED',
+        error: 'Supabase workspace configuration is required to update conversation status.',
+      };
     }
-    const memberName = teamMembers.find((m) => m.id === memberId)?.fullName ?? 'Unassigned';
-    appendAudit('Assigned Conversation', 'conversation', `Assigned ${conversationId} to ${memberName}`);
+
+    const dbRes = await updateConversationInDb({
+      businessId: business.id,
+      conversationId,
+      action: 'status',
+      status,
+    });
+
+    if (!dbRes.ok || !dbRes.conversation) {
+      if (dbRes.notFound) {
+        removeStaleConversationFromState(conversationId);
+      }
+      return {
+        ok: false,
+        code: dbRes.code,
+        error: dbRes.error || 'Could not update conversation status in Supabase.',
+      };
+    }
+
+    const persisted = dbRes.conversation;
+    setConversations((prev) => prev.map((c) => (c.id === persisted.id ? persisted : c)));
+    appendAudit(
+      'Updated Conversation Status',
+      'conversation',
+      `Marked ${persisted.id} as ${persisted.status}`
+    );
+    return { ok: true, conversation: persisted };
   };
 
-  const updateConversationStatus = (conversationId: string, status: ConversationStatus) => {
-    setConversations((prev) =>
-      prev.map((c) => (c.id === conversationId ? { ...c, status } : c))
-    );
-    if (supabase && isSupabaseConfigured && UUID_REGEX.test(conversationId)) {
-      void supabase.from('conversations').update({ status }).eq('id', conversationId);
+  const toggleHumanHandoff: AppContextValue['toggleHumanHandoff'] = async (
+    conversationId,
+    requested
+  ) => {
+    if (!supabase || !isSupabaseConfigured || !UUID_REGEX.test(business.id)) {
+      return {
+        ok: false,
+        code: 'SUPABASE_NOT_CONFIGURED',
+        error: 'Supabase workspace configuration is required to update handoff state.',
+      };
     }
-    appendAudit('Updated Conversation Status', 'conversation', `Marked ${conversationId} as ${status}`);
-  };
 
-  const toggleHumanHandoff = (conversationId: string, requested: boolean) => {
-    setConversations((prev) =>
-      prev.map((c) =>
-        c.id === conversationId ? { ...c, humanHandoffRequested: requested } : c
-      )
-    );
-    if (supabase && isSupabaseConfigured && UUID_REGEX.test(conversationId)) {
-      void supabase
-        .from('conversations')
-        .update({ human_handoff_requested: requested })
-        .eq('id', conversationId);
+    const dbRes = await updateConversationInDb({
+      businessId: business.id,
+      conversationId,
+      action: 'handoff',
+      humanHandoffRequested: requested,
+    });
+
+    if (!dbRes.ok || !dbRes.conversation) {
+      if (dbRes.notFound) {
+        removeStaleConversationFromState(conversationId);
+      }
+      return {
+        ok: false,
+        code: dbRes.code,
+        error: dbRes.error || 'Could not update human handoff flag in Supabase.',
+      };
     }
+
+    const persisted = dbRes.conversation;
+    setConversations((prev) => prev.map((c) => (c.id === persisted.id ? persisted : c)));
+    return { ok: true, conversation: persisted };
   };
 
   // ============================================================================
@@ -1916,48 +2226,55 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     return { ok: true, tag };
   };
 
-  const openOrCreateConversationForContact = (contactId: string): string => {
-    const existing = conversations.find((c) => c.contactId === contactId);
-    if (existing) {
-      setSelectedConversationId(existing.id);
-      return existing.id;
-    }
-    const convId = crypto.randomUUID();
-    const nowIso = new Date().toISOString();
-    const created: Conversation = {
-      id: convId,
-      contactId,
-      assignedToId: currentUser?.id ?? null,
-      status: 'open',
-      unreadCount: 0,
-      humanHandoffRequested: false,
-      lastCustomerMessageAt: new Date(0).toISOString(),
-      windowExpiresAt: new Date(0).toISOString(),
-      lastMessagePreview: 'New conversation started — send an approved template to initiate.',
-      lastMessageAt: nowIso,
-    };
-    setConversations((prev) => [created, ...prev]);
-    setSelectedConversationId(created.id);
+  const openOrCreateConversationForContact: AppContextValue['openOrCreateConversationForContact'] =
+    async (contactId) => {
+      if (!supabase || !isSupabaseConfigured || !UUID_REGEX.test(business.id)) {
+        return {
+          ok: false,
+          code: 'SUPABASE_NOT_CONFIGURED',
+          error: 'Active Supabase workspace is required to create or open a conversation.',
+        };
+      }
 
-    if (
-      supabase &&
-      isSupabaseConfigured &&
-      UUID_REGEX.test(business.id) &&
-      UUID_REGEX.test(contactId)
-    ) {
-      void supabase.from('conversations').insert({
-        id: convId,
-        business_id: business.id,
-        contact_id: contactId,
-        assigned_to: currentUser?.id ?? null,
-        status: 'open',
-        unread_count: 0,
-        last_message_preview: created.lastMessagePreview,
-        last_message_at: nowIso,
+      const dbRes = await openOrCreateConversationInDb({
+        businessId: business.id,
+        contactId,
+        whatsappAccountId: business.whatsappAccountId ?? null,
+        assignToUserId: currentUser?.id ?? null,
       });
-    }
-    return created.id;
-  };
+
+      if (!dbRes.ok || !dbRes.conversation) {
+        return {
+          ok: false,
+          code: dbRes.code,
+          error: dbRes.error || 'Could not create or open conversation in Supabase.',
+        };
+      }
+
+      const persisted = dbRes.conversation;
+      setConversations((prev) => {
+        const exists = prev.some((c) => c.id === persisted.id);
+        return exists
+          ? prev.map((c) => (c.id === persisted.id ? persisted : c))
+          : [persisted, ...prev];
+      });
+      setSelectedConversationId(persisted.id);
+      persistSelectedConversationHint(business.id, persisted.id);
+
+      if (dbRes.created) {
+        appendAudit(
+          'Started Conversation',
+          'conversation',
+          `Created conversation ${persisted.id} for contact ${contactId}`
+        );
+      }
+
+      return {
+        ok: true,
+        conversation: persisted,
+        created: dbRes.created,
+      };
+    };
 
   // ============================================================================
   // BROADCASTS & TEMPLATES (Real Supabase persistence; saving a draft NEVER sends WhatsApp)
@@ -2788,7 +3105,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     webhookSecretsReady,
     totalUnreadCount,
     selectedConversationId,
-    setSelectedConversationId,
+    setSelectedConversationId: handleSetSelectedConversationId,
     dateRange,
     setDateRange,
     recentTemplateIds,

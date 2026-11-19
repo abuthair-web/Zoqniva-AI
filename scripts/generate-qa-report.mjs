@@ -75,6 +75,7 @@ function classifySuiteModule(filePath) {
   if (rel.includes('templates.test.ts')) return { module: 'Message Templates', table: 'public.templates' };
   if (rel.includes('crmPersistence.contacts.test.ts')) return { module: 'Contacts & Tags', table: 'public.contacts, public.tags, public.contact_tags' };
   if (rel.includes('crmPersistence.campaigns.test.ts')) return { module: 'Campaigns', table: 'public.campaigns' };
+  if (rel.includes('conversationPersistence.test.ts')) return { module: 'Team Inbox (Conversations)', table: 'public.conversations, public.messages' };
   if (rel.includes('whatsapp-send-template.test.ts')) return { module: 'WhatsApp Template Sending', table: 'public.templates, public.messages' };
   if (rel.includes('whatsapp.integration.test.ts')) return { module: 'WhatsApp Cloud API', table: 'public.whatsapp_accounts, public.messages, public.webhook_events' };
   if (rel.includes('static-security.test.ts')) return { module: 'Security & Schema', table: 'All public CRM tables & Edge Functions' };
@@ -311,15 +312,15 @@ const liveAndAuditedRows = [
     recommendedFix: 'Await `businesses` UPDATE with `.select().single()` verification and surface errors in Settings UI',
   },
   {
-    scope: 'audit_codebase',
-    module: 'Team Inbox (Conversations)',
-    feature: 'Assign conversation, resolve/reopen, mark read, human handoff, create conversation',
-    databaseTable: 'public.conversations',
-    testPerformed: 'Frontend-to-backend write trace in `src/context/AppContext.tsx` (lines 1588-1638, 1900-1940)',
-    result: 'FAILED',
-    error: 'Writes use unawaited `void supabase.from(\'conversations\')` without `.eq(\'business_id\', business.id)` or error rollback',
-    severity: 'Medium',
-    recommendedFix: 'Await conversation updates with explicit `business_id` filter and roll back optimistic UI state on DB error',
+    scope: 'live_staging_db',
+    module: 'Team Inbox (Conversations — Live DB)',
+    feature: 'Create, reload, assign, resolve/reopen, mark read, handoff & pre-send DB verification',
+    databaseTable: 'public.conversations, public.messages',
+    testPerformed: 'Fire-and-forget writes replaced with awaited Supabase persistence & verified locally against mocks (`tests/unit/conversationPersistence.test.ts`); live Supabase DB verification awaits deployment',
+    result: 'NOT TESTED',
+    error: 'Live Supabase database persistence has not yet been executed against the production/staging Supabase project',
+    severity: 'None',
+    recommendedFix: 'Deploy updated frontend to Vercel, open/create a Team Inbox conversation, verify row exists in public.conversations via SQL Editor, refresh page, and send an allowlisted approved template',
   },
   {
     scope: 'audit_codebase',

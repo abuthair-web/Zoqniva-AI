@@ -93,6 +93,7 @@ export function ContactsPage() {
   const [deletingContact, setDeletingContact] = useState(false);
   const [creatingTag, setCreatingTag] = useState(false);
   const [importingCsv, setImportingCsv] = useState(false);
+  const [openingChatContactId, setOpeningChatContactId] = useState<string | null>(null);
   const [actionBanner, setActionBanner] = useState<{ ok: boolean; text: string } | null>(null);
 
   // CSV Bulk Upload State
@@ -402,6 +403,34 @@ export function ContactsPage() {
     }
   };
 
+  const handleOpenChat = async (contactId: string, options?: { fromDrawer?: boolean }) => {
+    if (openingChatContactId) return;
+    setOpeningChatContactId(contactId);
+    if (options?.fromDrawer) {
+      setFormError(null);
+    }
+
+    try {
+      const res = await openOrCreateConversationForContact(contactId);
+      if (!res.ok || !res.conversation) {
+        const errMsg = res.error ?? 'Could not open or create conversation in Supabase.';
+        if (options?.fromDrawer) {
+          setFormError(errMsg);
+        } else {
+          setActionBanner({ ok: false, text: errMsg });
+        }
+        return;
+      }
+
+      if (options?.fromDrawer) {
+        setFormDrawerOpen(false);
+      }
+      navigate('/app/inbox');
+    } finally {
+      setOpeningChatContactId(null);
+    }
+  };
+
   const getInitials = (name: string) =>
     name
       .split(' ')
@@ -685,13 +714,11 @@ export function ContactsPage() {
                     <div className="flex items-center justify-end gap-3 pt-1">
                       <button
                         type="button"
-                        onClick={() => {
-                          openOrCreateConversationForContact(c.id);
-                          navigate('/app/inbox');
-                        }}
-                        className="font-semibold text-[#2563EB] cursor-pointer"
+                        disabled={Boolean(openingChatContactId)}
+                        onClick={() => void handleOpenChat(c.id)}
+                        className="font-semibold text-[#2563EB] cursor-pointer disabled:opacity-50"
                       >
-                        Message
+                        {openingChatContactId === c.id ? 'Opening...' : 'Message'}
                       </button>
                       <button
                         type="button"
@@ -844,14 +871,16 @@ export function ContactsPage() {
                             <div className="inline-flex items-center gap-1">
                               <button
                                 type="button"
-                                onClick={() => {
-                                  openOrCreateConversationForContact(c.id);
-                                  navigate('/app/inbox');
-                                }}
+                                disabled={Boolean(openingChatContactId)}
+                                onClick={() => void handleOpenChat(c.id)}
                                 title="Open in Inbox"
-                                className="p-1.5 rounded-md text-[#2563EB] hover:bg-[#EFF6FF] cursor-pointer"
+                                className="p-1.5 rounded-md text-[#2563EB] hover:bg-[#EFF6FF] cursor-pointer disabled:opacity-50"
                               >
-                                <MessageSquare className="h-3.5 w-3.5" />
+                                {openingChatContactId === c.id ? (
+                                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                                ) : (
+                                  <MessageSquare className="h-3.5 w-3.5" />
+                                )}
                               </button>
                               <button
                                 type="button"
@@ -1194,15 +1223,16 @@ export function ContactsPage() {
                   {editingContact ? (
                     <button
                       type="button"
-                      onClick={() => {
-                        openOrCreateConversationForContact(editingContact.id);
-                        setFormDrawerOpen(false);
-                        navigate('/app/inbox');
-                      }}
-                      className="inline-flex items-center gap-1.5 text-xs font-semibold text-[#2563EB] hover:underline cursor-pointer"
+                      disabled={Boolean(openingChatContactId)}
+                      onClick={() => void handleOpenChat(editingContact.id, { fromDrawer: true })}
+                      className="inline-flex items-center gap-1.5 text-xs font-semibold text-[#2563EB] hover:underline cursor-pointer disabled:opacity-50"
                     >
-                      <MessageSquare className="h-3.5 w-3.5" />
-                      Open Chat
+                      {openingChatContactId === editingContact.id ? (
+                        <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                      ) : (
+                        <MessageSquare className="h-3.5 w-3.5" />
+                      )}
+                      {openingChatContactId === editingContact.id ? 'Opening...' : 'Open Chat'}
                     </button>
                   ) : (
                     <span />

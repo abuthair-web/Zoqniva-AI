@@ -165,7 +165,7 @@ export interface SendMessageServiceResult {
 export async function invokeSendWhatsAppMessage(params: {
   conversationId: string;
   messageType: 'text' | 'template';
-  body: string;
+  body?: string;
   templateName?: string;
   language?: string;
   templateParameters?: string[];

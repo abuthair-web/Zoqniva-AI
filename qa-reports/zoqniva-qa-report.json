@@ -1,5 +1,5 @@
 {
-  "generatedAt": "2026-11-19T05:16:36.334Z",
+  "generatedAt": "2026-11-19T07:44:06.717Z",
   "environment": {
     "nodeVersion": "v22.23.2",
     "liveStagingDbConfigured": false,
@@ -7,8 +7,8 @@
   },
   "summary": {
     "localExecutedAutomatedTests": {
-      "total": 45,
-      "PASSED": 45,
+      "total": 57,
+      "PASSED": 57,
       "FAILED": 0,
       "BLOCKED": 0,
       "NOT_TESTED": 0,
@@ -25,17 +25,17 @@
     "liveAndAuditedChecks": {
       "total": 13,
       "PASSED": 0,
-      "FAILED": 6,
+      "FAILED": 5,
       "BLOCKED": 4,
-      "NOT_TESTED": 2,
+      "NOT_TESTED": 3,
       "NOT_IMPLEMENTED": 1
     },
     "overallMatrix": {
-      "total": 59,
-      "PASSED": 45,
-      "FAILED": 6,
+      "total": 71,
+      "PASSED": 57,
+      "FAILED": 5,
       "BLOCKED": 5,
-      "NOT_TESTED": 2,
+      "NOT_TESTED": 3,
       "NOT_IMPLEMENTED": 1
     }
   },
@@ -112,6 +112,138 @@
       "feature": "Static Security & Schema Regression Suite (CI-Safe)",
       "databaseTable": "All public CRM tables & Edge Functions",
       "testPerformed": "[Local/Mocked] keeps .env.example and .env.test.example free of real credentials",
+      "result": "PASSED",
+      "error": "None",
+      "severity": "None",
+      "recommendedFix": "None required"
+    },
+    {
+      "scope": "local_mocked_or_static",
+      "module": "Team Inbox (Conversations)",
+      "feature": "Team Inbox conversation persistence service (mocked Supabase — zero live WhatsApp calls)",
+      "databaseTable": "public.conversations, public.messages",
+      "testPerformed": "[Local/Mocked] 1. Create conversation persists in Supabase via INSERT + read-back without client-invented UUID or protected window columns",
+      "result": "PASSED",
+      "error": "None",
+      "severity": "None",
+      "recommendedFix": "None required"
+    },
+    {
+      "scope": "local_mocked_or_static",
+      "module": "Team Inbox (Conversations)",
+      "feature": "Team Inbox conversation persistence service (mocked Supabase — zero live WhatsApp calls)",
+      "databaseTable": "public.conversations, public.messages",
+      "testPerformed": "[Local/Mocked] 2. Page refresh / reload returns same persisted conversation UUID and clears stale selection / orphan messages",
+      "result": "PASSED",
+      "error": "None",
+      "severity": "None",
+      "recommendedFix": "None required"
+    },
+    {
+      "scope": "local_mocked_or_static",
+      "module": "Team Inbox (Conversations)",
+      "feature": "Team Inbox conversation persistence service (mocked Supabase — zero live WhatsApp calls)",
+      "databaseTable": "public.conversations, public.messages",
+      "testPerformed": "[Local/Mocked] 3. Selecting an existing contact reuses persisted conversation without duplicate creation, including concurrent clicks and 23505 race",
+      "result": "PASSED",
+      "error": "None",
+      "severity": "None",
+      "recommendedFix": "None required"
+    },
+    {
+      "scope": "local_mocked_or_static",
+      "module": "Team Inbox (Conversations)",
+      "feature": "Team Inbox conversation persistence service (mocked Supabase — zero live WhatsApp calls)",
+      "databaseTable": "public.conversations, public.messages",
+      "testPerformed": "[Local/Mocked] 4. Assigned staff (agent) accesses and updates their own assigned and unassigned conversations",
+      "result": "PASSED",
+      "error": "None",
+      "severity": "None",
+      "recommendedFix": "None required"
+    },
+    {
+      "scope": "local_mocked_or_static",
+      "module": "Team Inbox (Conversations)",
+      "feature": "Team Inbox conversation persistence service (mocked Supabase — zero live WhatsApp calls)",
+      "databaseTable": "public.conversations, public.messages",
+      "testPerformed": "[Local/Mocked] 5. Unauthorized staff (agent) is denied access to another agent conversation and denied reassigning to other staff",
+      "result": "PASSED",
+      "error": "None",
+      "severity": "None",
+      "recommendedFix": "None required"
+    },
+    {
+      "scope": "local_mocked_or_static",
+      "module": "Team Inbox (Conversations)",
+      "feature": "Team Inbox conversation persistence service (mocked Supabase — zero live WhatsApp calls)",
+      "databaseTable": "public.conversations, public.messages",
+      "testPerformed": "[Local/Mocked] 6. Cross-business contact and conversation access is denied",
+      "result": "PASSED",
+      "error": "None",
+      "severity": "None",
+      "recommendedFix": "None required"
+    },
+    {
+      "scope": "local_mocked_or_static",
+      "module": "Team Inbox (Conversations)",
+      "feature": "Team Inbox conversation persistence service (mocked Supabase — zero live WhatsApp calls)",
+      "databaseTable": "public.conversations, public.messages",
+      "testPerformed": "[Local/Mocked] 7. Failed INSERT returns explicit error without inventing a conversation ID",
+      "result": "PASSED",
+      "error": "None",
+      "severity": "None",
+      "recommendedFix": "None required"
+    },
+    {
+      "scope": "local_mocked_or_static",
+      "module": "Team Inbox (Conversations)",
+      "feature": "Team Inbox conversation persistence service (mocked Supabase — zero live WhatsApp calls)",
+      "databaseTable": "public.conversations, public.messages",
+      "testPerformed": "[Local/Mocked] 8. Assignment update persists to Supabase and rejects inactive assignees",
+      "result": "PASSED",
+      "error": "None",
+      "severity": "None",
+      "recommendedFix": "None required"
+    },
+    {
+      "scope": "local_mocked_or_static",
+      "module": "Team Inbox (Conversations)",
+      "feature": "Team Inbox conversation persistence service (mocked Supabase — zero live WhatsApp calls)",
+      "databaseTable": "public.conversations, public.messages",
+      "testPerformed": "[Local/Mocked] 9. Resolve and reopen conversation status persist in Supabase",
+      "result": "PASSED",
+      "error": "None",
+      "severity": "None",
+      "recommendedFix": "None required"
+    },
+    {
+      "scope": "local_mocked_or_static",
+      "module": "Team Inbox (Conversations)",
+      "feature": "Team Inbox conversation persistence service (mocked Supabase — zero live WhatsApp calls)",
+      "databaseTable": "public.conversations, public.messages",
+      "testPerformed": "[Local/Mocked] 10. Approved template send (hello_world) verifies real DB conversation UUID before invoking whatsapp-send-message",
+      "result": "PASSED",
+      "error": "None",
+      "severity": "None",
+      "recommendedFix": "None required"
+    },
+    {
+      "scope": "local_mocked_or_static",
+      "module": "Team Inbox (Conversations)",
+      "feature": "Team Inbox conversation persistence service (mocked Supabase — zero live WhatsApp calls)",
+      "databaseTable": "public.conversations, public.messages",
+      "testPerformed": "[Local/Mocked] 11. Fake / non-persisted conversation IDs fail verification and NEVER invoke whatsapp-send-message",
+      "result": "PASSED",
+      "error": "None",
+      "severity": "None",
+      "recommendedFix": "None required"
+    },
+    {
+      "scope": "local_mocked_or_static",
+      "module": "Team Inbox (Conversations)",
+      "feature": "Team Inbox conversation persistence service (mocked Supabase — zero live WhatsApp calls)",
+      "databaseTable": "public.conversations, public.messages",
+      "testPerformed": "[Local/Mocked] 12. Zero live WhatsApp network calls are made during any conversation persistence or send-preparation test",
       "result": "PASSED",
       "error": "None",
       "severity": "None",
@@ -668,15 +800,15 @@
       "recommendedFix": "Await `businesses` UPDATE with `.select().single()` verification and surface errors in Settings UI"
     },
     {
-      "scope": "audit_codebase",
-      "module": "Team Inbox (Conversations)",
-      "feature": "Assign conversation, resolve/reopen, mark read, human handoff, create conversation",
-      "databaseTable": "public.conversations",
-      "testPerformed": "Frontend-to-backend write trace in `src/context/AppContext.tsx` (lines 1588-1638, 1900-1940)",
-      "result": "FAILED",
-      "error": "Writes use unawaited `void supabase.from('conversations')` without `.eq('business_id', business.id)` or error rollback",
-      "severity": "Medium",
-      "recommendedFix": "Await conversation updates with explicit `business_id` filter and roll back optimistic UI state on DB error"
+      "scope": "live_staging_db",
+      "module": "Team Inbox (Conversations — Live DB)",
+      "feature": "Create, reload, assign, resolve/reopen, mark read, handoff & pre-send DB verification",
+      "databaseTable": "public.conversations, public.messages",
+      "testPerformed": "Fire-and-forget writes replaced with awaited Supabase persistence & verified locally against mocks (`tests/unit/conversationPersistence.test.ts`); live Supabase DB verification awaits deployment",
+      "result": "NOT TESTED",
+      "error": "Live Supabase database persistence has not yet been executed against the production/staging Supabase project",
+      "severity": "None",
+      "recommendedFix": "Deploy updated frontend to Vercel, open/create a Team Inbox conversation, verify row exists in public.conversations via SQL Editor, refresh page, and send an allowlisted approved template"
     },
     {
       "scope": "audit_codebase",

@@ -36,6 +36,7 @@ export interface BusinessProfile {
   industry: string;
   timezone: string;
   website: string;
+  whatsappAccountId?: string;
   whatsappDisplayName: string;
   whatsappPhoneE164: string;
   metaPhoneNumberId: string;
