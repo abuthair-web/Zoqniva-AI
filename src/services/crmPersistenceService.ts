@@ -981,9 +981,18 @@ export function normalizeCampaignStatus(raw: unknown): CampaignStatus {
 }
 
 export function mapDbCampaignRow(row: Record<string, unknown>): Campaign {
+  const audienceFilter =
+    row.audience_filter && typeof row.audience_filter === 'object' && !Array.isArray(row.audience_filter)
+      ? (row.audience_filter as Record<string, unknown>)
+      : null;
+
   const rawVars =
     row.variable_mapping && typeof row.variable_mapping === 'object' && !Array.isArray(row.variable_mapping)
       ? (row.variable_mapping as Record<string, unknown>)
+      : audienceFilter?.variable_mapping &&
+        typeof audienceFilter.variable_mapping === 'object' &&
+        !Array.isArray(audienceFilter.variable_mapping)
+      ? (audienceFilter.variable_mapping as Record<string, unknown>)
       : {};
   const variableMapping: Record<string, string> = {};
   for (const [k, v] of Object.entries(rawVars)) {
@@ -991,11 +1000,6 @@ export function mapDbCampaignRow(row: Record<string, unknown>): Campaign {
       variableMapping[k] = String(v);
     }
   }
-
-  const audienceFilter =
-    row.audience_filter && typeof row.audience_filter === 'object' && !Array.isArray(row.audience_filter)
-      ? (row.audience_filter as Record<string, unknown>)
-      : null;
 
   const targetTagIds = Array.isArray(row.target_tag_ids)
     ? row.target_tag_ids.map(String)
@@ -1167,10 +1171,17 @@ export function buildCampaignInsertPayload(
 
   // Only include non-standard columns if explicitly confirmed in live public.campaigns
   if (canWriteColumn('audience_filter', knownCols, missingCols, true)) {
+    const cleanVarMap: Record<string, string> = {};
+    for (const [k, v] of Object.entries(input.variableMapping ?? {})) {
+      if (typeof v === 'string' && v.trim().length > 0) {
+        cleanVarMap[k] = v.trim();
+      }
+    }
     payload.audience_filter = {
       mode: input.audienceMode ?? (validTagIds.length > 0 ? 'groups' : 'all'),
       tag_ids: validTagIds,
       contact_ids: validContactIds,
+      ...(Object.keys(cleanVarMap).length > 0 ? { variable_mapping: cleanVarMap } : {}),
     };
   }
   if (input.audienceMode && canWriteColumn('audience_mode', knownCols, missingCols, true)) {

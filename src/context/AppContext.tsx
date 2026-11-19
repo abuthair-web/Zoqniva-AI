@@ -56,6 +56,14 @@ import {
   updateConversationInDb,
   verifyConversationInDb,
 } from '@/services/conversationPersistenceService';
+import {
+  createEmptyGroupedExclusions,
+  evaluateAudienceRows,
+  runCampaignGuardianPreflight,
+  validateTemplateComponentsForCampaign,
+  type CampaignGuardianPreflightInput,
+  type CampaignGuardianReport,
+} from '@/services/campaignEngineService';
 import type { User } from '@supabase/supabase-js';
 import type {
   AIAutomationLog,
@@ -239,6 +247,9 @@ interface AppContextValue {
   }>;
 
   // Broadcasts & Templates
+  validateCampaignPreflight: (
+    input: Omit<CampaignGuardianPreflightInput, 'businessId'>
+  ) => Promise<CampaignGuardianReport>;
   createCampaign: (input: {
     name: string;
     templateId: string;
@@ -2279,10 +2290,139 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   // ============================================================================
   // BROADCASTS & TEMPLATES (Real Supabase persistence; saving a draft NEVER sends WhatsApp)
   // ============================================================================
+  const validateCampaignPreflight: AppContextValue['validateCampaignPreflight'] = useCallback(
+    async (input) => {
+      if (supabase && isSupabaseConfigured) {
+        return runCampaignGuardianPreflight({
+          ...input,
+          businessId: business.id,
+        });
+      }
+
+      // Local fallback only when Supabase client is not configured
+      const matched =
+        input.audienceFilter.mode === 'groups'
+          ? (input.audienceFilter.tagIds?.length ?? 0) === 0
+            ? []
+            : contacts.filter((c) =>
+                c.tagIds.some((tid) => (input.audienceFilter.tagIds ?? []).includes(tid))
+              )
+          : input.audienceFilter.mode === 'specific'
+          ? contacts.filter((c) => (input.audienceFilter.contactIds ?? []).includes(c.id))
+          : contacts;
+
+      const evaluated = evaluateAudienceRows({
+        mode: input.audienceFilter.mode,
+        matchedContacts: matched.map((c) => ({
+          id: c.id,
+          full_name: c.fullName,
+          phone_e164: c.phoneE164,
+          marketing_opt_in: c.marketingOptIn,
+          opt_in_status: c.marketingOptIn ? 'opted_in' : 'none',
+          opted_out_at: null,
+        })),
+      });
+
+      const tpl = templates.find((t) => t.id === input.templateId) ?? null;
+      const tplApproved = tpl?.approvalStatus === 'APPROVED' && Boolean(tpl?.metaTemplateId);
+      const paramCheck = tpl
+        ? validateTemplateComponentsForCampaign(tpl.components ?? [], input.variableMapping ?? {})
+        : null;
+
+      const blockingReasons: string[] = [];
+      if (currentUser?.role !== 'admin') {
+        blockingReasons.push('Only active workspace administrators can validate or prepare campaigns.');
+      }
+      if (!tpl || !tplApproved) {
+        blockingReasons.push('Select a Meta-approved synchronized WhatsApp template.');
+      }
+      if (paramCheck && !paramCheck.ok) {
+        blockingReasons.push(
+          paramCheck.missingVariables.length > 0
+            ? `Missing template parameters: ${paramCheck.missingVariables.map((v) => `{{${v}}}`).join(', ')}.`
+            : paramCheck.unsupportedReasons.join(' ')
+        );
+      }
+      if (evaluated.eligibleCount === 0) {
+        blockingReasons.push('No eligible opted-in contacts with valid E.164 numbers matched.');
+      }
+
+      const validatedAt = new Date().toISOString();
+      return {
+        ok: blockingReasons.length === 0,
+        canSaveDraft: Boolean(tpl) && currentUser?.role === 'admin',
+        canLaunchBulk: false,
+        phase1DispatchBlocked: true,
+        messagingMode: business.messagingMode,
+        whatsappConnected: business.metaConnectionState === 'connected',
+        whatsappAccountId: null,
+        testAllowlistCount: business.testAllowlist.length,
+        eligibleInTestAllowlist: 0,
+        eligibleOutsideTestAllowlist: evaluated.eligibleCount,
+        checks: [
+          {
+            code: 'active_admin',
+            label: 'Active Administrator',
+            status: currentUser?.role === 'admin' ? 'pass' : 'fail',
+            message:
+              currentUser?.role === 'admin'
+                ? 'Active administrator role confirmed.'
+                : 'Administrator role required.',
+          },
+          {
+            code: 'template_approval',
+            label: 'Approved Meta Template',
+            status: tplApproved ? 'pass' : 'fail',
+            message: tplApproved
+              ? `Approved template "${tpl?.name}" (${tpl?.language}).`
+              : 'Selected template is not Meta-approved.',
+          },
+          {
+            code: 'audience_eligibility',
+            label: 'Eligible Opted-In Audience',
+            status: evaluated.eligibleCount > 0 ? 'pass' : 'fail',
+            message: `${evaluated.eligibleCount} eligible, ${evaluated.excludedCount} excluded.`,
+          },
+          {
+            code: 'phase1_dispatch_guard',
+            label: 'Phase 1 Dispatch Guard',
+            status: 'warn',
+            message: 'Bulk sending is disabled in Phase 1. Campaigns can be validated and saved as drafts only.',
+          },
+        ],
+        blockingReasons,
+        warnings: [
+          business.messagingMode === 'test'
+            ? 'Test Mode is active — bulk campaign dispatch is disabled.'
+            : 'Phase 1 foundation — bulk dispatch is disabled; saving persists a draft only.',
+        ],
+        templateSummary: tpl
+          ? {
+              id: tpl.id,
+              name: tpl.name,
+              language: tpl.language,
+              category: tpl.category,
+              status: tpl.approvalStatus.toLowerCase(),
+              metaTemplateId: tpl.metaTemplateId ?? null,
+              requiredVariables: paramCheck?.requiredBodyVariables ?? [],
+            }
+          : null,
+        audience: {
+          ...evaluated,
+          groupedExclusions: evaluated.groupedExclusions ?? createEmptyGroupedExclusions(),
+        },
+        validatedAt,
+        source: 'supabase_db',
+      };
+    },
+    [business.id, business.messagingMode, business.metaConnectionState, business.testAllowlist.length, contacts, currentUser?.role, templates]
+  );
+
   const createCampaign: AppContextValue['createCampaign'] = async (input) => {
     const isMetaLive =
       business.metaConnectionState === 'connected' && business.messagingMode === 'live';
-    // Never mark a draft as running or trigger any WhatsApp dispatch from campaign creation
+    // Phase 1 safety: never mark a campaign as running or trigger any WhatsApp dispatch.
+    // In Test Mode or when Meta is disconnected, always persist strictly as 'draft'.
     const nextStatus: Campaign['status'] =
       input.scheduleMode === 'draft' || !isMetaLive
         ? 'draft'
@@ -3127,6 +3267,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     importContactsBatch,
     createTag,
     openOrCreateConversationForContact,
+    validateCampaignPreflight,
     createCampaign,
     duplicateCampaign,
     updateCampaignStatus,

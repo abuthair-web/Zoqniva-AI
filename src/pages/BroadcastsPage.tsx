@@ -1,7 +1,8 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useLocation } from 'react-router-dom';
 import {
   AlertCircle,
+  AlertTriangle,
   ArrowLeft,
   ArrowRight,
   BarChart2,
@@ -16,11 +17,19 @@ import {
   Pause,
   Play,
   Plus,
+  RefreshCw,
   Search,
+  ShieldAlert,
+  ShieldCheck,
   Users,
   X,
 } from 'lucide-react';
 import { useApp } from '@/context/AppContext';
+import {
+  EXCLUSION_REASON_LABELS,
+  type CampaignExclusionReason,
+  type CampaignGuardianReport,
+} from '@/services/campaignEngineService';
 import type { Campaign, CampaignStatus, TemplateCategory } from '@/types/crm';
 
 const DRAFT_STORAGE_KEY = 'zoqniva_broadcast_composer_draft';
@@ -49,6 +58,7 @@ export function BroadcastsPage() {
     tags,
     contacts,
     recentTemplateIds,
+    validateCampaignPreflight,
     createCampaign,
     duplicateCampaign,
     updateCampaignStatus,
@@ -57,7 +67,18 @@ export function BroadcastsPage() {
   const location = useLocation();
   const isAdmin = currentUser?.role === 'admin';
 
-  const [viewMode, setViewMode] = useState<'list' | 'compose'>('list');
+  const savedDraft = useMemo(() => {
+    try {
+      const raw = localStorage.getItem(DRAFT_STORAGE_KEY);
+      return raw ? JSON.parse(raw) : null;
+    } catch {
+      return null;
+    }
+  }, []);
+
+  const [viewMode, setViewMode] = useState<'list' | 'compose'>(
+    savedDraft?.inCompose === true && isAdmin ? 'compose' : 'list'
+  );
   const [statusFilter, setStatusFilter] = useState<'all' | CampaignStatus>('all');
   const [sortBy, setSortBy] = useState<'newest' | 'name' | 'audience'>('newest');
   const [searchCampaign, setSearchCampaign] = useState('');
@@ -79,15 +100,6 @@ export function BroadcastsPage() {
       return aIdx - bIdx;
     });
   }, [templates, recentTemplateIds]);
-
-  const savedDraft = useMemo(() => {
-    try {
-      const raw = localStorage.getItem(DRAFT_STORAGE_KEY);
-      return raw ? JSON.parse(raw) : null;
-    } catch {
-      return null;
-    }
-  }, []);
 
   // Stage 1: Choose Template -> Stage 2: Choose Audience -> Stage 3: Review & Schedule
   const [wizardStage, setWizardStage] = useState<WizardStage>(
@@ -122,6 +134,12 @@ export function BroadcastsPage() {
   const [consentConfirmed, setConsentConfirmed] = useState(false);
   const [submitting, setSubmitting] = useState(false);
 
+  // Campaign Guardian & DB-backed Audience Validation state (Phase 1)
+  const [guardianReport, setGuardianReport] = useState<CampaignGuardianReport | null>(null);
+  const [validatingPreflight, setValidatingPreflight] = useState(false);
+  const [preflightError, setPreflightError] = useState<string | null>(null);
+  const validationSeqRef = useRef(0);
+
   useEffect(() => {
     const state = location.state as { openWizard?: boolean } | null;
     if (state?.openWizard && isAdmin) {
@@ -132,20 +150,25 @@ export function BroadcastsPage() {
 
   useEffect(() => {
     if (viewMode === 'compose') {
-      localStorage.setItem(
-        DRAFT_STORAGE_KEY,
-        JSON.stringify({
-          wizardStage,
-          audienceMode,
-          selectedTagIds,
-          selectedContactIds,
-          selectedTemplateId,
-          varMapping,
-          scheduleMode,
-          scheduledFor,
-          customName,
-        })
-      );
+      try {
+        localStorage.setItem(
+          DRAFT_STORAGE_KEY,
+          JSON.stringify({
+            inCompose: true,
+            wizardStage,
+            audienceMode,
+            selectedTagIds,
+            selectedContactIds,
+            selectedTemplateId,
+            varMapping,
+            scheduleMode,
+            scheduledFor,
+            customName,
+          })
+        );
+      } catch {
+        // Ignore storage quota issues
+      }
     }
   }, [
     viewMode,
@@ -199,6 +222,102 @@ export function BroadcastsPage() {
       invalidPhoneCount,
     };
   }, [contacts, audienceMode, selectedTagIds, selectedContactIds]);
+
+  const runDbPreflight = useCallback(async () => {
+    if (!selectedTemplate?.id) {
+      setGuardianReport(null);
+      setPreflightError(null);
+      return;
+    }
+
+    const seq = ++validationSeqRef.current;
+    setValidatingPreflight(true);
+    setPreflightError(null);
+
+    try {
+      const report = await validateCampaignPreflight({
+        templateId: selectedTemplate.id,
+        audienceFilter: {
+          mode: audienceMode,
+          tagIds: audienceMode === 'groups' ? selectedTagIds : [],
+          contactIds: audienceMode === 'specific' ? selectedContactIds : [],
+        },
+        variableMapping: varMapping,
+        scheduleMode: wizardStage === 3 ? scheduleMode : 'draft',
+        scheduledAt:
+          wizardStage === 3 && scheduleMode === 'scheduled' && scheduledFor
+            ? (() => {
+                const dt = new Date(scheduledFor);
+                return Number.isNaN(dt.getTime()) ? scheduledFor : dt.toISOString();
+              })()
+            : null,
+      });
+
+      if (seq !== validationSeqRef.current) return;
+      setGuardianReport(report);
+      if (report.error) {
+        setPreflightError(report.error);
+      }
+    } catch (err) {
+      if (seq !== validationSeqRef.current) return;
+      setPreflightError(
+        err instanceof Error
+          ? err.message
+          : 'Could not validate campaign audience and preflight rules.'
+      );
+    } finally {
+      if (seq === validationSeqRef.current) {
+        setValidatingPreflight(false);
+      }
+    }
+  }, [
+    selectedTemplate?.id,
+    validateCampaignPreflight,
+    audienceMode,
+    selectedTagIds,
+    selectedContactIds,
+    varMapping,
+    wizardStage,
+    scheduleMode,
+    scheduledFor,
+  ]);
+
+  // Automatically re-validate from Supabase whenever Stage 2 or Stage 3 is active or refreshed
+  useEffect(() => {
+    if (viewMode !== 'compose' || (wizardStage !== 2 && wizardStage !== 3)) return;
+    if (!selectedTemplate?.id) return;
+
+    const timer = window.setTimeout(() => {
+      void runDbPreflight();
+    }, 160);
+
+    return () => window.clearTimeout(timer);
+  }, [viewMode, wizardStage, selectedTemplate?.id, runDbPreflight]);
+
+  const effectiveAudience = useMemo(() => {
+    if (guardianReport?.audience?.ok) {
+      return {
+        selectedCount: guardianReport.audience.totalMatched,
+        eligibleCount: guardianReport.audience.eligibleCount,
+        skippedCount: guardianReport.audience.excludedCount,
+        groupedExclusions: guardianReport.audience.groupedExclusions,
+        verifiedFromDb: true,
+      };
+    }
+    return {
+      selectedCount: audienceStats.selectedCount,
+      eligibleCount: audienceStats.eligibleCount,
+      skippedCount: audienceStats.skippedCount,
+      groupedExclusions: {
+        opted_out: 0,
+        no_explicit_consent: audienceStats.optedOutCount,
+        invalid_phone: audienceStats.invalidPhoneCount,
+        duplicate_phone: 0,
+        contact_not_in_business: 0,
+      } as Record<CampaignExclusionReason, number>,
+      verifiedFromDb: false,
+    };
+  }, [guardianReport, audienceStats]);
 
   const autoCampaignName = useMemo(() => {
     const groupPart =
@@ -271,21 +390,62 @@ export function BroadcastsPage() {
     setViewMode('compose');
   };
 
+  const handleExitComposer = () => {
+    try {
+      const raw = localStorage.getItem(DRAFT_STORAGE_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        localStorage.setItem(DRAFT_STORAGE_KEY, JSON.stringify({ ...parsed, inCompose: false }));
+      }
+    } catch {
+      // ignore
+    }
+    setViewMode('list');
+  };
+
   const dispatchDisabledReason =
     business.messagingMode === 'test'
-      ? 'Test Mode is active — bulk campaign dispatch is disabled. Confirming saves this campaign as a draft.'
+      ? 'Test Mode is active — bulk campaign dispatch is disabled. Confirming saves this campaign as a draft without sending any WhatsApp messages.'
       : business.metaConnectionState !== 'connected'
       ? 'WhatsApp is not connected — confirming saves this campaign as a draft only.'
-      : null;
+      : 'Phase 1 Campaign Foundation — bulk campaign dispatch is disabled. Confirming saves a validated campaign draft in Supabase without sending any WhatsApp messages.';
 
   const handleSubmitBroadcast = async (asDraft: boolean) => {
     if (submitting || !selectedTemplate) return;
-    if (!asDraft && (!consentConfirmed || audienceStats.eligibleCount === 0)) return;
+    if (!asDraft && (!consentConfirmed || effectiveAudience.eligibleCount === 0)) return;
 
     setComposeError(null);
     setSubmitting(true);
 
     try {
+      // Run fresh DB-backed Campaign Guardian preflight before confirming Stage 3
+      if (!asDraft) {
+        const latestReport = await validateCampaignPreflight({
+          templateId: selectedTemplate.id,
+          audienceFilter: {
+            mode: audienceMode,
+            tagIds: audienceMode === 'groups' ? selectedTagIds : [],
+            contactIds: audienceMode === 'specific' ? selectedContactIds : [],
+          },
+          variableMapping: varMapping,
+          scheduleMode,
+          scheduledAt:
+            scheduleMode === 'scheduled' && scheduledFor
+              ? (() => {
+                  const dt = new Date(scheduledFor);
+                  return Number.isNaN(dt.getTime()) ? scheduledFor : dt.toISOString();
+                })()
+              : null,
+        });
+        setGuardianReport(latestReport);
+
+        if (!latestReport.ok && latestReport.blockingReasons.length > 0) {
+          // Surface blocking Guardian failures clearly without deleting any form data
+          setComposeError(latestReport.blockingReasons.join(' '));
+          return;
+        }
+      }
+
       const res = await createCampaign({
         name: customName.trim() || autoCampaignName,
         templateId: selectedTemplate.id,
@@ -298,9 +458,9 @@ export function BroadcastsPage() {
           !asDraft && scheduleMode === 'scheduled'
             ? new Date(scheduledFor).toISOString()
             : undefined,
-        selectedCount: audienceStats.selectedCount,
-        eligibleCount: audienceStats.eligibleCount,
-        skippedCount: audienceStats.skippedCount,
+        selectedCount: effectiveAudience.selectedCount,
+        eligibleCount: effectiveAudience.eligibleCount,
+        skippedCount: effectiveAudience.skippedCount,
       });
 
       if (!res.ok || !res.campaign) {
@@ -378,7 +538,9 @@ export function BroadcastsPage() {
       {
         num: 2,
         title: 'Choose Audience',
-        subtitle: `${audienceStats.eligibleCount} eligible contact${audienceStats.eligibleCount === 1 ? '' : 's'}`,
+        subtitle: `${effectiveAudience.eligibleCount} eligible contact${
+          effectiveAudience.eligibleCount === 1 ? '' : 's'
+        }`,
         icon: Users,
       },
       {
@@ -390,7 +552,7 @@ export function BroadcastsPage() {
     ];
 
     const canAccessStage2 = Boolean(selectedTemplate);
-    const canAccessStage3 = Boolean(selectedTemplate) && audienceStats.eligibleCount > 0;
+    const canAccessStage3 = Boolean(selectedTemplate) && effectiveAudience.eligibleCount > 0;
 
     return (
       <div className="p-4 sm:p-6 pb-20 lg:pb-8 max-w-[1440px] mx-auto space-y-5">
@@ -399,7 +561,7 @@ export function BroadcastsPage() {
           <div className="flex items-center gap-3">
             <button
               type="button"
-              onClick={() => setViewMode('list')}
+              onClick={handleExitComposer}
               className="inline-flex items-center gap-1.5 rounded-lg border border-[#E2E8F0] bg-white px-3 py-2 text-xs font-semibold text-[#0F172A] hover:bg-[#F1F5F9] cursor-pointer"
             >
               <ArrowLeft className="h-3.5 w-3.5" />
@@ -751,39 +913,120 @@ export function BroadcastsPage() {
                   </div>
                 )}
 
-                {/* Audience Eligibility Summary */}
-                <div className="rounded-lg border border-[#E2E8F0] bg-[#F8FAFC] p-4 flex flex-wrap items-center justify-between gap-3">
-                  <div>
-                    <p className="text-xs text-slate-500">Eligible Opted-In Recipients</p>
-                    <p className="font-display text-2xl font-bold text-[#2563EB] tabular-nums">
-                      {audienceStats.eligibleCount}
-                    </p>
-                  </div>
+                {/* Audience Eligibility Summary (Database-Verified) */}
+                <div className="rounded-lg border border-[#E2E8F0] bg-[#F8FAFC] p-4 space-y-3">
+                  <div className="flex flex-wrap items-center justify-between gap-3">
+                    <div>
+                      <div className="flex items-center gap-2">
+                        <p className="text-xs text-slate-500">Eligible Opted-In Recipients</p>
+                        {validatingPreflight ? (
+                          <span className="inline-flex items-center gap-1 text-[11px] font-medium text-[#2563EB]">
+                            <Loader2 className="h-3 w-3 animate-spin" />
+                            Validating from database...
+                          </span>
+                        ) : effectiveAudience.verifiedFromDb ? (
+                          <span className="inline-flex items-center gap-1 text-[11px] font-semibold text-emerald-700">
+                            <CheckCircle2 className="h-3 w-3" />
+                            Verified from Supabase
+                          </span>
+                        ) : null}
+                      </div>
+                      <div className="flex items-baseline gap-2.5 mt-0.5">
+                        <p className="font-display text-2xl font-bold text-[#2563EB] tabular-nums">
+                          {effectiveAudience.eligibleCount}
+                        </p>
+                        <span className="text-xs text-slate-500 tabular-nums">
+                          of {effectiveAudience.selectedCount} matched
+                        </span>
+                      </div>
+                    </div>
 
-                  {audienceStats.skippedCount > 0 && (
-                    <div className="text-right text-xs">
+                    <div className="flex items-center gap-3">
                       <button
                         type="button"
-                        onClick={() => setShowExcludedDetails((v) => !v)}
-                        className="font-semibold text-slate-600 hover:text-[#0F172A] inline-flex items-center gap-1 cursor-pointer"
+                        onClick={() => void runDbPreflight()}
+                        disabled={validatingPreflight}
+                        className="inline-flex items-center gap-1.5 rounded-lg border border-[#E2E8F0] bg-white px-2.5 py-1.5 text-[11px] font-semibold text-[#0F172A] hover:bg-[#F1F5F9] disabled:opacity-50 cursor-pointer"
                       >
-                        <span className="tabular-nums">
-                          {audienceStats.skippedCount} automatically excluded
-                        </span>
-                        <ChevronDown
-                          className={`h-3.5 w-3.5 transition-transform ${
-                            showExcludedDetails ? 'rotate-180' : ''
-                          }`}
+                        <RefreshCw
+                          className={`h-3 w-3 ${validatingPreflight ? 'animate-spin' : ''}`}
                         />
+                        <span>Re-validate</span>
                       </button>
-                      {showExcludedDetails && (
-                        <p className="text-[11px] text-slate-500 mt-1 tabular-nums">
-                          {audienceStats.optedOutCount} not opted in ·{' '}
-                          {audienceStats.invalidPhoneCount} invalid phone
-                        </p>
+
+                      {effectiveAudience.skippedCount > 0 && (
+                        <button
+                          type="button"
+                          onClick={() => setShowExcludedDetails((v) => !v)}
+                          className="text-xs font-semibold text-slate-600 hover:text-[#0F172A] inline-flex items-center gap-1 cursor-pointer"
+                        >
+                          <span className="tabular-nums">
+                            {effectiveAudience.skippedCount} automatically excluded
+                          </span>
+                          <ChevronDown
+                            className={`h-3.5 w-3.5 transition-transform ${
+                              showExcludedDetails ? 'rotate-180' : ''
+                            }`}
+                          />
+                        </button>
                       )}
                     </div>
+                  </div>
+
+                  {showExcludedDetails && effectiveAudience.skippedCount > 0 && (
+                    <div className="pt-2.5 border-t border-[#E2E8F0] grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2 text-[11px]">
+                      {(
+                        Object.entries(effectiveAudience.groupedExclusions) as Array<
+                          [CampaignExclusionReason, number]
+                        >
+                      )
+                        .filter(([, count]) => count > 0)
+                        .map(([reason, count]) => (
+                          <div
+                            key={reason}
+                            className="flex items-center justify-between rounded-md border border-[#E2E8F0] bg-white px-2.5 py-1.5"
+                          >
+                            <span className="text-slate-600">{EXCLUSION_REASON_LABELS[reason]}</span>
+                            <span className="font-semibold text-[#0F172A] tabular-nums">
+                              {count}
+                            </span>
+                          </div>
+                        ))}
+                    </div>
                   )}
+
+                  {guardianReport?.messagingMode === 'test' &&
+                    effectiveAudience.verifiedFromDb &&
+                    effectiveAudience.eligibleCount > 0 && (
+                      <div className="pt-2 border-t border-[#E2E8F0] text-[11px] text-amber-800 flex items-center gap-1.5">
+                        <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
+                        <span>
+                          Test Mode allowlist check: {guardianReport.eligibleInTestAllowlist} of{' '}
+                          {effectiveAudience.eligibleCount} eligible contact
+                          {effectiveAudience.eligibleCount === 1 ? '' : 's'} are in your Test Mode
+                          allowlist. Bulk dispatch remains disabled in Test Mode.
+                        </span>
+                      </div>
+                    )}
+
+                  {preflightError && (
+                    <div className="rounded-md border border-[#E11D48]/30 bg-rose-50 px-3 py-2 text-[11px] text-[#E11D48] flex items-start gap-2">
+                      <AlertCircle className="h-3.5 w-3.5 shrink-0 mt-0.5" />
+                      <span>{preflightError}</span>
+                    </div>
+                  )}
+
+                  {guardianReport?.audience?.invalidTagIds &&
+                    guardianReport.audience.invalidTagIds.length > 0 && (
+                      <div className="rounded-md border border-[#E11D48]/30 bg-rose-50 px-3 py-2 text-[11px] text-[#E11D48] flex items-start gap-2">
+                        <AlertCircle className="h-3.5 w-3.5 shrink-0 mt-0.5" />
+                        <span>
+                          {guardianReport.audience.invalidTagIds.length} selected tag
+                          {guardianReport.audience.invalidTagIds.length === 1 ? '' : 's'} could not
+                          be verified in the active workspace and were ignored.
+                        </span>
+                      </div>
+                    )}
                 </div>
 
                 <div className="pt-4 border-t border-[#E2E8F0] flex items-center justify-between">
@@ -839,7 +1082,14 @@ export function BroadcastsPage() {
                       <div>
                         <p className="text-[11px] text-slate-500">Eligible Audience</p>
                         <p className="font-semibold text-[#0F172A] mt-0.5 tabular-nums">
-                          {audienceStats.eligibleCount} contact{audienceStats.eligibleCount === 1 ? '' : 's'}
+                          {effectiveAudience.eligibleCount} contact
+                          {effectiveAudience.eligibleCount === 1 ? '' : 's'}
+                          {effectiveAudience.skippedCount > 0 && (
+                            <span className="text-slate-500 font-normal">
+                              {' '}
+                              ({effectiveAudience.skippedCount} excluded)
+                            </span>
+                          )}
                         </p>
                       </div>
                       <div>
@@ -848,6 +1098,89 @@ export function BroadcastsPage() {
                           {selectedTemplate ? formatTemplateTitle(selectedTemplate.name) : '—'}
                         </p>
                       </div>
+                    </div>
+
+                    {/* Campaign Guardian Preflight Summary */}
+                    <div className="rounded-lg border border-[#E2E8F0] bg-white p-3.5 space-y-2.5">
+                      <div className="flex items-center justify-between gap-2">
+                        <div className="flex items-center gap-2">
+                          {guardianReport?.ok ? (
+                            <ShieldCheck className="h-4 w-4 text-emerald-600 shrink-0" />
+                          ) : (
+                            <ShieldAlert className="h-4 w-4 text-amber-600 shrink-0" />
+                          )}
+                          <p className="font-bold text-[#0F172A]">Campaign Guardian Preflight</p>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => void runDbPreflight()}
+                          disabled={validatingPreflight}
+                          className="inline-flex items-center gap-1 text-[11px] font-semibold text-[#2563EB] hover:underline disabled:opacity-50 cursor-pointer"
+                        >
+                          <RefreshCw
+                            className={`h-3 w-3 ${validatingPreflight ? 'animate-spin' : ''}`}
+                          />
+                          <span>{validatingPreflight ? 'Checking...' : 'Re-check'}</span>
+                        </button>
+                      </div>
+
+                      {validatingPreflight && !guardianReport ? (
+                        <div className="flex items-center gap-2 py-2 text-[11px] text-slate-500">
+                          <Loader2 className="h-3.5 w-3.5 animate-spin text-[#2563EB]" />
+                          <span>
+                            Verifying admin permissions, Meta template approval, WhatsApp account,
+                            and opted-in contacts...
+                          </span>
+                        </div>
+                      ) : guardianReport ? (
+                        <div className="space-y-1.5">
+                          {guardianReport.checks.map((chk) => (
+                            <div
+                              key={chk.code}
+                              className="flex items-start gap-2 rounded-md bg-[#F8FAFC] px-2.5 py-1.5 text-[11px]"
+                            >
+                              {chk.status === 'pass' ? (
+                                <CheckCircle2 className="h-3.5 w-3.5 text-emerald-600 shrink-0 mt-0.5" />
+                              ) : chk.status === 'warn' ? (
+                                <AlertTriangle className="h-3.5 w-3.5 text-amber-600 shrink-0 mt-0.5" />
+                              ) : (
+                                <AlertCircle className="h-3.5 w-3.5 text-[#E11D48] shrink-0 mt-0.5" />
+                              )}
+                              <div className="min-w-0">
+                                <span className="font-semibold text-[#0F172A]">{chk.label}: </span>
+                                <span
+                                  className={
+                                    chk.status === 'fail' ? 'text-[#E11D48]' : 'text-slate-600'
+                                  }
+                                >
+                                  {chk.message}
+                                </span>
+                              </div>
+                            </div>
+                          ))}
+
+                          {effectiveAudience.skippedCount > 0 && (
+                            <div className="pt-1.5 flex flex-wrap gap-1.5 text-[11px]">
+                              {(
+                                Object.entries(effectiveAudience.groupedExclusions) as Array<
+                                  [CampaignExclusionReason, number]
+                                >
+                              )
+                                .filter(([, count]) => count > 0)
+                                .map(([reason, count]) => (
+                                  <span
+                                    key={reason}
+                                    className="rounded border border-[#E2E8F0] bg-[#F8FAFC] px-2 py-0.5 text-slate-600 tabular-nums"
+                                  >
+                                    {EXCLUSION_REASON_LABELS[reason]}: <strong>{count}</strong>
+                                  </span>
+                                ))}
+                            </div>
+                          )}
+                        </div>
+                      ) : preflightError ? (
+                        <p className="text-[11px] text-[#E11D48]">{preflightError}</p>
+                      ) : null}
                     </div>
 
                     <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
@@ -914,7 +1247,8 @@ export function BroadcastsPage() {
                         className="mt-0.5 rounded border-slate-300 accent-[#2563EB]"
                       />
                       <span className="font-medium text-[#0F172A] leading-relaxed">
-                        I confirm these {audienceStats.eligibleCount} recipients explicitly opted in to receive WhatsApp messages from {business.name}.
+                        I confirm these {effectiveAudience.eligibleCount} recipients explicitly
+                        opted in to receive WhatsApp messages from {business.name}.
                       </span>
                     </label>
                   </div>
@@ -943,9 +1277,11 @@ export function BroadcastsPage() {
                         type="button"
                         disabled={
                           submitting ||
+                          validatingPreflight ||
                           !selectedTemplate ||
                           !consentConfirmed ||
-                          audienceStats.eligibleCount === 0
+                          effectiveAudience.eligibleCount === 0 ||
+                          Boolean(guardianReport && !guardianReport.ok)
                         }
                         onClick={() => handleSubmitBroadcast(false)}
                         className="w-full inline-flex items-center justify-center gap-2 rounded-lg bg-[#E11D48] py-2.5 text-xs font-semibold text-white hover:bg-rose-700 disabled:opacity-45 transition-colors cursor-pointer"
@@ -958,11 +1294,12 @@ export function BroadcastsPage() {
                         <span>
                           {submitting
                             ? 'Saving to Supabase...'
-                            : dispatchDisabledReason
+                            : business.messagingMode === 'test' ||
+                              business.metaConnectionState !== 'connected'
                             ? 'Save Campaign Draft'
                             : scheduleMode === 'scheduled'
-                            ? 'Schedule Campaign'
-                            : 'Save Campaign Draft'}
+                            ? 'Schedule Campaign Draft'
+                            : 'Save Validated Draft'}
                         </span>
                       </button>
                       <button

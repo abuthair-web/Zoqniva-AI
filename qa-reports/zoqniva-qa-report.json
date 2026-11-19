@@ -1,5 +1,5 @@
 {
-  "generatedAt": "2026-11-19T07:44:06.717Z",
+  "generatedAt": "2026-11-19T09:06:13.239Z",
   "environment": {
     "nodeVersion": "v22.23.2",
     "liveStagingDbConfigured": false,
@@ -7,8 +7,8 @@
   },
   "summary": {
     "localExecutedAutomatedTests": {
-      "total": 57,
-      "PASSED": 57,
+      "total": 67,
+      "PASSED": 67,
       "FAILED": 0,
       "BLOCKED": 0,
       "NOT_TESTED": 0,
@@ -23,19 +23,19 @@
       "NOT_IMPLEMENTED": 0
     },
     "liveAndAuditedChecks": {
-      "total": 13,
+      "total": 14,
       "PASSED": 0,
       "FAILED": 5,
       "BLOCKED": 4,
-      "NOT_TESTED": 3,
+      "NOT_TESTED": 4,
       "NOT_IMPLEMENTED": 1
     },
     "overallMatrix": {
-      "total": 71,
-      "PASSED": 57,
+      "total": 82,
+      "PASSED": 67,
       "FAILED": 5,
       "BLOCKED": 5,
-      "NOT_TESTED": 3,
+      "NOT_TESTED": 4,
       "NOT_IMPLEMENTED": 1
     }
   },
@@ -112,6 +112,116 @@
       "feature": "Static Security & Schema Regression Suite (CI-Safe)",
       "databaseTable": "All public CRM tables & Edge Functions",
       "testPerformed": "[Local/Mocked] keeps .env.example and .env.test.example free of real credentials",
+      "result": "PASSED",
+      "error": "None",
+      "severity": "None",
+      "recommendedFix": "None required"
+    },
+    {
+      "scope": "local_mocked_or_static",
+      "module": "Campaign Engine V1 (Phase 1)",
+      "feature": "Campaign Engine V1 — Phase 1 (Local / Mocked Unit & Contract Suite)",
+      "databaseTable": "public.campaigns, public.campaign_runs, public.campaign_recipients, public.campaign_events",
+      "testPerformed": "[Local/Mocked] enforces explicit opt-in consent and never treats a saved phone number as consent",
+      "result": "PASSED",
+      "error": "None",
+      "severity": "None",
+      "recommendedFix": "None required"
+    },
+    {
+      "scope": "local_mocked_or_static",
+      "module": "Campaign Engine V1 (Phase 1)",
+      "feature": "Campaign Engine V1 — Phase 1 (Local / Mocked Unit & Contract Suite)",
+      "databaseTable": "public.campaigns, public.campaign_runs, public.campaign_recipients, public.campaign_events",
+      "testPerformed": "[Local/Mocked] supports tag-based audiences (groups) and specific contact selection from DB",
+      "result": "PASSED",
+      "error": "None",
+      "severity": "None",
+      "recommendedFix": "None required"
+    },
+    {
+      "scope": "local_mocked_or_static",
+      "module": "Campaign Engine V1 (Phase 1)",
+      "feature": "Campaign Engine V1 — Phase 1 (Local / Mocked Unit & Contract Suite)",
+      "databaseTable": "public.campaigns, public.campaign_runs, public.campaign_recipients, public.campaign_events",
+      "testPerformed": "[Local/Mocked] excludes invalid E.164 numbers and deduplicates formatted duplicate phone numbers deterministically",
+      "result": "PASSED",
+      "error": "None",
+      "severity": "None",
+      "recommendedFix": "None required"
+    },
+    {
+      "scope": "local_mocked_or_static",
+      "module": "Campaign Engine V1 (Phase 1)",
+      "feature": "Campaign Engine V1 — Phase 1 (Local / Mocked Unit & Contract Suite)",
+      "databaseTable": "public.campaigns, public.campaign_runs, public.campaign_recipients, public.campaign_events",
+      "testPerformed": "[Local/Mocked] validates Meta template approval status and components JSONB parameters strictly",
+      "result": "PASSED",
+      "error": "None",
+      "severity": "None",
+      "recommendedFix": "None required"
+    },
+    {
+      "scope": "local_mocked_or_static",
+      "module": "Campaign Engine V1 (Phase 1)",
+      "feature": "Campaign Engine V1 — Phase 1 (Local / Mocked Unit & Contract Suite)",
+      "databaseTable": "public.campaigns, public.campaign_runs, public.campaign_recipients, public.campaign_events",
+      "testPerformed": "[Local/Mocked] enforces strict cross-business isolation for campaigns, templates, tags, and contacts",
+      "result": "PASSED",
+      "error": "None",
+      "severity": "None",
+      "recommendedFix": "None required"
+    },
+    {
+      "scope": "local_mocked_or_static",
+      "module": "Campaign Engine V1 (Phase 1)",
+      "feature": "Campaign Engine V1 — Phase 1 (Local / Mocked Unit & Contract Suite)",
+      "databaseTable": "public.campaigns, public.campaign_runs, public.campaign_recipients, public.campaign_events",
+      "testPerformed": "[Local/Mocked] requires active administrator membership (is_active = true and role = admin)",
+      "result": "PASSED",
+      "error": "None",
+      "severity": "None",
+      "recommendedFix": "None required"
+    },
+    {
+      "scope": "local_mocked_or_static",
+      "module": "Campaign Engine V1 (Phase 1)",
+      "feature": "Campaign Engine V1 — Phase 1 (Local / Mocked Unit & Contract Suite)",
+      "databaseTable": "public.campaigns, public.campaign_runs, public.campaign_recipients, public.campaign_events",
+      "testPerformed": "[Local/Mocked] prevents concurrent duplicate launches, freezes durable snapshots, and claims disjoint batches atomically",
+      "result": "PASSED",
+      "error": "None",
+      "severity": "None",
+      "recommendedFix": "None required"
+    },
+    {
+      "scope": "local_mocked_or_static",
+      "module": "Campaign Engine V1 (Phase 1)",
+      "feature": "Campaign Engine V1 — Phase 1 (Local / Mocked Unit & Contract Suite)",
+      "databaseTable": "public.campaigns, public.campaign_runs, public.campaign_recipients, public.campaign_events",
+      "testPerformed": "[Local/Mocked] never dispatches WhatsApp messages or calls Meta Graph API during draft, preflight, or snapshot flows",
+      "result": "PASSED",
+      "error": "None",
+      "severity": "None",
+      "recommendedFix": "None required"
+    },
+    {
+      "scope": "local_mocked_or_static",
+      "module": "Campaign Engine V1 (Phase 1)",
+      "feature": "Campaign Engine V1 — Phase 1 (Local / Mocked Unit & Contract Suite)",
+      "databaseTable": "public.campaigns, public.campaign_runs, public.campaign_recipients, public.campaign_events",
+      "testPerformed": "[Local/Mocked] recomputes fresh DB-verified validation results after restoring a saved draft across page refresh",
+      "result": "PASSED",
+      "error": "None",
+      "severity": "None",
+      "recommendedFix": "None required"
+    },
+    {
+      "scope": "local_mocked_or_static",
+      "module": "Campaign Engine V1 (Phase 1)",
+      "feature": "Campaign Engine V1 — Phase 1 (Local / Mocked Unit & Contract Suite)",
+      "databaseTable": "public.campaigns, public.campaign_runs, public.campaign_recipients, public.campaign_events",
+      "testPerformed": "[Local/Mocked] ensures preflight SQL is strictly read-only and migration 004 defines required Phase 1 foundations safely",
       "result": "PASSED",
       "error": "None",
       "severity": "None",
@@ -809,6 +919,17 @@
       "error": "Live Supabase database persistence has not yet been executed against the production/staging Supabase project",
       "severity": "None",
       "recommendedFix": "Deploy updated frontend to Vercel, open/create a Team Inbox conversation, verify row exists in public.conversations via SQL Editor, refresh page, and send an allowlisted approved template"
+    },
+    {
+      "scope": "live_staging_db",
+      "module": "Campaign Engine V1 Phase 1 (Live DB & Migration 004)",
+      "feature": "Preflight SQL, migration 004 (`campaign_runs`, `campaign_recipients`, `campaign_events`, atomic RPCs) & `campaign-preflight` Edge Function",
+      "databaseTable": "public.campaign_runs, public.campaign_recipients, public.campaign_events",
+      "testPerformed": "Verified locally via mocked Supabase & RPC tests (`tests/unit/campaignEngine.phase1.test.ts`); migration 004 intentionally NOT auto-applied to live DB",
+      "result": "NOT TESTED",
+      "error": "Migration 004 and `campaign-preflight` Edge Function have not yet been reviewed and deployed to live Supabase",
+      "severity": "None",
+      "recommendedFix": "Run `tests/db/campaign_engine_preflight_readonly.sql`, review & apply `supabase/migrations/004_campaign_engine_v1_phase1.sql`, deploy `campaign-preflight` Edge Function, and run live verification checklist"
     },
     {
       "scope": "audit_codebase",

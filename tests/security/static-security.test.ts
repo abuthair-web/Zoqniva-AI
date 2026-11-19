@@ -101,6 +101,7 @@ describe('Static Security & Schema Regression Suite (CI-Safe)', () => {
       'whatsapp-send-message',
       'sync-templates',
       'team-members',
+      'campaign-preflight',
     ];
 
     for (const fnName of protectedFns) {
@@ -115,6 +116,12 @@ describe('Static Security & Schema Regression Suite (CI-Safe)', () => {
         `${fnName} must not select nonexistent business_members.status`
       ).toBe(false);
     }
+
+    const campaignPreflightCode = fs
+      .readFileSync(path.join(FUNCTIONS_DIR, 'campaign-preflight', 'index.ts'), 'utf8')
+      .replace(/\/\/.*$/gm, '');
+    expect(campaignPreflightCode).not.toContain('graph.facebook.com');
+    expect(campaignPreflightCode).not.toContain('whatsapp-send-message');
 
     const webhookCode = fs.readFileSync(path.join(FUNCTIONS_DIR, 'whatsapp-webhook', 'index.ts'), 'utf8');
     expect(webhookCode).toContain('verifyWebhookSignature');

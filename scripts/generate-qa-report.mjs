@@ -75,6 +75,7 @@ function classifySuiteModule(filePath) {
   if (rel.includes('templates.test.ts')) return { module: 'Message Templates', table: 'public.templates' };
   if (rel.includes('crmPersistence.contacts.test.ts')) return { module: 'Contacts & Tags', table: 'public.contacts, public.tags, public.contact_tags' };
   if (rel.includes('crmPersistence.campaigns.test.ts')) return { module: 'Campaigns', table: 'public.campaigns' };
+  if (rel.includes('campaignEngine.phase1.test.ts')) return { module: 'Campaign Engine V1 (Phase 1)', table: 'public.campaigns, public.campaign_runs, public.campaign_recipients, public.campaign_events' };
   if (rel.includes('conversationPersistence.test.ts')) return { module: 'Team Inbox (Conversations)', table: 'public.conversations, public.messages' };
   if (rel.includes('whatsapp-send-template.test.ts')) return { module: 'WhatsApp Template Sending', table: 'public.templates, public.messages' };
   if (rel.includes('whatsapp.integration.test.ts')) return { module: 'WhatsApp Cloud API', table: 'public.whatsapp_accounts, public.messages, public.webhook_events' };
@@ -321,6 +322,17 @@ const liveAndAuditedRows = [
     error: 'Live Supabase database persistence has not yet been executed against the production/staging Supabase project',
     severity: 'None',
     recommendedFix: 'Deploy updated frontend to Vercel, open/create a Team Inbox conversation, verify row exists in public.conversations via SQL Editor, refresh page, and send an allowlisted approved template',
+  },
+  {
+    scope: 'live_staging_db',
+    module: 'Campaign Engine V1 Phase 1 (Live DB & Migration 004)',
+    feature: 'Preflight SQL, migration 004 (`campaign_runs`, `campaign_recipients`, `campaign_events`, atomic RPCs) & `campaign-preflight` Edge Function',
+    databaseTable: 'public.campaign_runs, public.campaign_recipients, public.campaign_events',
+    testPerformed: 'Verified locally via mocked Supabase & RPC tests (`tests/unit/campaignEngine.phase1.test.ts`); migration 004 intentionally NOT auto-applied to live DB',
+    result: 'NOT TESTED',
+    error: 'Migration 004 and `campaign-preflight` Edge Function have not yet been reviewed and deployed to live Supabase',
+    severity: 'None',
+    recommendedFix: 'Run `tests/db/campaign_engine_preflight_readonly.sql`, review & apply `supabase/migrations/004_campaign_engine_v1_phase1.sql`, deploy `campaign-preflight` Edge Function, and run live verification checklist',
   },
   {
     scope: 'audit_codebase',
