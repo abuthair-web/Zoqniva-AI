@@ -234,7 +234,13 @@ export function mapDbContactRow(
 ): Contact {
   const fullName = String(row.full_name ?? row.name ?? '').trim();
   const phoneE164 = String(row.phone_e164 ?? row.phone ?? '').trim();
-  const marketingOptIn = Boolean(row.marketing_opt_in ?? row.opt_in ?? false);
+  const rawOptInStatus = typeof row.opt_in_status === 'string' ? row.opt_in_status.trim().toLowerCase() : '';
+  const marketingOptIn =
+    row.marketing_opt_in !== undefined
+      ? Boolean(row.marketing_opt_in)
+      : row.opt_in !== undefined
+      ? Boolean(row.opt_in)
+      : rawOptInStatus === 'opted_in' || rawOptInStatus === 'subscribed' || rawOptInStatus === 'active';
 
   return {
     id: String(row.id),
@@ -354,11 +360,14 @@ export function buildContactInsertPayload(
     payload.phone_e164 = input.phoneE164;
   }
 
-  // Consent column
+  // Consent column(s)
   if (knownCols && !knownCols.has('marketing_opt_in') && knownCols.has('opt_in')) {
     payload.opt_in = Boolean(input.marketingOptIn);
   } else if (canWriteColumn('marketing_opt_in', knownCols, missingCols)) {
     payload.marketing_opt_in = Boolean(input.marketingOptIn);
+  }
+  if (canWriteColumn('opt_in_status', knownCols, missingCols, true)) {
+    payload.opt_in_status = input.marketingOptIn ? 'opted_in' : 'opted_out';
   }
 
   // Optional columns — only include when supported by the real live table
@@ -451,6 +460,9 @@ export function buildContactUpdatePayload(
       patch.opt_in = Boolean(updates.marketingOptIn);
     } else if (canWriteColumn('marketing_opt_in', knownCols, missingCols)) {
       patch.marketing_opt_in = Boolean(updates.marketingOptIn);
+    }
+    if (canWriteColumn('opt_in_status', knownCols, missingCols, true)) {
+      patch.opt_in_status = updates.marketingOptIn ? 'opted_in' : 'opted_out';
     }
     if (canWriteColumn('opted_out_at', knownCols, missingCols, true)) {
       patch.opted_out_at = updates.optedOutAt ?? null;
@@ -980,27 +992,45 @@ export function mapDbCampaignRow(row: Record<string, unknown>): Campaign {
     }
   }
 
+  const audienceFilter =
+    row.audience_filter && typeof row.audience_filter === 'object' && !Array.isArray(row.audience_filter)
+      ? (row.audience_filter as Record<string, unknown>)
+      : null;
+
   const targetTagIds = Array.isArray(row.target_tag_ids)
     ? row.target_tag_ids.map(String)
+    : Array.isArray(audienceFilter?.tagIds)
+    ? audienceFilter.tagIds.map(String)
+    : Array.isArray(audienceFilter?.tag_ids)
+    ? audienceFilter.tag_ids.map(String)
     : [];
   const targetContactIds = Array.isArray(row.target_contact_ids)
     ? row.target_contact_ids.map(String)
+    : Array.isArray(audienceFilter?.contactIds)
+    ? audienceFilter.contactIds.map(String)
+    : Array.isArray(audienceFilter?.contact_ids)
+    ? audienceFilter.contact_ids.map(String)
     : undefined;
 
   const eligible = Number(row.eligible_count ?? row.total_recipients ?? 0);
   const selected = Number(row.selected_count ?? eligible);
+
+  const filterMode = audienceFilter?.mode;
+  const resolvedAudienceMode =
+    row.audience_mode === 'all' || row.audience_mode === 'groups' || row.audience_mode === 'specific'
+      ? row.audience_mode
+      : filterMode === 'all' || filterMode === 'groups' || filterMode === 'specific'
+      ? filterMode
+      : targetTagIds.length > 0
+      ? 'groups'
+      : 'all';
 
   return {
     id: String(row.id),
     name: String(row.name ?? 'Untitled Campaign'),
     templateId: String(row.template_id ?? ''),
     status: normalizeCampaignStatus(row.status),
-    audienceMode:
-      row.audience_mode === 'all' || row.audience_mode === 'groups' || row.audience_mode === 'specific'
-        ? row.audience_mode
-        : targetTagIds.length > 0
-        ? 'groups'
-        : 'all',
+    audienceMode: resolvedAudienceMode,
     targetTagIds,
     targetContactIds,
     variableMapping,
@@ -1136,6 +1166,13 @@ export function buildCampaignInsertPayload(
   }
 
   // Only include non-standard columns if explicitly confirmed in live public.campaigns
+  if (canWriteColumn('audience_filter', knownCols, missingCols, true)) {
+    payload.audience_filter = {
+      mode: input.audienceMode ?? (validTagIds.length > 0 ? 'groups' : 'all'),
+      tag_ids: validTagIds,
+      contact_ids: validContactIds,
+    };
+  }
   if (input.audienceMode && canWriteColumn('audience_mode', knownCols, missingCols, true)) {
     payload.audience_mode = input.audienceMode;
   }

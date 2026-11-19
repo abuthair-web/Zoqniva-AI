@@ -50,7 +50,7 @@ const SENSITIVE_KEY_PATTERN =
   /token|secret|authorization|password|apikey|api_key|signature|verify_token|body|message_text|content/i;
 
 function logEvent(
-  category: 'outgoing_submit' | 'permission_error' | 'meta_api_error' | 'duplicate_event',
+  category: 'outgoing_submit' | 'permission_error' | 'meta_api_error' | 'duplicate_event' | 'persistence_error',
   level: 'info' | 'warn' | 'error',
   message: string,
   context: Record<string, unknown> = {}
@@ -224,7 +224,8 @@ async function dispatchMetaMessage(params: {
         messageType,
       });
       return {
-        ok: false,
+        ok: false as const,
+        uncertain: false,
         httpStatus: classified.httpStatus,
         errorCode: classified.code,
         userMessage: classified.userMessage,
@@ -240,30 +241,367 @@ async function dispatchMetaMessage(params: {
     });
 
     return {
-      ok: true,
+      ok: true as const,
+      uncertain: false,
       httpStatus: 200,
       metaMessageId,
       rawResponse: json,
     };
   } catch (err) {
-    // NEVER blindly retry a timed-out POST to Meta to avoid duplicate WhatsApp messages
+    // NEVER blindly retry a timed-out or interrupted POST to Meta to avoid duplicate WhatsApp messages
     const isAbort = err instanceof DOMException && err.name === 'AbortError';
     logEvent('meta_api_error', 'error', 'Meta send network failure/timeout', {
       isAbort,
       recipient: maskPhone(recipientWaId),
     });
     return {
-      ok: false,
+      ok: false as const,
+      uncertain: true,
       httpStatus: 504,
       errorCode: isAbort ? 'META_REQUEST_TIMEOUT' : 'META_NETWORK_ERROR',
       userMessage: isAbort
-        ? 'Timed out waiting for WhatsApp confirmation. Check status before retrying to avoid duplicates.'
-        : 'Network error communicating with WhatsApp Cloud API.',
+        ? 'Timed out waiting for WhatsApp confirmation. Check delivery status before creating a new request to avoid duplicate customer messages.'
+        : 'Network interruption while communicating with WhatsApp Cloud API. Verify delivery status before retrying.',
       diagnosticMessage: (err as Error).message,
     };
   } finally {
     clearTimeout(timer);
   }
+}
+
+interface TemplateButtonRecord {
+  type?: unknown;
+  text?: unknown;
+  url?: unknown;
+  phone_number?: unknown;
+  example?: unknown;
+}
+
+interface TemplateComponentRecord {
+  type?: unknown;
+  format?: unknown;
+  text?: unknown;
+  buttons?: unknown;
+}
+
+const SUPPORTED_COMPONENT_TYPES = new Set(['HEADER', 'BODY', 'FOOTER', 'BUTTONS']);
+const SUPPORTED_STATIC_BUTTON_TYPES = new Set(['QUICK_REPLY', 'PHONE_NUMBER', 'URL', 'VOICE_CALL']);
+
+function coerceTemplateComponents(raw: unknown): TemplateComponentRecord[] {
+  if (Array.isArray(raw)) {
+    return raw.filter(
+      (item): item is TemplateComponentRecord =>
+        Boolean(item) && typeof item === 'object' && !Array.isArray(item)
+    );
+  }
+  if (typeof raw === 'string' && raw.trim().startsWith('[')) {
+    try {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) {
+        return parsed.filter(
+          (item): item is TemplateComponentRecord =>
+            Boolean(item) && typeof item === 'object' && !Array.isArray(item)
+        );
+      }
+    } catch {
+      return [];
+    }
+  }
+  return [];
+}
+
+function renderTemplateTextFromComponents(params: {
+  templateName: string;
+  language: string;
+  components: TemplateComponentRecord[];
+  sanitizedParameters?: string[];
+}): string {
+  const headerComp = params.components.find(
+    (c) => String(c.type ?? '').trim().toUpperCase() === 'HEADER'
+  );
+  const bodyComp = params.components.find(
+    (c) => String(c.type ?? '').trim().toUpperCase() === 'BODY'
+  );
+  const footerComp = params.components.find(
+    (c) => String(c.type ?? '').trim().toUpperCase() === 'FOOTER'
+  );
+
+  const headerText =
+    headerComp &&
+    String(headerComp.format ?? (headerComp.text ? 'TEXT' : '')).trim().toUpperCase() === 'TEXT' &&
+    typeof headerComp.text === 'string'
+      ? headerComp.text.trim()
+      : '';
+
+  let bodyText = typeof bodyComp?.text === 'string' ? bodyComp.text.trim() : '';
+  if (bodyText && params.sanitizedParameters && params.sanitizedParameters.length > 0) {
+    bodyText = bodyText.replace(/\{\{(\d+)\}\}/g, (match, rawIdx: string) => {
+      const idx = Number(rawIdx) - 1;
+      return idx >= 0 && idx < params.sanitizedParameters!.length
+        ? params.sanitizedParameters![idx]
+        : match;
+    });
+  }
+
+  const footerText = typeof footerComp?.text === 'string' ? footerComp.text.trim() : '';
+
+  const sections = [headerText, bodyText, footerText].filter((part) => part.length > 0);
+  if (sections.length > 0) {
+    return sections.join('\n\n').slice(0, 4096);
+  }
+
+  return `[WhatsApp Template: ${params.templateName} (${params.language})]`;
+}
+
+function validateTemplateComponentsAndParams(params: {
+  templateName: string;
+  language: string;
+  components: unknown;
+  providedParameters?: string[];
+}):
+  | { ok: true; sanitizedParameters?: string[]; renderedBody: string }
+  | { ok: false; code: string; error: string } {
+  const components = coerceTemplateComponents(params.components);
+  const rawParams = Array.isArray(params.providedParameters)
+    ? params.providedParameters.map((v) => String(v))
+    : [];
+
+  // 1. Reject unsupported top-level component types (e.g., CAROUSEL, LIMITED_TIME_OFFER)
+  for (const comp of components) {
+    const compType = String(comp.type ?? '').trim().toUpperCase();
+    if (!compType || !SUPPORTED_COMPONENT_TYPES.has(compType)) {
+      return {
+        ok: false,
+        code: 'TEMPLATE_UNSUPPORTED_COMPONENT',
+        error: `Template "${params.templateName}" contains an unsupported component type ("${compType || 'UNKNOWN'}") and cannot be sent by this endpoint.`,
+      };
+    }
+
+    if (compType === 'HEADER') {
+      const headerFormat = String(comp.format ?? (comp.text ? 'TEXT' : 'NONE'))
+        .trim()
+        .toUpperCase();
+
+      if (headerFormat !== 'NONE' && headerFormat !== 'TEXT') {
+        return {
+          ok: false,
+          code: 'TEMPLATE_UNSUPPORTED_COMPONENT',
+          error: `Template "${params.templateName}" uses a ${headerFormat} header component, which is not supported for sending yet.`,
+        };
+      }
+
+      if (
+        headerFormat === 'TEXT' &&
+        typeof comp.text === 'string' &&
+        /\{\{[^}]+\}\}/.test(comp.text)
+      ) {
+        return {
+          ok: false,
+          code: 'TEMPLATE_UNSUPPORTED_COMPONENT',
+          error: `Template "${params.templateName}" requires dynamic header parameters, which are not supported for sending yet.`,
+        };
+      }
+    }
+
+    if (compType === 'BUTTONS' && Array.isArray(comp.buttons)) {
+      for (const rawBtn of comp.buttons as TemplateButtonRecord[]) {
+        if (!rawBtn || typeof rawBtn !== 'object') continue;
+        const btnType = String(rawBtn.type ?? '').trim().toUpperCase();
+        if (!SUPPORTED_STATIC_BUTTON_TYPES.has(btnType)) {
+          return {
+            ok: false,
+            code: 'TEMPLATE_UNSUPPORTED_COMPONENT',
+            error: `Template "${params.templateName}" includes an unsupported interactive button type ("${btnType || 'UNKNOWN'}") that requires send-time parameters.`,
+          };
+        }
+        if (
+          btnType === 'URL' &&
+          typeof rawBtn.url === 'string' &&
+          /\{\{[^}]+\}\}/.test(rawBtn.url)
+        ) {
+          return {
+            ok: false,
+            code: 'TEMPLATE_UNSUPPORTED_COMPONENT',
+            error: `Template "${params.templateName}" contains a dynamic URL button parameter, which is not supported for sending yet.`,
+          };
+        }
+      }
+    }
+  }
+
+  // 2. Validate BODY component parameters against Meta placeholders
+  const bodyComp = components.find(
+    (c) => String(c.type ?? '').trim().toUpperCase() === 'BODY'
+  );
+
+  let sanitizedParameters: string[] | undefined = undefined;
+
+  if (bodyComp && typeof bodyComp.text === 'string') {
+    const matches = Array.from(bodyComp.text.matchAll(/\{\{([^}]+)\}\}/g));
+    const tokens = matches.map((m) => String(m[1] ?? '').trim()).filter(Boolean);
+    const nonNumericTokens = tokens.filter((t) => !/^\d+$/.test(t));
+
+    if (nonNumericTokens.length > 0) {
+      return {
+        ok: false,
+        code: 'TEMPLATE_UNSUPPORTED_COMPONENT',
+        error: `Template "${params.templateName}" uses named body parameters ({{${nonNumericTokens[0]}}}), which are not supported for sending yet.`,
+      };
+    }
+
+    const numericIndices = tokens
+      .map((t) => Number(t))
+      .filter((n) => Number.isInteger(n) && n > 0);
+    const requiredBodyParams = numericIndices.length > 0 ? Math.max(...numericIndices) : 0;
+
+    if (requiredBodyParams > 0) {
+      if (rawParams.length < requiredBodyParams) {
+        return {
+          ok: false,
+          code: 'TEMPLATE_PARAMETERS_MISSING',
+          error: `Template "${params.templateName}" requires ${requiredBodyParams} body parameter(s), but ${rawParams.length} were provided.`,
+        };
+      }
+      if (rawParams.length > requiredBodyParams) {
+        return {
+          ok: false,
+          code: 'TEMPLATE_PARAMETERS_MISMATCH',
+          error: `Template "${params.templateName}" accepts ${requiredBodyParams} body parameter(s), but ${rawParams.length} were provided.`,
+        };
+      }
+      for (let i = 0; i < rawParams.length; i++) {
+        const val = rawParams[i].trim();
+        if (!val) {
+          return {
+            ok: false,
+            code: 'TEMPLATE_PARAMETER_EMPTY',
+            error: `Template parameter #${i + 1} cannot be empty.`,
+          };
+        }
+        if (val.length > 1024) {
+          return {
+            ok: false,
+            code: 'TEMPLATE_PARAMETER_TOO_LONG',
+            error: `Template parameter #${i + 1} exceeds WhatsApp's 1,024-character limit.`,
+          };
+        }
+      }
+      sanitizedParameters = rawParams.map((v) => v.trim());
+    } else if (rawParams.length > 0) {
+      return {
+        ok: false,
+        code: 'TEMPLATE_PARAMETERS_UNEXPECTED',
+        error: `Template "${params.templateName}" does not accept body parameters.`,
+      };
+    }
+  } else if (rawParams.length > 0) {
+    for (let i = 0; i < rawParams.length; i++) {
+      const val = rawParams[i].trim();
+      if (!val) {
+        return {
+          ok: false,
+          code: 'TEMPLATE_PARAMETER_EMPTY',
+          error: `Template parameter #${i + 1} cannot be empty.`,
+        };
+      }
+      if (val.length > 1024) {
+        return {
+          ok: false,
+          code: 'TEMPLATE_PARAMETER_TOO_LONG',
+          error: `Template parameter #${i + 1} exceeds WhatsApp's 1,024-character limit.`,
+        };
+      }
+    }
+    sanitizedParameters = rawParams.map((v) => v.trim());
+  }
+
+  const renderedBody = renderTemplateTextFromComponents({
+    templateName: params.templateName,
+    language: params.language,
+    components,
+    sanitizedParameters,
+  });
+
+  return { ok: true, sanitizedParameters, renderedBody };
+}
+
+function buildIdempotentResponse(
+  existingMsg: Record<string, unknown>,
+  clientRequestId: string
+): Response {
+  const status = String(existingMsg.delivery_status ?? '').trim().toLowerCase();
+
+  logEvent('duplicate_event', status === 'failed' || status === 'pending' ? 'warn' : 'info', 'Handled duplicate clientRequestId', {
+    messageId: existingMsg.id,
+    clientRequestId,
+    deliveryStatus: status || 'unknown',
+  });
+
+  // Confirmed Meta-accepted message states: safe idempotent replay without re-sending to Meta
+  if (status === 'submitted' || status === 'sent' || status === 'delivered' || status === 'read') {
+    return jsonResponse(
+      {
+        ok: true,
+        idempotentReplay: true,
+        code: 'IDEMPOTENT_REPLAY',
+        deliveryStatus: status,
+        metaMessageId: existingMsg.meta_message_id ?? null,
+        message: existingMsg,
+      },
+      200
+    );
+  }
+
+  // Failed request: NEVER report ok: true
+  if (status === 'failed') {
+    return jsonResponse(
+      {
+        ok: false,
+        idempotentReplay: true,
+        code: 'IDEMPOTENT_REQUEST_FAILED',
+        deliveryStatus: 'failed',
+        metaMessageId: existingMsg.meta_message_id ?? null,
+        error:
+          'A previous send attempt with this clientRequestId failed. Review the error and send with a new clientRequestId if you intend to retry.',
+        originalErrorCode: existingMsg.error_code ?? null,
+        originalErrorMessage: existingMsg.error_message ?? null,
+        message: existingMsg,
+      },
+      409
+    );
+  }
+
+  // Pending / in-flight / timed-out uncertain request: NEVER trigger duplicate send and NEVER report confirmed sent
+  if (status === 'pending') {
+    return jsonResponse(
+      {
+        ok: false,
+        idempotentReplay: true,
+        code: 'IDEMPOTENT_REQUEST_IN_PROGRESS',
+        deliveryStatus: 'pending',
+        reconciliationRequired: Boolean(existingMsg.error_code),
+        doNotResend: true,
+        metaMessageId: existingMsg.meta_message_id ?? null,
+        error:
+          'A send attempt with this clientRequestId is still pending or awaiting confirmation. Do not resend to avoid duplicate customer messages.',
+        message: existingMsg,
+      },
+      409
+    );
+  }
+
+  return jsonResponse(
+    {
+      ok: false,
+      idempotentReplay: true,
+      code: 'IDEMPOTENT_REQUEST_CONFLICT',
+      deliveryStatus: status || 'unknown',
+      metaMessageId: existingMsg.meta_message_id ?? null,
+      error: 'A message record with this clientRequestId already exists in a non-replayable state.',
+      message: existingMsg,
+    },
+    409
+  );
 }
 
 Deno.serve(async (req: Request) => {
@@ -318,7 +656,7 @@ Deno.serve(async (req: Request) => {
 
     const conversationId = String(payload.conversationId ?? '').trim();
     const messageType = String(payload.messageType ?? 'text').trim();
-    const trimmedBody = String(payload.body ?? '').trim();
+    const rawFreeformBody = typeof payload.body === 'string' ? payload.body.trim() : '';
     const templateName = payload.templateName ? String(payload.templateName).trim() : undefined;
     const clientRequestId = payload.clientRequestId ? String(payload.clientRequestId).trim() : undefined;
 
@@ -337,15 +675,17 @@ Deno.serve(async (req: Request) => {
       );
     }
 
-    if (!trimmedBody) {
-      return jsonResponse({ ok: false, code: 'EMPTY_MESSAGE', error: 'Message text cannot be empty.' }, 400);
-    }
-
-    if (trimmedBody.length > 4096) {
-      return jsonResponse(
-        { ok: false, code: 'MESSAGE_TOO_LONG', error: 'WhatsApp messages cannot exceed 4,096 characters.' },
-        400
-      );
+    // Only free-form text messages require payload.body; template content comes strictly from Meta template components JSONB
+    if (messageType === 'text') {
+      if (!rawFreeformBody) {
+        return jsonResponse({ ok: false, code: 'EMPTY_MESSAGE', error: 'Message text cannot be empty.' }, 400);
+      }
+      if (rawFreeformBody.length > 4096) {
+        return jsonResponse(
+          { ok: false, code: 'MESSAGE_TOO_LONG', error: 'WhatsApp messages cannot exceed 4,096 characters.' },
+          400
+        );
+      }
     }
 
     if (clientRequestId && clientRequestId.length > 128) {
@@ -415,28 +755,33 @@ Deno.serve(async (req: Request) => {
       );
     }
 
-    // 5. Idempotency check (prevent double sends)
+    // 5. Idempotency check (strict handling for submitted, pending, and failed records)
     if (clientRequestId) {
-      const { data: existingMsg } = await serviceClient
+      const { data: existingMsg, error: existingMsgErr } = await serviceClient
         .from('messages')
         .select('*')
         .eq('business_id', businessId)
         .eq('client_request_id', clientRequestId)
         .maybeSingle();
 
-      if (existingMsg && existingMsg.delivery_status !== 'failed') {
-        logEvent('duplicate_event', 'info', 'Returning idempotent message result', {
-          messageId: existingMsg.id,
+      if (existingMsgErr) {
+        logEvent('persistence_error', 'error', 'Failed idempotency lookup on messages', {
+          businessId,
           clientRequestId,
-          status: existingMsg.delivery_status,
+          error: existingMsgErr.message,
         });
-        return jsonResponse({
-          ok: true,
-          idempotentReplay: true,
-          deliveryStatus: existingMsg.delivery_status,
-          metaMessageId: existingMsg.meta_message_id,
-          message: existingMsg,
-        });
+        return jsonResponse(
+          {
+            ok: false,
+            code: 'IDEMPOTENCY_CHECK_FAILED',
+            error: 'Could not verify request idempotency state. Wait and verify before retrying.',
+          },
+          500
+        );
+      }
+
+      if (existingMsg) {
+        return buildIdempotentResponse(existingMsg as Record<string, unknown>, clientRequestId);
       }
     }
 
@@ -546,30 +891,139 @@ Deno.serve(async (req: Request) => {
       );
     }
 
-    // 10. Validate approved template when sending template message
-    let resolvedLanguage = payload.language || 'en_US';
+    // 10. Validate approved template against real public.templates schema (status, components, meta_template_id)
+    let resolvedLanguage = payload.language ? String(payload.language).trim() : 'en_US';
+    let validatedTemplateParameters: string[] | undefined = undefined;
+    let storedMessageBody = rawFreeformBody;
+
     if (messageType === 'template') {
-      const { data: tplRow } = await serviceClient
+      const { data: tplRows, error: tplErr } = await serviceClient
         .from('templates')
-        .select('id, name, category, language, approval_status')
+        .select('id, business_id, meta_template_id, name, language, category, status, components')
         .eq('business_id', businessId)
-        .eq('name', templateName!)
-        .eq('approval_status', 'APPROVED')
-        .maybeSingle();
+        .eq('name', templateName!);
+
+      if (tplErr) {
+        logEvent('meta_api_error', 'error', 'Failed to query public.templates for template send', {
+          businessId,
+          templateName,
+          errorCode: tplErr.code,
+          error: tplErr.message,
+        });
+        return jsonResponse(
+          {
+            ok: false,
+            code: 'TEMPLATE_LOOKUP_FAILED',
+            error: `Unable to verify WhatsApp template approval status: ${tplErr.message}`,
+          },
+          500
+        );
+      }
+
+      const matchingRows = Array.isArray(tplRows)
+        ? (tplRows as Array<Record<string, unknown>>)
+        : [];
+
+      const requestedLang = payload.language ? String(payload.language).trim() : '';
+      let tplRow: Record<string, unknown> | undefined;
+
+      if (requestedLang) {
+        tplRow = matchingRows.find(
+          (row) => String(row.language ?? '').trim().toLowerCase() === requestedLang.toLowerCase()
+        );
+      } else {
+        tplRow =
+          matchingRows.find(
+            (row) => String(row.status ?? '').trim().toLowerCase() === 'approved'
+          ) ?? matchingRows[0];
+      }
 
       if (!tplRow) {
         return jsonResponse(
           {
             ok: false,
+            code: 'TEMPLATE_NOT_FOUND',
+            error: requestedLang
+              ? `WhatsApp template "${templateName}" (${requestedLang}) was not found in this workspace. Sync templates from Meta and try again.`
+              : `WhatsApp template "${templateName}" was not found in this workspace. Sync templates from Meta and try again.`,
+          },
+          404
+        );
+      }
+
+      const normalizedStatus = String(tplRow.status ?? '').trim().toLowerCase();
+      if (normalizedStatus !== 'approved') {
+        const statusResponses: Record<string, { code: string; error: string }> = {
+          pending: {
+            code: 'TEMPLATE_PENDING',
+            error: `Template "${templateName}" is still pending Meta approval and cannot be sent yet.`,
+          },
+          rejected: {
+            code: 'TEMPLATE_REJECTED',
+            error: `Template "${templateName}" was rejected by Meta and cannot be sent.`,
+          },
+          paused: {
+            code: 'TEMPLATE_PAUSED',
+            error: `Template "${templateName}" is paused by Meta and cannot be sent.`,
+          },
+          disabled: {
+            code: 'TEMPLATE_DISABLED',
+            error: `Template "${templateName}" is disabled in Meta and cannot be sent.`,
+          },
+          draft: {
             code: 'TEMPLATE_NOT_APPROVED',
-            error: 'Selected template is not approved in your Meta WhatsApp Business account.',
+            error: `Template "${templateName}" is a local draft and has not been approved by Meta.`,
+          },
+        };
+
+        const denial = statusResponses[normalizedStatus] ?? {
+          code: 'TEMPLATE_NOT_APPROVED',
+          error: `Selected template "${templateName}" is not approved in your Meta WhatsApp Business account (status: ${normalizedStatus || 'unknown'}).`,
+        };
+
+        logEvent('permission_error', 'warn', 'Blocked unapproved template send attempt', {
+          businessId,
+          templateName,
+          templateStatus: normalizedStatus || 'unknown',
+        });
+
+        return jsonResponse(
+          {
+            ok: false,
+            code: denial.code,
+            error: denial.error,
           },
           400
         );
       }
 
-      resolvedLanguage = String(tplRow.language || resolvedLanguage);
-      if (tplRow.category === 'MARKETING' && (!contactObj.marketing_opt_in || contactObj.opted_out_at)) {
+      const metaTemplateId = String(tplRow.meta_template_id ?? '').trim();
+      if (!metaTemplateId) {
+        return jsonResponse(
+          {
+            ok: false,
+            code: 'TEMPLATE_NOT_SYNCED_WITH_META',
+            error: `Template "${templateName}" is missing a verified Meta template ID. Sync templates from Meta before sending.`,
+          },
+          400
+        );
+      }
+
+      resolvedLanguage = String(tplRow.language ?? resolvedLanguage).trim() || 'en_US';
+
+      // Enforce customer opt-out and marketing consent restrictions on business-initiated templates
+      const normalizedCategory = String(tplRow.category ?? '').trim().toUpperCase();
+      if (contactObj.opted_out_at) {
+        return jsonResponse(
+          {
+            ok: false,
+            code: 'CONTACT_OPTED_OUT',
+            error: 'This customer has opted out of outbound WhatsApp template messages.',
+          },
+          400
+        );
+      }
+      if (normalizedCategory === 'MARKETING' && !contactObj.marketing_opt_in) {
         return jsonResponse(
           {
             ok: false,
@@ -579,6 +1033,30 @@ Deno.serve(async (req: Request) => {
           400
         );
       }
+
+      const paramCheck = validateTemplateComponentsAndParams({
+        templateName: String(tplRow.name ?? templateName),
+        language: resolvedLanguage,
+        components: tplRow.components,
+        providedParameters: Array.isArray(payload.templateParameters)
+          ? payload.templateParameters.map(String)
+          : undefined,
+      });
+
+      if (!paramCheck.ok) {
+        return jsonResponse(
+          {
+            ok: false,
+            code: paramCheck.code,
+            error: paramCheck.error,
+          },
+          400
+        );
+      }
+
+      validatedTemplateParameters = paramCheck.sanitizedParameters;
+      // Canonical template body derived strictly from verified Meta components JSONB
+      storedMessageBody = paramCheck.renderedBody;
     }
 
     // 11. Create pending message record before calling Meta Graph API
@@ -591,7 +1069,7 @@ Deno.serve(async (req: Request) => {
         sender_profile_id: callerId,
         direction: 'outbound',
         message_type: messageType,
-        body: trimmedBody,
+        body: storedMessageBody,
         template_name: messageType === 'template' ? templateName : null,
         client_request_id: clientRequestId ?? null,
         delivery_status: 'pending',
@@ -601,23 +1079,29 @@ Deno.serve(async (req: Request) => {
 
     if (insErr) {
       if (insErr.code === '23505' && clientRequestId) {
-        const { data: raceMsg } = await serviceClient
+        const { data: raceMsg, error: raceErr } = await serviceClient
           .from('messages')
           .select('*')
           .eq('business_id', businessId)
           .eq('client_request_id', clientRequestId)
           .maybeSingle();
-        if (raceMsg) {
-          return jsonResponse({
-            ok: true,
-            idempotentReplay: true,
-            deliveryStatus: raceMsg.delivery_status,
-            metaMessageId: raceMsg.meta_message_id,
-            message: raceMsg,
-          });
+
+        if (!raceErr && raceMsg) {
+          return buildIdempotentResponse(raceMsg as Record<string, unknown>, clientRequestId);
         }
+
+        return jsonResponse(
+          {
+            ok: false,
+            idempotentReplay: true,
+            code: 'IDEMPOTENT_CONFLICT_UNRESOLVED',
+            error:
+              'A concurrent request with this clientRequestId already exists, and its current state could not be loaded. Check message history before retrying.',
+          },
+          409
+        );
       }
-      return jsonResponse({ ok: false, error: insErr.message }, 500);
+      return jsonResponse({ ok: false, code: 'MESSAGE_CREATE_FAILED', error: insErr.message }, 500);
     }
 
     await serviceClient.from('message_events').insert({
@@ -634,18 +1118,53 @@ Deno.serve(async (req: Request) => {
       accessToken,
       recipientWaId,
       messageType: messageType as 'text' | 'template',
-      body: trimmedBody,
+      body: messageType === 'text' ? storedMessageBody : undefined,
       templateName,
       language: resolvedLanguage,
-      templateParameters: Array.isArray(payload.templateParameters)
-        ? payload.templateParameters.map(String)
-        : undefined,
+      templateParameters: validatedTemplateParameters,
     });
 
     const nowIso = new Date().toISOString();
 
     if (!metaResult.ok || !metaResult.metaMessageId) {
-      const { data: failedMsg } = await serviceClient
+      // If the Meta POST timed out / dropped mid-flight, keep status as 'pending' (uncertain) to block blind retries
+      if (metaResult.uncertain) {
+        const { data: uncertainMsg, error: uncertainUpdErr } = await serviceClient
+          .from('messages')
+          .update({
+            last_status_at: nowIso,
+            error_code: metaResult.errorCode ?? 'META_REQUEST_TIMEOUT',
+            error_message: metaResult.userMessage ?? metaResult.diagnosticMessage ?? 'Uncertain Meta delivery state.',
+          })
+          .eq('id', createdMsg.id)
+          .select('*')
+          .single();
+
+        if (uncertainUpdErr) {
+          logEvent('persistence_error', 'error', 'Failed recording uncertain Meta timeout state on message', {
+            businessId,
+            messageId: createdMsg.id,
+            error: uncertainUpdErr.message,
+          });
+        }
+
+        return jsonResponse(
+          {
+            ok: false,
+            code: metaResult.errorCode ?? 'META_REQUEST_TIMEOUT',
+            deliveryStatus: 'pending',
+            reconciliationRequired: true,
+            doNotResend: true,
+            messageId: createdMsg.id,
+            error: metaResult.userMessage,
+            diagnostic: metaResult.diagnosticMessage,
+            message: uncertainMsg ?? createdMsg,
+          },
+          metaResult.httpStatus
+        );
+      }
+
+      const { data: failedMsg, error: failUpdErr } = await serviceClient
         .from('messages')
         .update({
           delivery_status: 'failed',
@@ -657,6 +1176,14 @@ Deno.serve(async (req: Request) => {
         .eq('id', createdMsg.id)
         .select('*')
         .single();
+
+      if (failUpdErr) {
+        logEvent('persistence_error', 'error', 'Failed updating rejected message to failed status', {
+          businessId,
+          messageId: createdMsg.id,
+          error: failUpdErr.message,
+        });
+      }
 
       await serviceClient.from('message_events').insert({
         business_id: businessId,
@@ -672,6 +1199,7 @@ Deno.serve(async (req: Request) => {
         {
           ok: false,
           code: metaResult.errorCode ?? 'META_SEND_FAILED',
+          deliveryStatus: 'failed',
           error: metaResult.userMessage ?? 'WhatsApp could not send this message.',
           diagnostic: metaResult.diagnosticMessage,
           message: failedMsg ?? createdMsg,
@@ -680,8 +1208,8 @@ Deno.serve(async (req: Request) => {
       );
     }
 
-    // 13. Meta accepted message -> mark strictly as 'submitted' (real webhooks advance sent/delivered/read)
-    const { data: submittedMsg } = await serviceClient
+    // 13. Meta accepted message -> explicitly verify DB update to 'submitted'
+    const { data: submittedMsg, error: submitUpdateErr } = await serviceClient
       .from('messages')
       .update({
         delivery_status: 'submitted',
@@ -695,32 +1223,108 @@ Deno.serve(async (req: Request) => {
       .select('*')
       .single();
 
-    await serviceClient.from('message_events').insert({
+    if (submitUpdateErr || !submittedMsg) {
+      logEvent('persistence_error', 'error', 'Meta accepted message but messages DB update failed (reconciliation required)', {
+        businessId,
+        conversationId,
+        messageId: createdMsg.id,
+        metaMessageId: metaResult.metaMessageId,
+        clientRequestId: clientRequestId ?? null,
+        errorCode: submitUpdateErr?.code ?? 'NO_ROW_RETURNED',
+        error: submitUpdateErr?.message ?? 'messages update returned no row',
+      });
+
+      // Best-effort audit trail in message_events so meta_message_id is preserved for reconciliation
+      await serviceClient
+        .from('message_events')
+        .insert({
+          business_id: businessId,
+          message_id: createdMsg.id,
+          event_type: 'submitted',
+          raw_payload: {
+            reconciliation_required: true,
+            meta_message_id: metaResult.metaMessageId,
+            db_update_error: submitUpdateErr?.message ?? 'messages update returned no row',
+            meta_response: metaResult.rawResponse ?? null,
+          },
+        })
+        .then(({ error: evtErr }) => {
+          if (evtErr) {
+            logEvent('persistence_error', 'error', 'Fallback message_events reconciliation insert also failed', {
+              businessId,
+              messageId: createdMsg.id,
+              metaMessageId: metaResult.metaMessageId,
+              error: evtErr.message,
+            });
+          }
+        });
+
+      return jsonResponse(
+        {
+          ok: false,
+          code: 'PERSISTENCE_RECONCILIATION_REQUIRED',
+          reconciliationRequired: true,
+          metaAccepted: true,
+          doNotResend: true,
+          deliveryStatus: 'pending',
+          messageId: createdMsg.id,
+          metaMessageId: metaResult.metaMessageId,
+          error:
+            'WhatsApp accepted this message, but recording the confirmation in Supabase failed. Do NOT resend this message; reconcile the pending record using metaMessageId and messageId.',
+          diagnostic: submitUpdateErr?.message ?? 'messages UPDATE returned no row',
+          message: createdMsg,
+        },
+        500
+      );
+    }
+
+    const { error: eventErr } = await serviceClient.from('message_events').insert({
       business_id: businessId,
       message_id: createdMsg.id,
       event_type: 'submitted',
       raw_payload: metaResult.rawResponse ?? { meta_message_id: metaResult.metaMessageId },
     });
+    if (eventErr) {
+      logEvent('persistence_error', 'warn', 'Non-fatal message_events submitted insert failure', {
+        businessId,
+        messageId: createdMsg.id,
+        error: eventErr.message,
+      });
+    }
 
-    await serviceClient
+    const { error: convUpdErr } = await serviceClient
       .from('conversations')
       .update({
-        last_message_preview: trimmedBody.slice(0, 140),
+        last_message_preview: storedMessageBody.slice(0, 140),
         last_message_at: nowIso,
         unread_count: 0,
       })
       .eq('id', conversationId);
+    if (convUpdErr) {
+      logEvent('persistence_error', 'warn', 'Non-fatal conversations preview update failure', {
+        businessId,
+        conversationId,
+        error: convUpdErr.message,
+      });
+    }
 
-    await serviceClient
+    const { error: contactUpdErr } = await serviceClient
       .from('contacts')
       .update({ last_contacted_at: nowIso })
       .eq('id', String(contactObj.id));
+    if (contactUpdErr) {
+      logEvent('persistence_error', 'warn', 'Non-fatal contacts last_contacted_at update failure', {
+        businessId,
+        contactId: contactObj.id,
+        error: contactUpdErr.message,
+      });
+    }
 
     return jsonResponse({
       ok: true,
       deliveryStatus: 'submitted',
       metaMessageId: metaResult.metaMessageId,
-      message: submittedMsg ?? createdMsg,
+      message: submittedMsg,
     });
   } catch (err) {
     logEvent('meta_api_error', 'error', 'Unhandled exception in whatsapp-send-message', {

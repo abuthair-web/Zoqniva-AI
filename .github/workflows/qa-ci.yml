@@ -1,0 +1,147 @@
+name: Zoqniva AI — Automated QA, Persistence & Security CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+  workflow_dispatch:
+    inputs:
+      run_staging_live_tests:
+        description: 'Run live staging Supabase persistence & RLS suites (NEVER sends WhatsApp messages)'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+
+permissions:
+  contents: read
+
+jobs:
+  typecheck-build-unit-security:
+    name: TypeScript, Build, Unit & Static Security
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: TypeScript strict validation
+        run: npm run lint
+
+      - name: Production Vite build
+        run: npm run build
+
+      - name: Run Unit, Mocked WhatsApp & Static Security suites
+        run: npm run test
+
+      - name: Generate QA Report (JSON & Markdown)
+        run: npm run test:report
+
+      - name: Upload QA Report artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zoqniva-qa-reports
+          path: qa-reports/
+          retention-days: 14
+
+  playwright-browser-ui:
+    name: Playwright Browser UI & Unauthenticated Security Guards
+    runs-on: ubuntu-latest
+    needs: typecheck-build-unit-security
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Playwright Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: Run Playwright browser UI smoke tests (non-live)
+        run: npm run test:e2e
+
+      - name: Upload Playwright report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-ui-report
+          path: qa-reports/playwright-results.json
+          retention-days: 7
+
+  deno-edge-function-tests:
+    name: Deno Edge Function Contract Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Deno
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      - name: Run Deno Edge Function tests
+        run: npm run test:edge
+
+  staging-live-persistence-and-rls:
+    name: Staging Live Supabase Persistence & 5-Role RLS (Manual / Non-Production Only)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && inputs.run_staging_live_tests == 'true'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run Live Staging Supabase Persistence Integration Tests
+        env:
+          ALLOW_LIVE_TEST_DB: 'true'
+          TEST_SUPABASE_URL: ${{ secrets.TEST_SUPABASE_URL }}
+          TEST_SUPABASE_PUBLISHABLE_KEY: ${{ secrets.TEST_SUPABASE_PUBLISHABLE_KEY }}
+          TEST_BUSINESS_A_ID: ${{ secrets.TEST_BUSINESS_A_ID }}
+          TEST_ADMIN_A_EMAIL: ${{ secrets.TEST_ADMIN_A_EMAIL }}
+          TEST_ADMIN_A_PASSWORD: ${{ secrets.TEST_ADMIN_A_PASSWORD }}
+        run: npm run test:integration
+
+      - name: Run Live Staging 5-Role RLS Security Tests
+        env:
+          ALLOW_LIVE_TEST_DB: 'true'
+          TEST_SUPABASE_URL: ${{ secrets.TEST_SUPABASE_URL }}
+          TEST_SUPABASE_PUBLISHABLE_KEY: ${{ secrets.TEST_SUPABASE_PUBLISHABLE_KEY }}
+          TEST_BUSINESS_A_ID: ${{ secrets.TEST_BUSINESS_A_ID }}
+          TEST_BUSINESS_B_ID: ${{ secrets.TEST_BUSINESS_B_ID }}
+          TEST_ADMIN_A_EMAIL: ${{ secrets.TEST_ADMIN_A_EMAIL }}
+          TEST_ADMIN_A_PASSWORD: ${{ secrets.TEST_ADMIN_A_PASSWORD }}
+          TEST_AGENT_A_EMAIL: ${{ secrets.TEST_AGENT_A_EMAIL }}
+          TEST_AGENT_A_PASSWORD: ${{ secrets.TEST_AGENT_A_PASSWORD }}
+          TEST_ADMIN_B_EMAIL: ${{ secrets.TEST_ADMIN_B_EMAIL }}
+          TEST_ADMIN_B_PASSWORD: ${{ secrets.TEST_ADMIN_B_PASSWORD }}
+          TEST_INACTIVE_EMAIL: ${{ secrets.TEST_INACTIVE_EMAIL }}
+          TEST_INACTIVE_PASSWORD: ${{ secrets.TEST_INACTIVE_PASSWORD }}
+        run: npm run test:security:live
