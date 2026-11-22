@@ -1,5 +1,5 @@
 {
-  "generatedAt": "2026-11-19T09:06:13.239Z",
+  "generatedAt": "2026-11-22T17:25:30.912Z",
   "environment": {
     "nodeVersion": "v22.23.2",
     "liveStagingDbConfigured": false,
@@ -7,8 +7,8 @@
   },
   "summary": {
     "localExecutedAutomatedTests": {
-      "total": 67,
-      "PASSED": 67,
+      "total": 69,
+      "PASSED": 69,
       "FAILED": 0,
       "BLOCKED": 0,
       "NOT_TESTED": 0,
@@ -31,8 +31,8 @@
       "NOT_IMPLEMENTED": 1
     },
     "overallMatrix": {
-      "total": 82,
-      "PASSED": 67,
+      "total": 84,
+      "PASSED": 69,
       "FAILED": 5,
       "BLOCKED": 5,
       "NOT_TESTED": 4,
@@ -222,6 +222,28 @@
       "feature": "Campaign Engine V1 — Phase 1 (Local / Mocked Unit & Contract Suite)",
       "databaseTable": "public.campaigns, public.campaign_runs, public.campaign_recipients, public.campaign_events",
       "testPerformed": "[Local/Mocked] ensures preflight SQL is strictly read-only and migration 004 defines required Phase 1 foundations safely",
+      "result": "PASSED",
+      "error": "None",
+      "severity": "None",
+      "recommendedFix": "None required"
+    },
+    {
+      "scope": "local_mocked_or_static",
+      "module": "Campaign Engine V1 (Phase 1)",
+      "feature": "Campaign Engine V1 — Phase 1 (Local / Mocked Unit & Contract Suite)",
+      "databaseTable": "public.campaigns, public.campaign_runs, public.campaign_recipients, public.campaign_events",
+      "testPerformed": "[Local/Mocked] calls campaign-preflight for server validation and surfaces 401, 403, 422, 503 MIGRATION_NOT_APPLIED, PGRST202/204 honestly",
+      "result": "PASSED",
+      "error": "None",
+      "severity": "None",
+      "recommendedFix": "None required"
+    },
+    {
+      "scope": "local_mocked_or_static",
+      "module": "Campaign Engine V1 (Phase 1)",
+      "feature": "Campaign Engine V1 — Phase 1 (Local / Mocked Unit & Contract Suite)",
+      "databaseTable": "public.campaigns, public.campaign_runs, public.campaign_recipients, public.campaign_events",
+      "testPerformed": "[Local/Mocked] updates saved drafts with verified columns, paginates >1000 contacts, and handles alternate whatsapp_accounts phone columns",
       "result": "PASSED",
       "error": "None",
       "severity": "None",

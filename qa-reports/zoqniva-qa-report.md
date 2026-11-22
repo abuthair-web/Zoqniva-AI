@@ -1,6 +1,6 @@
 # Zoqniva AI — Automated QA, Persistence & Security Report
 
-Generated: `2026-11-19T09:06:13.239Z`  
+Generated: `2026-11-22T17:25:30.912Z`  
 Node Runtime: `v22.23.2`
 
 > **Verification Integrity Notice:** Local/mocked Vitest results validate frontend logic, payload construction, schema safety, and security invariants, and are **strictly separated** from live Supabase persistence, pgTAP RLS, Playwright browser, Deno Edge, and live WhatsApp tests. Mocked tests are **never** counted as proof of live Supabase persistence.
@@ -9,7 +9,7 @@ Node Runtime: `v22.23.2`
 
 | Category | Total | PASSED | FAILED | BLOCKED | NOT TESTED | NOT IMPLEMENTED |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Local Executed Automated Tests (TypeScript + Vitest Unit/Mocked/Static Security) | 67 | 67 | 0 | 0 | 0 | 0 |
+| Local Executed Automated Tests (TypeScript + Vitest Unit/Mocked/Static Security) | 69 | 69 | 0 | 0 | 0 | 0 |
 | Browser E2E Tests (Playwright) | 1 | 0 | 0 | 1 | 0 | 0 |
 | Live Staging DB / Edge / WhatsApp & Static Codebase Audit | 14 | 0 | 5 | 4 | 4 | 1 |
 
@@ -34,6 +34,8 @@ Node Runtime: `v22.23.2`
 | Campaign Engine V1 (Phase 1) | Campaign Engine V1 — Phase 1 (Local / Mocked Unit & Contract Suite) | public.campaigns, public.campaign_runs, public.campaign_recipients, public.campaign_events | [Local/Mocked] never dispatches WhatsApp messages or calls Meta Graph API during draft, preflight, or snapshot flows | **PASSED** | None | None | None required |
 | Campaign Engine V1 (Phase 1) | Campaign Engine V1 — Phase 1 (Local / Mocked Unit & Contract Suite) | public.campaigns, public.campaign_runs, public.campaign_recipients, public.campaign_events | [Local/Mocked] recomputes fresh DB-verified validation results after restoring a saved draft across page refresh | **PASSED** | None | None | None required |
 | Campaign Engine V1 (Phase 1) | Campaign Engine V1 — Phase 1 (Local / Mocked Unit & Contract Suite) | public.campaigns, public.campaign_runs, public.campaign_recipients, public.campaign_events | [Local/Mocked] ensures preflight SQL is strictly read-only and migration 004 defines required Phase 1 foundations safely | **PASSED** | None | None | None required |
+| Campaign Engine V1 (Phase 1) | Campaign Engine V1 — Phase 1 (Local / Mocked Unit & Contract Suite) | public.campaigns, public.campaign_runs, public.campaign_recipients, public.campaign_events | [Local/Mocked] calls campaign-preflight for server validation and surfaces 401, 403, 422, 503 MIGRATION_NOT_APPLIED, PGRST202/204 honestly | **PASSED** | None | None | None required |
+| Campaign Engine V1 (Phase 1) | Campaign Engine V1 — Phase 1 (Local / Mocked Unit & Contract Suite) | public.campaigns, public.campaign_runs, public.campaign_recipients, public.campaign_events | [Local/Mocked] updates saved drafts with verified columns, paginates >1000 contacts, and handles alternate whatsapp_accounts phone columns | **PASSED** | None | None | None required |
 | Team Inbox (Conversations) | Team Inbox conversation persistence service (mocked Supabase — zero live WhatsApp calls) | public.conversations, public.messages | [Local/Mocked] 1. Create conversation persists in Supabase via INSERT + read-back without client-invented UUID or protected window columns | **PASSED** | None | None | None required |
 | Team Inbox (Conversations) | Team Inbox conversation persistence service (mocked Supabase — zero live WhatsApp calls) | public.conversations, public.messages | [Local/Mocked] 2. Page refresh / reload returns same persisted conversation UUID and clears stale selection / orphan messages | **PASSED** | None | None | None required |
 | Team Inbox (Conversations) | Team Inbox conversation persistence service (mocked Supabase — zero live WhatsApp calls) | public.conversations, public.messages | [Local/Mocked] 3. Selecting an existing contact reuses persisted conversation without duplicate creation, including concurrent clicks and 23505 race | **PASSED** | None | None | None required |

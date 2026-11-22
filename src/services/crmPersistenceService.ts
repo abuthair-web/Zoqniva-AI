@@ -1112,11 +1112,23 @@ export function validateCampaignInput(input: {
   return { ok: true, cleanName, scheduledIso };
 }
 
+// Verified live public.campaigns columns (never assume nonexistent legacy columns)
+const DEFAULT_LIVE_CAMPAIGN_COLUMNS = new Set<string>([
+  'business_id',
+  'name',
+  'template_id',
+  'audience_filter',
+  'status',
+  'scheduled_at',
+  'created_by',
+]);
+
 export function buildCampaignInsertPayload(
   input: CampaignCreateInput & { scheduledIso: string | null },
   knownCols: Set<string> | null,
   missingCols: Set<string> = new Set()
 ): Record<string, unknown> {
+  const effectiveCols = knownCols && knownCols.size > 0 ? knownCols : DEFAULT_LIVE_CAMPAIGN_COLUMNS;
   const payload: Record<string, unknown> = {
     business_id: input.businessId,
     name: input.name.trim(),
@@ -1127,50 +1139,50 @@ export function buildCampaignInsertPayload(
   const validTagIds = input.targetTagIds.filter((tid) => UUID_REGEX.test(tid));
   const validContactIds = (input.targetContactIds ?? []).filter((cid) => UUID_REGEX.test(cid));
 
-  if (canWriteColumn('target_tag_ids', knownCols, missingCols)) {
+  if (canWriteColumn('target_tag_ids', effectiveCols, missingCols)) {
     payload.target_tag_ids = validTagIds;
   }
-  if (canWriteColumn('variable_mapping', knownCols, missingCols)) {
+  if (canWriteColumn('variable_mapping', effectiveCols, missingCols)) {
     payload.variable_mapping = input.variableMapping ?? {};
   }
 
-  // Handle either `scheduled_for` (001_initial_schema) or `scheduled_at` if live schema uses it
-  if (knownCols && !knownCols.has('scheduled_for') && knownCols.has('scheduled_at')) {
+  // Handle either `scheduled_at` (verified live schema) or `scheduled_for` (legacy 001 schema)
+  if (effectiveCols.has('scheduled_at') && !missingCols.has('scheduled_at')) {
     payload.scheduled_at = input.scheduledIso;
-  } else if (canWriteColumn('scheduled_for', knownCols, missingCols)) {
+  } else if (canWriteColumn('scheduled_for', effectiveCols, missingCols)) {
     payload.scheduled_for = input.scheduledIso;
   }
 
-  if (canWriteColumn('selected_count', knownCols, missingCols)) {
+  if (canWriteColumn('selected_count', effectiveCols, missingCols)) {
     payload.selected_count = Math.max(0, Math.floor(input.selectedCount));
   }
-  if (canWriteColumn('eligible_count', knownCols, missingCols)) {
+  if (canWriteColumn('eligible_count', effectiveCols, missingCols)) {
     payload.eligible_count = Math.max(0, Math.floor(input.eligibleCount));
   }
-  if (canWriteColumn('total_recipients', knownCols, missingCols, true)) {
+  if (canWriteColumn('total_recipients', effectiveCols, missingCols, true)) {
     payload.total_recipients = Math.max(0, Math.floor(input.eligibleCount));
   }
-  if (canWriteColumn('submitted_count', knownCols, missingCols)) {
+  if (canWriteColumn('submitted_count', effectiveCols, missingCols)) {
     payload.submitted_count = 0;
   }
-  if (canWriteColumn('sent_count', knownCols, missingCols)) {
+  if (canWriteColumn('sent_count', effectiveCols, missingCols)) {
     payload.sent_count = 0;
   }
-  if (canWriteColumn('delivered_count', knownCols, missingCols)) {
+  if (canWriteColumn('delivered_count', effectiveCols, missingCols)) {
     payload.delivered_count = 0;
   }
-  if (canWriteColumn('read_count', knownCols, missingCols)) {
+  if (canWriteColumn('read_count', effectiveCols, missingCols)) {
     payload.read_count = 0;
   }
-  if (canWriteColumn('failed_count', knownCols, missingCols)) {
+  if (canWriteColumn('failed_count', effectiveCols, missingCols)) {
     payload.failed_count = 0;
   }
-  if (canWriteColumn('skipped_count', knownCols, missingCols)) {
+  if (canWriteColumn('skipped_count', effectiveCols, missingCols)) {
     payload.skipped_count = Math.max(0, Math.floor(input.skippedCount));
   }
 
-  // Only include non-standard columns if explicitly confirmed in live public.campaigns
-  if (canWriteColumn('audience_filter', knownCols, missingCols, true)) {
+  // Store audience_filter JSONB (including variable_mapping) in the exact format campaign-preflight expects
+  if (canWriteColumn('audience_filter', effectiveCols, missingCols, true)) {
     const cleanVarMap: Record<string, string> = {};
     for (const [k, v] of Object.entries(input.variableMapping ?? {})) {
       if (typeof v === 'string' && v.trim().length > 0) {
@@ -1184,16 +1196,16 @@ export function buildCampaignInsertPayload(
       ...(Object.keys(cleanVarMap).length > 0 ? { variable_mapping: cleanVarMap } : {}),
     };
   }
-  if (input.audienceMode && canWriteColumn('audience_mode', knownCols, missingCols, true)) {
+  if (input.audienceMode && canWriteColumn('audience_mode', effectiveCols, missingCols, true)) {
     payload.audience_mode = input.audienceMode;
   }
-  if (validContactIds.length > 0 && canWriteColumn('target_contact_ids', knownCols, missingCols, true)) {
+  if (validContactIds.length > 0 && canWriteColumn('target_contact_ids', effectiveCols, missingCols, true)) {
     payload.target_contact_ids = validContactIds;
   }
   if (
     input.createdBy &&
     UUID_REGEX.test(input.createdBy) &&
-    canWriteColumn('created_by', knownCols, missingCols, true)
+    canWriteColumn('created_by', effectiveCols, missingCols, true)
   ) {
     payload.created_by = input.createdBy;
   }
@@ -1294,7 +1306,13 @@ export async function createCampaignInDb(
     };
   }
 
-  const persistedId = String(insertedRow.id);
+  const persistedId = String(insertedRow.id ?? '');
+  if (!UUID_REGEX.test(persistedId)) {
+    return {
+      ok: false,
+      error: 'Campaign insert did not return a valid persisted campaign ID from Supabase.',
+    };
+  }
 
   // Re-fetch persisted campaign from Supabase to verify read-back & persistence across refresh
   const { data: verifiedRow, error: verifyErr } = await supabase
@@ -1304,7 +1322,7 @@ export async function createCampaignInDb(
     .eq('business_id', input.businessId)
     .single();
 
-  if (verifyErr || !verifiedRow) {
+  if (verifyErr || !verifiedRow || String((verifiedRow as Record<string, unknown>).id ?? '') !== persistedId) {
     return {
       ok: false,
       error: verifyErr
@@ -1315,6 +1333,135 @@ export async function createCampaignInDb(
 
   const mapped = mapDbCampaignRow(verifiedRow as Record<string, unknown>);
   // Preserve client audience counts/metadata cleanly if the live table lacks count columns
+  return {
+    ok: true,
+    campaign: {
+      ...mapped,
+      audienceMode: input.audienceMode ?? mapped.audienceMode,
+      targetContactIds: input.targetContactIds ?? mapped.targetContactIds,
+      metrics: {
+        ...mapped.metrics,
+        selected: mapped.metrics.selected || input.selectedCount,
+        eligible: mapped.metrics.eligible || input.eligibleCount,
+        skipped: mapped.metrics.skipped || input.skippedCount,
+      },
+    },
+  };
+}
+
+/**
+ * Updates an existing persisted campaign draft in public.campaigns with awaited read-back verification.
+ * NEVER creates phantom rows or triggers WhatsApp message delivery.
+ */
+export async function updateCampaignInDb(
+  input: CampaignCreateInput & { campaignId: string }
+): Promise<{ ok: boolean; campaign?: Campaign; error?: string }> {
+  if (!supabase) {
+    return { ok: false, error: 'Supabase client is not configured.' };
+  }
+  if (!UUID_REGEX.test(input.campaignId)) {
+    return { ok: false, error: 'Invalid campaign ID for update.' };
+  }
+
+  const validation = validateCampaignInput({
+    businessId: input.businessId,
+    name: input.name,
+    templateId: input.templateId,
+    scheduledFor: input.scheduledFor,
+    status: input.status,
+    requireBusinessId: true,
+  });
+
+  if (!validation.ok || !validation.cleanName) {
+    return { ok: false, error: validation.error || 'Invalid campaign details.' };
+  }
+
+  const { data: userRes, error: userErr } = await supabase.auth.getUser();
+  if (userErr || !userRes.user) {
+    return { ok: false, error: 'Your session has expired. Sign in again and retry.' };
+  }
+
+  const knownCols = await discoverTableColumns('campaigns');
+  const payload = buildCampaignInsertPayload(
+    {
+      ...input,
+      name: validation.cleanName,
+      scheduledIso: validation.scheduledIso ?? null,
+      createdBy: undefined,
+    },
+    knownCols,
+    getMissingTableColumns('campaigns')
+  );
+  delete payload.business_id;
+  delete payload.created_by;
+
+  let updatedRow: Record<string, unknown> | null = null;
+  let lastError: SupabaseLikeError | null = null;
+
+  for (let attempt = 0; attempt < 12; attempt++) {
+    const { data, error } = await supabase
+      .from('campaigns')
+      .update(payload)
+      .eq('id', input.campaignId)
+      .eq('business_id', input.businessId)
+      .select('*')
+      .single();
+
+    if (!error && data) {
+      updatedRow = data as Record<string, unknown>;
+      seedTableColumnsFromRows('campaigns', [updatedRow]);
+      lastError = null;
+      break;
+    }
+
+    lastError = error;
+    const missingCol = parsePgrst204MissingColumn(error);
+    if (
+      missingCol &&
+      missingCol in payload &&
+      !CAMPAIGN_CORE_PROTECTED_COLS.has(missingCol)
+    ) {
+      recordMissingColumn('campaigns', missingCol);
+      delete payload[missingCol];
+      continue;
+    }
+
+    break;
+  }
+
+  if (lastError || !updatedRow) {
+    return {
+      ok: false,
+      error: formatPersistenceError('campaign', lastError),
+    };
+  }
+
+  const persistedId = String(updatedRow.id ?? '');
+  if (persistedId !== input.campaignId) {
+    return {
+      ok: false,
+      error: 'Campaign update did not return the expected persisted campaign ID from Supabase.',
+    };
+  }
+
+  // Re-fetch persisted campaign from Supabase to verify durable read-back
+  const { data: verifiedRow, error: verifyErr } = await supabase
+    .from('campaigns')
+    .select('*')
+    .eq('id', persistedId)
+    .eq('business_id', input.businessId)
+    .single();
+
+  if (verifyErr || !verifiedRow || String((verifiedRow as Record<string, unknown>).id ?? '') !== persistedId) {
+    return {
+      ok: false,
+      error: verifyErr
+        ? `Campaign update could not be verified on read-back: ${formatPersistenceError('campaign', verifyErr)}`
+        : 'Campaign update could not be verified in Supabase after saving.',
+    };
+  }
+
+  const mapped = mapDbCampaignRow(verifiedRow as Record<string, unknown>);
   return {
     ok: true,
     campaign: {

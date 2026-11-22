@@ -45,6 +45,7 @@ import {
   mapDbCampaignRow,
   mapDbContactRow,
   seedTableColumnsFromRows,
+  updateCampaignInDb,
   updateCampaignStatusInDb,
   updateContactInDb,
 } from '@/services/crmPersistenceService';
@@ -57,12 +58,11 @@ import {
   verifyConversationInDb,
 } from '@/services/conversationPersistenceService';
 import {
-  createEmptyGroupedExclusions,
-  evaluateAudienceRows,
-  runCampaignGuardianPreflight,
-  validateTemplateComponentsForCampaign,
+  createCampaignSnapshotViaEdge,
+  validateCampaignViaPreflightEdge,
   type CampaignGuardianPreflightInput,
   type CampaignGuardianReport,
+  type CampaignSnapshotResult,
 } from '@/services/campaignEngineService';
 import type { User } from '@supabase/supabase-js';
 import type {
@@ -263,6 +263,24 @@ interface AppContextValue {
     eligibleCount: number;
     skippedCount: number;
   }) => Promise<{ ok: boolean; campaign?: Campaign; error?: string }>;
+  updateCampaign: (input: {
+    campaignId: string;
+    name: string;
+    templateId: string;
+    audienceMode?: 'all' | 'groups' | 'specific';
+    targetTagIds: string[];
+    targetContactIds?: string[];
+    variableMapping: Record<string, string>;
+    scheduleMode: 'immediate' | 'scheduled' | 'draft';
+    scheduledFor?: string;
+    selectedCount: number;
+    eligibleCount: number;
+    skippedCount: number;
+  }) => Promise<{ ok: boolean; campaign?: Campaign; error?: string }>;
+  createCampaignSnapshot: (input: {
+    campaignId: string;
+    idempotencyKey: string;
+  }) => Promise<CampaignSnapshotResult>;
   duplicateCampaign: (id: string) => Promise<{ ok: boolean; campaign?: Campaign; error?: string }>;
   updateCampaignStatus: (
     id: string,
@@ -2288,197 +2306,46 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     };
 
   // ============================================================================
-  // BROADCASTS & TEMPLATES (Real Supabase persistence; saving a draft NEVER sends WhatsApp)
+  // BROADCASTS & TEMPLATES (Server-backed campaign-preflight & awaited Supabase persistence)
   // ============================================================================
   const validateCampaignPreflight: AppContextValue['validateCampaignPreflight'] = useCallback(
     async (input) => {
-      if (supabase && isSupabaseConfigured) {
-        return runCampaignGuardianPreflight({
-          ...input,
-          businessId: business.id,
-        });
-      }
-
-      // Local fallback only when Supabase client is not configured
-      const matched =
-        input.audienceFilter.mode === 'groups'
-          ? (input.audienceFilter.tagIds?.length ?? 0) === 0
-            ? []
-            : contacts.filter((c) =>
-                c.tagIds.some((tid) => (input.audienceFilter.tagIds ?? []).includes(tid))
-              )
-          : input.audienceFilter.mode === 'specific'
-          ? contacts.filter((c) => (input.audienceFilter.contactIds ?? []).includes(c.id))
-          : contacts;
-
-      const evaluated = evaluateAudienceRows({
-        mode: input.audienceFilter.mode,
-        matchedContacts: matched.map((c) => ({
-          id: c.id,
-          full_name: c.fullName,
-          phone_e164: c.phoneE164,
-          marketing_opt_in: c.marketingOptIn,
-          opt_in_status: c.marketingOptIn ? 'opted_in' : 'none',
-          opted_out_at: null,
-        })),
+      return validateCampaignViaPreflightEdge({
+        ...input,
+        businessId: business.id,
       });
-
-      const tpl = templates.find((t) => t.id === input.templateId) ?? null;
-      const tplApproved = tpl?.approvalStatus === 'APPROVED' && Boolean(tpl?.metaTemplateId);
-      const paramCheck = tpl
-        ? validateTemplateComponentsForCampaign(tpl.components ?? [], input.variableMapping ?? {})
-        : null;
-
-      const blockingReasons: string[] = [];
-      if (currentUser?.role !== 'admin') {
-        blockingReasons.push('Only active workspace administrators can validate or prepare campaigns.');
-      }
-      if (!tpl || !tplApproved) {
-        blockingReasons.push('Select a Meta-approved synchronized WhatsApp template.');
-      }
-      if (paramCheck && !paramCheck.ok) {
-        blockingReasons.push(
-          paramCheck.missingVariables.length > 0
-            ? `Missing template parameters: ${paramCheck.missingVariables.map((v) => `{{${v}}}`).join(', ')}.`
-            : paramCheck.unsupportedReasons.join(' ')
-        );
-      }
-      if (evaluated.eligibleCount === 0) {
-        blockingReasons.push('No eligible opted-in contacts with valid E.164 numbers matched.');
-      }
-
-      const validatedAt = new Date().toISOString();
-      return {
-        ok: blockingReasons.length === 0,
-        canSaveDraft: Boolean(tpl) && currentUser?.role === 'admin',
-        canLaunchBulk: false,
-        phase1DispatchBlocked: true,
-        messagingMode: business.messagingMode,
-        whatsappConnected: business.metaConnectionState === 'connected',
-        whatsappAccountId: null,
-        testAllowlistCount: business.testAllowlist.length,
-        eligibleInTestAllowlist: 0,
-        eligibleOutsideTestAllowlist: evaluated.eligibleCount,
-        checks: [
-          {
-            code: 'active_admin',
-            label: 'Active Administrator',
-            status: currentUser?.role === 'admin' ? 'pass' : 'fail',
-            message:
-              currentUser?.role === 'admin'
-                ? 'Active administrator role confirmed.'
-                : 'Administrator role required.',
-          },
-          {
-            code: 'template_approval',
-            label: 'Approved Meta Template',
-            status: tplApproved ? 'pass' : 'fail',
-            message: tplApproved
-              ? `Approved template "${tpl?.name}" (${tpl?.language}).`
-              : 'Selected template is not Meta-approved.',
-          },
-          {
-            code: 'audience_eligibility',
-            label: 'Eligible Opted-In Audience',
-            status: evaluated.eligibleCount > 0 ? 'pass' : 'fail',
-            message: `${evaluated.eligibleCount} eligible, ${evaluated.excludedCount} excluded.`,
-          },
-          {
-            code: 'phase1_dispatch_guard',
-            label: 'Phase 1 Dispatch Guard',
-            status: 'warn',
-            message: 'Bulk sending is disabled in Phase 1. Campaigns can be validated and saved as drafts only.',
-          },
-        ],
-        blockingReasons,
-        warnings: [
-          business.messagingMode === 'test'
-            ? 'Test Mode is active — bulk campaign dispatch is disabled.'
-            : 'Phase 1 foundation — bulk dispatch is disabled; saving persists a draft only.',
-        ],
-        templateSummary: tpl
-          ? {
-              id: tpl.id,
-              name: tpl.name,
-              language: tpl.language,
-              category: tpl.category,
-              status: tpl.approvalStatus.toLowerCase(),
-              metaTemplateId: tpl.metaTemplateId ?? null,
-              requiredVariables: paramCheck?.requiredBodyVariables ?? [],
-            }
-          : null,
-        audience: {
-          ...evaluated,
-          groupedExclusions: evaluated.groupedExclusions ?? createEmptyGroupedExclusions(),
-        },
-        validatedAt,
-        source: 'supabase_db',
-      };
     },
-    [business.id, business.messagingMode, business.metaConnectionState, business.testAllowlist.length, contacts, currentUser?.role, templates]
+    [business.id]
   );
 
   const createCampaign: AppContextValue['createCampaign'] = async (input) => {
-    const isMetaLive =
-      business.metaConnectionState === 'connected' && business.messagingMode === 'live';
+    if (!supabase || !isSupabaseConfigured) {
+      return {
+        ok: false,
+        error: 'Supabase is not configured. Connect Supabase before saving campaign drafts.',
+      };
+    }
+
+    if (!UUID_REGEX.test(business.id)) {
+      return {
+        ok: false,
+        error: 'Active business workspace could not be verified. Refresh and sign in again.',
+      };
+    }
+
     // Phase 1 safety: never mark a campaign as running or trigger any WhatsApp dispatch.
-    // In Test Mode or when Meta is disconnected, always persist strictly as 'draft'.
     const nextStatus: Campaign['status'] =
-      input.scheduleMode === 'draft' || !isMetaLive
-        ? 'draft'
-        : input.scheduleMode === 'scheduled'
+      input.scheduleMode === 'scheduled' &&
+      business.metaConnectionState === 'connected' &&
+      business.messagingMode === 'live'
         ? 'scheduled'
         : 'draft';
 
     const scheduledForValue = nextStatus === 'scheduled' ? input.scheduledFor : undefined;
 
-    if (supabase && isSupabaseConfigured) {
-      if (!UUID_REGEX.test(business.id)) {
-        return {
-          ok: false,
-          error: 'Active business workspace could not be verified. Refresh and sign in again.',
-        };
-      }
-
-      const dbRes = await createCampaignInDb({
-        businessId: business.id,
-        name: input.name,
-        templateId: input.templateId,
-        status: nextStatus,
-        audienceMode: input.audienceMode ?? 'groups',
-        targetTagIds: input.targetTagIds,
-        targetContactIds: input.targetContactIds,
-        variableMapping: input.variableMapping,
-        scheduledFor: scheduledForValue,
-        selectedCount: input.selectedCount,
-        eligibleCount: input.eligibleCount,
-        skippedCount: input.skippedCount,
-        createdBy: currentUser?.id ?? null,
-      });
-
-      if (!dbRes.ok || !dbRes.campaign) {
-        return {
-          ok: false,
-          error: dbRes.error || 'Could not save campaign draft to Supabase.',
-        };
-      }
-
-      const persisted = dbRes.campaign;
-      setCampaigns((prev) => [persisted, ...prev.filter((c) => c.id !== persisted.id)]);
-      setRecentTemplateIds((prev) =>
-        [input.templateId, ...prev.filter((tid) => tid !== input.templateId)].slice(0, 5)
-      );
-      appendAudit(
-        persisted.status === 'draft' ? 'Saved Campaign Draft' : 'Created Broadcast Campaign',
-        'campaign',
-        `${persisted.name} (${persisted.metrics.eligible} eligible)`
-      );
-      return { ok: true, campaign: persisted };
-    }
-
-    const campaign: Campaign = {
-      id: crypto.randomUUID(),
-      name: input.name.trim(),
+    const dbRes = await createCampaignInDb({
+      businessId: business.id,
+      name: input.name,
       templateId: input.templateId,
       status: nextStatus,
       audienceMode: input.audienceMode ?? 'groups',
@@ -2486,29 +2353,117 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       targetContactIds: input.targetContactIds,
       variableMapping: input.variableMapping,
       scheduledFor: scheduledForValue,
-      createdAt: new Date().toISOString(),
-      metrics: {
-        selected: input.selectedCount,
-        eligible: input.eligibleCount,
-        submitted: 0,
-        sent: 0,
-        delivered: 0,
-        read: 0,
-        failed: 0,
-        skipped: input.skippedCount,
-      },
-    };
-    setCampaigns((prev) => [campaign, ...prev]);
+      selectedCount: input.selectedCount,
+      eligibleCount: input.eligibleCount,
+      skippedCount: input.skippedCount,
+      createdBy: currentUser?.id ?? null,
+    });
+
+    if (!dbRes.ok || !dbRes.campaign) {
+      return {
+        ok: false,
+        error: dbRes.error || 'Could not save campaign draft to Supabase.',
+      };
+    }
+
+    const persisted = dbRes.campaign;
+    setCampaigns((prev) => [persisted, ...prev.filter((c) => c.id !== persisted.id)]);
     setRecentTemplateIds((prev) =>
       [input.templateId, ...prev.filter((tid) => tid !== input.templateId)].slice(0, 5)
     );
     appendAudit(
-      'Saved Campaign Draft',
+      persisted.status === 'draft' ? 'Saved Campaign Draft' : 'Scheduled Campaign Draft',
       'campaign',
-      `${campaign.name} (${campaign.metrics.eligible} eligible)`
+      `${persisted.name} (id: ${persisted.id})`
     );
-    return { ok: true, campaign };
+    return { ok: true, campaign: persisted };
   };
+
+  const updateCampaign: AppContextValue['updateCampaign'] = async (input) => {
+    if (!supabase || !isSupabaseConfigured) {
+      return {
+        ok: false,
+        error: 'Supabase is not configured. Connect Supabase before updating campaign drafts.',
+      };
+    }
+
+    if (!UUID_REGEX.test(business.id) || !UUID_REGEX.test(input.campaignId)) {
+      return {
+        ok: false,
+        error: 'Active business workspace or campaign ID could not be verified.',
+      };
+    }
+
+    const nextStatus: Campaign['status'] =
+      input.scheduleMode === 'scheduled' &&
+      business.metaConnectionState === 'connected' &&
+      business.messagingMode === 'live'
+        ? 'scheduled'
+        : 'draft';
+
+    const scheduledForValue = nextStatus === 'scheduled' ? input.scheduledFor : undefined;
+
+    const dbRes = await updateCampaignInDb({
+      campaignId: input.campaignId,
+      businessId: business.id,
+      name: input.name,
+      templateId: input.templateId,
+      status: nextStatus,
+      audienceMode: input.audienceMode ?? 'groups',
+      targetTagIds: input.targetTagIds,
+      targetContactIds: input.targetContactIds,
+      variableMapping: input.variableMapping,
+      scheduledFor: scheduledForValue,
+      selectedCount: input.selectedCount,
+      eligibleCount: input.eligibleCount,
+      skippedCount: input.skippedCount,
+    });
+
+    if (!dbRes.ok || !dbRes.campaign) {
+      return {
+        ok: false,
+        error: dbRes.error || 'Could not update campaign draft in Supabase.',
+      };
+    }
+
+    const persisted = dbRes.campaign;
+    setCampaigns((prev) => [persisted, ...prev.filter((c) => c.id !== persisted.id)]);
+    setRecentTemplateIds((prev) =>
+      [input.templateId, ...prev.filter((tid) => tid !== input.templateId)].slice(0, 5)
+    );
+    appendAudit(
+      'Updated Campaign Draft',
+      'campaign',
+      `${persisted.name} (id: ${persisted.id})`
+    );
+    return { ok: true, campaign: persisted };
+  };
+
+  const createCampaignSnapshot: AppContextValue['createCampaignSnapshot'] = useCallback(
+    async ({ campaignId, idempotencyKey }) => {
+      if (!supabase || !isSupabaseConfigured) {
+        return {
+          ok: false,
+          code: 'SUPABASE_NOT_CONFIGURED',
+          error: 'Supabase is not configured.',
+        };
+      }
+      const res = await createCampaignSnapshotViaEdge({
+        businessId: business.id,
+        campaignId,
+        idempotencyKey,
+      });
+      if (res.ok && res.runId) {
+        appendAudit(
+          res.replayed ? 'Replayed Campaign Snapshot' : 'Created Campaign Snapshot',
+          'campaign',
+          `Campaign ${campaignId} -> run #${res.runNumber ?? '?'} (${res.status ?? 'validated'}, ${res.eligibleCount ?? 0} eligible, 0 sent)`
+        );
+      }
+      return res;
+    },
+    [business.id]
+  );
 
   const duplicateCampaign: AppContextValue['duplicateCampaign'] = async (id) => {
     const source = campaigns.find((c) => c.id === id);
@@ -3269,6 +3224,8 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     openOrCreateConversationForContact,
     validateCampaignPreflight,
     createCampaign,
+    updateCampaign,
+    createCampaignSnapshot,
     duplicateCampaign,
     updateCampaignStatus,
     createTemplateDraft,

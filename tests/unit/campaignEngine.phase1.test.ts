@@ -30,6 +30,10 @@ const { mockState, mockSupabase } = vi.hoisted(() => {
     tables: Record<string, Array<Record<string, unknown>>>;
     invokedFunctions: Array<{ name: string; body: unknown }>;
     insertedCampaigns: Array<Record<string, unknown>>;
+    updatedCampaigns: Array<Record<string, unknown>>;
+    nextEdgeResponse:
+      | null
+      | ((name: string, body: Record<string, unknown>) => Promise<{ data: unknown; error: unknown }> | { data: unknown; error: unknown });
   }
 
   const state: MockDbState = {
@@ -37,22 +41,50 @@ const { mockState, mockSupabase } = vi.hoisted(() => {
     tables: {},
     invokedFunctions: [],
     insertedCampaigns: [],
+    updatedCampaigns: [],
+    nextEdgeResponse: null,
   };
 
   function createQueryBuilder(table: string) {
     const filters: Array<{ op: 'eq' | 'in'; col: string; val: unknown }> = [];
     let limitCount: number | null = null;
+    let rangeSlice: [number, number] | null = null;
     let pendingInsert: Record<string, unknown> | null = null;
+    let pendingUpdate: Record<string, unknown> | null = null;
 
-    const evaluateRows = () => {
-      const rows = (state.tables[table] ?? []).filter((row) =>
+    const matchRows = () =>
+      (state.tables[table] ?? []).filter((row) =>
         filters.every((f) => {
           if (f.op === 'eq') return row[f.col] === f.val;
           if (f.op === 'in') return Array.isArray(f.val) && f.val.includes(row[f.col]);
           return true;
         })
       );
-      return limitCount !== null ? rows.slice(0, limitCount) : rows;
+
+    const evaluateRows = () => {
+      let rows = matchRows();
+      if (rangeSlice) {
+        rows = rows.slice(rangeSlice[0], rangeSlice[1] + 1);
+      }
+      if (limitCount !== null) {
+        rows = rows.slice(0, limitCount);
+      }
+      return rows;
+    };
+
+    const applyPendingUpdate = () => {
+      if (!pendingUpdate) return null;
+      const matches = matchRows();
+      if (matches.length === 0) return null;
+      const target = matches[0];
+      const updated = {
+        ...target,
+        ...pendingUpdate,
+        updated_at: new Date().toISOString(),
+      };
+      state.tables[table] = (state.tables[table] ?? []).map((r) => (r === target ? updated : r));
+      state.updatedCampaigns.push(updated);
+      return updated;
     };
 
     const builder: Record<string, unknown> = {
@@ -63,6 +95,11 @@ const { mockState, mockSupabase } = vi.hoisted(() => {
       },
       in: (col: string, val: unknown[]) => {
         filters.push({ op: 'in', col, val });
+        return builder;
+      },
+      order: () => builder,
+      range: (from: number, to: number) => {
+        rangeSlice = [from, to];
         return builder;
       },
       limit: (n: number) => {
@@ -79,9 +116,17 @@ const { mockState, mockSupabase } = vi.hoisted(() => {
         state.tables[table] = [...(state.tables[table] ?? []), pendingInsert];
         return builder;
       },
+      update: (payload: Record<string, unknown>) => {
+        pendingUpdate = payload;
+        return builder;
+      },
       maybeSingle: async () => {
         if (pendingInsert) {
           return { data: pendingInsert, error: null };
+        }
+        if (pendingUpdate) {
+          const updated = applyPendingUpdate();
+          return { data: updated, error: null };
         }
         const rows = evaluateRows();
         return { data: rows[0] ?? null, error: null };
@@ -89,6 +134,10 @@ const { mockState, mockSupabase } = vi.hoisted(() => {
       single: async () => {
         if (pendingInsert) {
           return { data: pendingInsert, error: null };
+        }
+        if (pendingUpdate) {
+          const updated = applyPendingUpdate();
+          return { data: updated, error: updated ? null : { message: 'Row not found' } };
         }
         const rows = evaluateRows();
         return { data: rows[0] ?? null, error: rows[0] ? null : { message: 'Row not found' } };
@@ -116,8 +165,12 @@ const { mockState, mockSupabase } = vi.hoisted(() => {
     functions: {
       invoke: vi.fn(async (name: string, opts?: { body?: unknown }) => {
         state.invokedFunctions.push({ name, body: opts?.body });
+        const body = (opts?.body ?? {}) as Record<string, unknown>;
+        if (state.nextEdgeResponse) {
+          const handler = state.nextEdgeResponse;
+          return await handler(name, body);
+        }
         if (name === 'campaign-preflight') {
-          const body = (opts?.body ?? {}) as Record<string, unknown>;
           if (body.action === 'create_snapshot') {
             return {
               data: {
@@ -151,21 +204,24 @@ import {
   createCampaignSnapshotViaEdge,
   evaluateAudienceRows,
   evaluateContactConsent,
-  resetCampaignPreflightEdgeCircuit,
   resolveCampaignAudienceFromDb,
   runCampaignGuardianPreflight,
+  validateCampaignViaPreflightEdge,
   validateTemplateComponentsForCampaign,
   verifyActiveBusinessAdmin,
 } from '@/services/campaignEngineService';
 import {
   createCampaignInDb,
   seedTableColumnsFromRows,
+  updateCampaignInDb,
 } from '@/services/crmPersistenceService';
 
 function seedDefaultWorkspace() {
   mockState.authUser = { id: ADMIN_A };
   mockState.invokedFunctions = [];
   mockState.insertedCampaigns = [];
+  mockState.updatedCampaigns = [];
+  mockState.nextEdgeResponse = null;
   mockState.tables = {
     business_members: [
       { business_id: BIZ_A, user_id: ADMIN_A, role: 'admin', is_active: true },
@@ -545,7 +601,6 @@ class SimulatedCampaignSnapshotStore {
 describe('Campaign Engine V1 — Phase 1 (Local / Mocked Unit & Contract Suite)', () => {
   beforeEach(() => {
     seedDefaultWorkspace();
-    resetCampaignPreflightEdgeCircuit();
     seedTableColumnsFromRows('campaigns', [
       {
         id: CAMP_A,
@@ -908,9 +963,20 @@ describe('Campaign Engine V1 — Phase 1 (Local / Mocked Unit & Contract Suite)'
         businessId: BIZ_A,
         campaignId: CAMP_A,
         idempotencyKey: 'phase1-safe-snap-1',
-        audienceFilter: { mode: 'all' },
       });
       expect(snapshotRes.ok).toBe(true);
+      expect(snapshotRes.status).toBe('validated');
+
+      // Verify exact minimal Phase 1 snapshot payload (no client-side audience/template overrides)
+      const snapCall = mockState.invokedFunctions.find(
+        (fn) => fn.name === 'campaign-preflight' && (fn.body as Record<string, unknown>)?.action === 'create_snapshot'
+      );
+      expect(snapCall?.body).toEqual({
+        action: 'create_snapshot',
+        businessId: BIZ_A,
+        campaignId: CAMP_A,
+        idempotencyKey: 'phase1-safe-snap-1',
+      });
 
       expect(fetchSpy).not.toHaveBeenCalled();
       expect(
@@ -954,7 +1020,6 @@ describe('Campaign Engine V1 — Phase 1 (Local / Mocked Unit & Contract Suite)'
     mockState.tables.contacts[0].opted_out_at = '2026-02-01T08:00:00Z';
 
     // Simulate page refresh: restore draft from storage and re-run Guardian preflight
-    resetCampaignPreflightEdgeCircuit();
     const restored = JSON.parse(storageMap.get('zoqniva_broadcast_composer_draft')!);
     expect(restored.wizardStage).toBe(3);
     expect(restored.customName).toBe('Reload Durability Campaign');
@@ -998,5 +1063,295 @@ describe('Campaign Engine V1 — Phase 1 (Local / Mocked Unit & Contract Suite)'
     expect(migration004).toContain('reclaim_expired_campaign_leases');
     expect(migration004).toContain('bm.is_active = TRUE');
     expect(migration004).not.toContain("bm.status = 'active'");
+
+    // Verify standalone campaign-preflight Edge Function contract
+    const edgeFnSrc = fs.readFileSync(
+      path.join(rootDir, 'supabase/functions/campaign-preflight/index.ts'),
+      'utf8'
+    );
+    expect(edgeFnSrc).toContain("from('whatsapp_accounts')");
+    expect(edgeFnSrc).toContain(".select('*')");
+    expect(edgeFnSrc).toContain('MIGRATION_NOT_APPLIED');
+    expect(edgeFnSrc).toContain("p_initial_status: 'validated'");
+    expect(edgeFnSrc).toContain('canLaunchBulk: false');
+    expect(edgeFnSrc).toContain('phase1DispatchBlocked: true');
+    expect(edgeFnSrc).not.toMatch(/graph\.facebook\.com/i);
+  });
+
+  // 11. Server-backed validateCampaignViaPreflightEdge success & structured FunctionsHttpError parsing
+  it('calls campaign-preflight for server validation and surfaces 401, 403, 422, 503 MIGRATION_NOT_APPLIED, PGRST202/204 honestly', async () => {
+    // 200 OK with migrationPending = true
+    mockState.nextEdgeResponse = () => ({
+      data: {
+        ok: true,
+        canSaveDraft: true,
+        canLaunchBulk: false,
+        phase1DispatchBlocked: true,
+        migrationReady: false,
+        messagingMode: 'test',
+        whatsappConnected: true,
+        whatsappAccountId: '77777777-7777-4777-8777-777777777701',
+        testAllowlistCount: 1,
+        eligibleInTestAllowlist: 1,
+        eligibleOutsideTestAllowlist: 1,
+        checks: [
+          {
+            code: 'MIGRATION_NOT_APPLIED',
+            label: 'Phase 1 SQL Tables',
+            status: 'warn',
+            message: 'campaign_runs table not yet applied.',
+          },
+        ],
+        blockingReasons: [],
+        warnings: ['campaign_runs table not yet applied.'],
+        templateSummary: {
+          id: TPL_APPROVED,
+          name: 'hello_world',
+          language: 'en_US',
+          category: 'UTILITY',
+          status: 'approved',
+          metaTemplateId: 'meta_hello_world_001',
+          requiredVariables: [],
+        },
+        audience: {
+          ok: true,
+          mode: 'all',
+          totalMatched: 6,
+          eligibleCount: 2,
+          excludedCount: 4,
+          groupedExclusions: {
+            contact_not_in_business: 0,
+            invalid_phone: 1,
+            duplicate_phone: 1,
+            opted_out: 1,
+            no_explicit_consent: 1,
+          },
+          invalidTagIds: [],
+          invalidContactIds: [],
+          validatedAt: '2026-01-01T00:00:00Z',
+        },
+        validatedAt: '2026-01-01T00:00:00Z',
+      },
+      error: null,
+    });
+
+    const okReport = await validateCampaignViaPreflightEdge({
+      businessId: BIZ_A,
+      campaignId: CAMP_A,
+      templateId: TPL_APPROVED,
+      audienceFilter: { mode: 'all' },
+      variableMapping: {},
+      scheduleMode: 'draft',
+    });
+
+    expect(okReport.serverVerified).toBe(true);
+    expect(okReport.source).toBe('edge_function');
+    expect(okReport.migrationPending).toBe(true);
+    expect(okReport.canLaunchBulk).toBe(false);
+    expect(okReport.phase1DispatchBlocked).toBe(true);
+    expect(okReport.audience.eligibleCount).toBe(2);
+
+    // HTTP 403 ADMIN_REQUIRED via FunctionsHttpError-shaped error.context Response
+    mockState.nextEdgeResponse = () => ({
+      data: null,
+      error: {
+        name: 'FunctionsHttpError',
+        message: 'Edge Function returned a non-2xx status code',
+        context: new Response(
+          JSON.stringify({
+            ok: false,
+            code: 'ADMIN_REQUIRED',
+            error: 'Only active workspace administrators can validate campaigns.',
+          }),
+          { status: 403, headers: { 'Content-Type': 'application/json' } }
+        ),
+      },
+    });
+
+    const forbidden = await validateCampaignViaPreflightEdge({
+      businessId: BIZ_A,
+      templateId: TPL_APPROVED,
+      audienceFilter: { mode: 'all' },
+    });
+    expect(forbidden.serverVerified).toBe(false);
+    expect(forbidden.audience.ok).toBe(false);
+    expect(forbidden.httpStatus).toBe(403);
+    expect(forbidden.errorCode).toBe('ADMIN_REQUIRED');
+    expect(forbidden.error).toContain('administrators');
+
+    // HTTP 503 MIGRATION_NOT_APPLIED on create_snapshot
+    mockState.nextEdgeResponse = () => ({
+      data: null,
+      error: {
+        name: 'FunctionsHttpError',
+        message: 'Edge Function returned a non-2xx status code',
+        context: new Response(
+          JSON.stringify({
+            ok: false,
+            code: 'MIGRATION_NOT_APPLIED',
+            migrationReady: false,
+            error: 'Phase 1 SQL migration has not been applied yet (PGRST202).',
+          }),
+          { status: 503, headers: { 'Content-Type': 'application/json' } }
+        ),
+      },
+    });
+
+    const missingSqlSnap = await createCampaignSnapshotViaEdge({
+      businessId: BIZ_A,
+      campaignId: CAMP_A,
+      idempotencyKey: 'snap-pending-sql-1',
+    });
+    expect(missingSqlSnap.ok).toBe(false);
+    expect(missingSqlSnap.httpStatus).toBe(503);
+    expect(missingSqlSnap.code).toBe('MIGRATION_NOT_APPLIED');
+    expect(missingSqlSnap.migrationPending).toBe(true);
+
+    // HTTP 422 PREFLIGHT_FAILED on create_snapshot preserves embedded Guardian report
+    mockState.nextEdgeResponse = () => ({
+      data: null,
+      error: {
+        name: 'FunctionsHttpError',
+        message: 'Edge Function returned a non-2xx status code',
+        context: new Response(
+          JSON.stringify({
+            ok: false,
+            code: 'PREFLIGHT_FAILED',
+            error: 'Template is not approved.',
+            guardian: {
+              ok: false,
+              canSaveDraft: true,
+              canLaunchBulk: false,
+              phase1DispatchBlocked: true,
+              migrationReady: true,
+              messagingMode: 'test',
+              whatsappConnected: true,
+              whatsappAccountId: null,
+              testAllowlistCount: 0,
+              eligibleInTestAllowlist: 0,
+              eligibleOutsideTestAllowlist: 0,
+              checks: [
+                {
+                  code: 'TEMPLATE_NOT_APPROVED',
+                  label: 'Meta Template Approval',
+                  status: 'fail',
+                  message: 'Template is draft.',
+                },
+              ],
+              blockingReasons: ['Template is draft.'],
+              warnings: [],
+              templateSummary: null,
+              audience: {
+                ok: true,
+                mode: 'all',
+                totalMatched: 1,
+                eligibleCount: 1,
+                excludedCount: 0,
+                groupedExclusions: {
+                  contact_not_in_business: 0,
+                  invalid_phone: 0,
+                  duplicate_phone: 0,
+                  opted_out: 0,
+                  no_explicit_consent: 0,
+                },
+                invalidTagIds: [],
+                invalidContactIds: [],
+                validatedAt: '2026-01-01T00:00:00Z',
+              },
+              validatedAt: '2026-01-01T00:00:00Z',
+            },
+          }),
+          { status: 422, headers: { 'Content-Type': 'application/json' } }
+        ),
+      },
+    });
+
+    const failedSnap = await createCampaignSnapshotViaEdge({
+      businessId: BIZ_A,
+      campaignId: CAMP_A,
+      idempotencyKey: 'snap-422-1',
+    });
+    expect(failedSnap.ok).toBe(false);
+    expect(failedSnap.httpStatus).toBe(422);
+    expect(failedSnap.code).toBe('PREFLIGHT_FAILED');
+    expect(failedSnap.guardian?.serverVerified).toBe(true);
+    expect(failedSnap.guardian?.checks[0].code).toBe('TEMPLATE_NOT_APPROVED');
+  });
+
+  // 12. Persisted draft updateCampaignInDb + verified live column set + pagination > 1000 rows + dynamic whatsapp_accounts
+  it('updates saved drafts with verified columns, paginates >1000 contacts, and handles alternate whatsapp_accounts phone columns', async () => {
+    const updRes = await updateCampaignInDb({
+      campaignId: CAMP_A,
+      businessId: BIZ_A,
+      name: 'Updated Q2 Draft',
+      templateId: TPL_PARAMS,
+      status: 'draft',
+      audienceMode: 'groups',
+      targetTagIds: [TAG_VIP_A],
+      variableMapping: { '1': 'Customer', '2': '20%' },
+      selectedCount: 6,
+      eligibleCount: 2,
+      skippedCount: 4,
+    });
+    expect(updRes.ok).toBe(true);
+    expect(updRes.campaign?.id).toBe(CAMP_A);
+    expect(updRes.campaign?.name).toBe('Updated Q2 Draft');
+    expect(updRes.campaign?.variableMapping).toEqual({ '1': 'Customer', '2': '20%' });
+
+    const rawUpdated = mockState.updatedCampaigns[0];
+    expect(rawUpdated.audience_filter).toEqual({
+      mode: 'groups',
+      tag_ids: [TAG_VIP_A],
+      contact_ids: [],
+      variable_mapping: { '1': 'Customer', '2': '20%' },
+    });
+    // Ensure no phantom non-existent columns were written
+    expect(rawUpdated).not.toHaveProperty('city');
+    expect(rawUpdated).not.toHaveProperty('approval_status');
+
+    // Dynamic whatsapp_accounts phone_number_id (without meta_phone_number_id)
+    mockState.tables.whatsapp_accounts = [
+      {
+        id: '77777777-7777-4777-8777-777777777702',
+        business_id: BIZ_A,
+        connection_status: 'connected',
+        messaging_mode: 'live',
+        test_allowlist: [],
+        phone_number_id: '998877665544332',
+        display_phone_number: '+14155550188',
+      },
+    ];
+    const dynWaReport = await runCampaignGuardianPreflight({
+      businessId: BIZ_A,
+      templateId: TPL_APPROVED,
+      audienceFilter: { mode: 'all' },
+      scheduleMode: 'draft',
+    });
+    expect(dynWaReport.whatsappConnected).toBe(true);
+    expect(dynWaReport.ok).toBe(true);
+
+    // Pagination > 1,000 contacts (1,050 unique opted-in rows across 2 PostgREST pages)
+    const bigContacts: Array<Record<string, unknown>> = [];
+    for (let i = 1; i <= 1050; i++) {
+      bigContacts.push({
+        id: `66666666-6666-4666-8666-${String(i).padStart(12, '0')}`,
+        business_id: BIZ_A,
+        full_name: `Contact ${i}`,
+        phone_e164: `+1415${String(1000000 + i)}`,
+        marketing_opt_in: true,
+        opt_in_status: 'opted_in',
+        opted_out_at: null,
+        created_at: `2026-01-01T00:00:00Z`,
+      });
+    }
+    mockState.tables.contacts = bigContacts;
+
+    const pagedAudience = await resolveCampaignAudienceFromDb({
+      businessId: BIZ_A,
+      audienceFilter: { mode: 'all' },
+    });
+    expect(pagedAudience.ok).toBe(true);
+    expect(pagedAudience.totalMatched).toBe(1050);
+    expect(pagedAudience.eligibleCount).toBe(1050);
   });
 });

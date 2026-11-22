@@ -4,9 +4,10 @@
 //
 // Phase 1 Safety Invariants:
 //   - Active administrator authorization strictly checked against `business_members.is_active = true`.
-//   - Bulk WhatsApp dispatch is COMPLETELY DISABLED in Phase 1 and in Test Mode.
-//   - NEVER calls Meta Graph API or `whatsapp-send-message`.
-//   - Supports ONLY `action: 'validate'` and `action: 'create_snapshot'` (`draft_snapshot`/`validated`).
+//   - Bulk WhatsApp dispatch is COMPLETELY DISABLED in Phase 1 and in Test Mode (`canLaunchBulk: false`).
+//   - NEVER invokes external messaging APIs or dispatches WhatsApp messages.
+//   - Supports ONLY `action: 'validate'` (read-only) and `action: 'create_snapshot'` (`validated` run only).
+//   - `create_snapshot` intentionally re-reads template, audience_filter, and variable_mapping from `public.campaigns`.
 
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
 
@@ -14,6 +15,10 @@ const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12
 const E164_STRICT_REGEX = /^\+[1-9][0-9]{6,14}$/;
 const OPTED_OUT_STATUSES = new Set(['opted_out', 'unsubscribed', 'revoked', 'blocked', 'do_not_contact']);
 const OPTED_IN_STATUSES = new Set(['opted_in', 'subscribed', 'consented']);
+
+const PAGE_SIZE = 1000;
+const IN_CHUNK_SIZE = 250;
+const MAX_AUDIENCE_ROWS = 25000;
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
@@ -33,6 +38,56 @@ function normalizePhoneToE164(raw: string): string | null {
   if (digits.length < 7 || digits.length > 15 || digits.startsWith('0')) return null;
   const candidate = `+${digits}`;
   return E164_STRICT_REGEX.test(candidate) ? candidate : null;
+}
+
+function isMissingSchemaError(err: { code?: string; message?: string } | null | undefined): boolean {
+  if (!err) return false;
+  const code = String(err.code ?? '');
+  const msg = String(err.message ?? '').toLowerCase();
+  return (
+    code === '42P01' ||
+    code === '42883' ||
+    code === 'PGRST202' ||
+    code === 'PGRST205' ||
+    msg.includes('does not exist') ||
+    msg.includes('could not find the function') ||
+    msg.includes('could not find the table')
+  );
+}
+
+function isColumnMismatchError(err: { code?: string; message?: string } | null | undefined): boolean {
+  if (!err) return false;
+  const code = String(err.code ?? '');
+  const msg = String(err.message ?? '').toLowerCase();
+  return code === '42703' || code === 'PGRST204' || msg.includes('schema cache');
+}
+
+function extractWhatsAppPhoneId(wa: Record<string, unknown> | null): string {
+  if (!wa) return '';
+  const candidates = [
+    wa.meta_phone_number_id,
+    wa.phone_number_id,
+    wa.whatsapp_phone_number_id,
+    wa.meta_phone_id,
+  ];
+  for (const c of candidates) {
+    if (typeof c === 'string' && c.trim().length > 0) return c.trim();
+    if (typeof c === 'number' && Number.isFinite(c)) return String(c);
+  }
+  return '';
+}
+
+function extractWhatsAppDisplayPhone(wa: Record<string, unknown> | null): string {
+  if (!wa) return '';
+  const candidates = [
+    wa.phone_number_e164,
+    wa.display_phone_number,
+    wa.phone_number,
+  ];
+  for (const c of candidates) {
+    if (typeof c === 'string' && c.trim().length > 0) return c.trim();
+  }
+  return extractWhatsAppPhoneId(wa);
 }
 
 type ExclusionReason =
@@ -147,6 +202,154 @@ function validateTemplateComponents(
   };
 }
 
+function coerceStringRecord(raw: unknown): Record<string, string> {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+    if (typeof v === 'string' || typeof v === 'number') {
+      const trimmed = String(v).trim();
+      if (trimmed.length > 0) out[k] = trimmed;
+    }
+  }
+  return out;
+}
+
+const CONTACT_SELECT_COLS =
+  'id, business_id, full_name, phone_e164, marketing_opt_in, opt_in_status, opted_out_at, created_at';
+
+// deno-lint-ignore no-explicit-any
+async function fetchAllBusinessContactsPaginated(adminClient: any, businessId: string): Promise<
+  | { ok: true; rows: Array<Record<string, unknown>> }
+  | { ok: false; code: string; status: number; error: string }
+> {
+  const rows: Array<Record<string, unknown>> = [];
+  let offset = 0;
+
+  while (true) {
+    const { data, error } = await adminClient
+      .from('contacts')
+      .select(CONTACT_SELECT_COLS)
+      .eq('business_id', businessId)
+      .order('created_at', { ascending: true })
+      .order('id', { ascending: true })
+      .range(offset, offset + PAGE_SIZE - 1);
+
+    if (error) {
+      if (isColumnMismatchError(error)) {
+        return { ok: false, code: 'SCHEMA_MISMATCH', status: 500, error: `Contacts schema mismatch: ${error.message}` };
+      }
+      if (isMissingSchemaError(error)) {
+        return { ok: false, code: 'MIGRATION_NOT_APPLIED', status: 503, error: `Contacts table unavailable: ${error.message}` };
+      }
+      return { ok: false, code: 'AUDIENCE_QUERY_FAILED', status: 500, error: `Failed to load contacts: ${error.message}` };
+    }
+
+    const batch = (data ?? []) as Array<Record<string, unknown>>;
+    rows.push(...batch);
+
+    if (rows.length > MAX_AUDIENCE_ROWS) {
+      return {
+        ok: false,
+        code: 'AUDIENCE_LIMIT_EXCEEDED',
+        status: 422,
+        error: `Audience exceeds Phase 1 validation limit of ${MAX_AUDIENCE_ROWS.toLocaleString()} contacts. Narrow the audience by tags before validating.`,
+      };
+    }
+
+    if (batch.length < PAGE_SIZE) {
+      break;
+    }
+    offset += PAGE_SIZE;
+  }
+
+  return { ok: true, rows };
+}
+
+// deno-lint-ignore no-explicit-any
+async function fetchContactsByIdsChunked(adminClient: any, businessId: string, contactIds: string[]): Promise<
+  | { ok: true; rows: Array<Record<string, unknown>> }
+  | { ok: false; code: string; status: number; error: string }
+> {
+  if (contactIds.length > MAX_AUDIENCE_ROWS) {
+    return {
+      ok: false,
+      code: 'AUDIENCE_LIMIT_EXCEEDED',
+      status: 422,
+      error: `Audience exceeds Phase 1 validation limit of ${MAX_AUDIENCE_ROWS.toLocaleString()} contacts.`,
+    };
+  }
+
+  const rows: Array<Record<string, unknown>> = [];
+  for (let i = 0; i < contactIds.length; i += IN_CHUNK_SIZE) {
+    const chunk = contactIds.slice(i, i + IN_CHUNK_SIZE);
+    const { data, error } = await adminClient
+      .from('contacts')
+      .select(CONTACT_SELECT_COLS)
+      .eq('business_id', businessId)
+      .in('id', chunk);
+
+    if (error) {
+      if (isColumnMismatchError(error)) {
+        return { ok: false, code: 'SCHEMA_MISMATCH', status: 500, error: `Contacts schema mismatch: ${error.message}` };
+      }
+      if (isMissingSchemaError(error)) {
+        return { ok: false, code: 'MIGRATION_NOT_APPLIED', status: 503, error: `Contacts table unavailable: ${error.message}` };
+      }
+      return { ok: false, code: 'AUDIENCE_QUERY_FAILED', status: 500, error: `Failed to load selected contacts: ${error.message}` };
+    }
+
+    rows.push(...((data ?? []) as Array<Record<string, unknown>>));
+  }
+
+  return { ok: true, rows };
+}
+
+// deno-lint-ignore no-explicit-any
+async function fetchContactIdsForTagsPaginated(adminClient: any, tagIds: string[]): Promise<
+  | { ok: true; contactIds: string[] }
+  | { ok: false; code: string; status: number; error: string }
+> {
+  const idSet = new Set<string>();
+  let offset = 0;
+
+  while (true) {
+    const { data, error } = await adminClient
+      .from('contact_tags')
+      .select('contact_id')
+      .in('tag_id', tagIds)
+      .order('contact_id', { ascending: true })
+      .range(offset, offset + PAGE_SIZE - 1);
+
+    if (error) {
+      if (isMissingSchemaError(error)) {
+        return { ok: false, code: 'MIGRATION_NOT_APPLIED', status: 503, error: `contact_tags unavailable: ${error.message}` };
+      }
+      return { ok: false, code: 'AUDIENCE_QUERY_FAILED', status: 500, error: `Failed to load tag links: ${error.message}` };
+    }
+
+    const batch = (data ?? []) as Array<Record<string, unknown>>;
+    for (const row of batch) {
+      if (row.contact_id) idSet.add(String(row.contact_id));
+    }
+
+    if (idSet.size > MAX_AUDIENCE_ROWS) {
+      return {
+        ok: false,
+        code: 'AUDIENCE_LIMIT_EXCEEDED',
+        status: 422,
+        error: `Tagged audience exceeds Phase 1 validation limit of ${MAX_AUDIENCE_ROWS.toLocaleString()} contacts.`,
+      };
+    }
+
+    if (batch.length < PAGE_SIZE) {
+      break;
+    }
+    offset += PAGE_SIZE;
+  }
+
+  return { ok: true, contactIds: Array.from(idSet) };
+}
+
 Deno.serve(async (req: Request) => {
   if (req.method === 'OPTIONS') {
     return new Response('ok', { status: 200, headers: corsHeaders });
@@ -247,7 +450,13 @@ Deno.serve(async (req: Request) => {
       .eq('business_id', businessId)
       .maybeSingle();
 
-    if (cErr || !cRow) {
+    if (cErr) {
+      if (isColumnMismatchError(cErr)) {
+        return jsonResponse({ ok: false, code: 'SCHEMA_MISMATCH', error: `Campaigns schema mismatch: ${cErr.message}` }, 500);
+      }
+      return jsonResponse({ ok: false, code: 'CAMPAIGN_LOOKUP_FAILED', error: cErr.message }, 500);
+    }
+    if (!cRow) {
       return jsonResponse(
         { ok: false, code: 'CAMPAIGN_NOT_FOUND', error: 'Campaign does not exist in this workspace.' },
         404
@@ -261,22 +470,34 @@ Deno.serve(async (req: Request) => {
     );
   }
 
-  const templateId = String(body.templateId ?? campaignRow?.template_id ?? '').trim();
-  const rawVars =
-    body.variableMapping && typeof body.variableMapping === 'object' && !Array.isArray(body.variableMapping)
-      ? (body.variableMapping as Record<string, unknown>)
-      : {};
-  const variableMapping: Record<string, string> = {};
-  for (const [k, v] of Object.entries(rawVars)) {
-    if (typeof v === 'string' || typeof v === 'number') variableMapping[k] = String(v);
-  }
-
-  const rawFilter =
-    body.audienceFilter && typeof body.audienceFilter === 'object' && !Array.isArray(body.audienceFilter)
-      ? (body.audienceFilter as Record<string, unknown>)
-      : campaignRow?.audience_filter && typeof campaignRow.audience_filter === 'object'
+  // For `create_snapshot`, intentionally re-read template, audience_filter, variable_mapping & schedule from saved DB row.
+  const savedAudienceFilter =
+    campaignRow?.audience_filter && typeof campaignRow.audience_filter === 'object' && !Array.isArray(campaignRow.audience_filter)
       ? (campaignRow.audience_filter as Record<string, unknown>)
       : {};
+
+  const templateId =
+    action === 'create_snapshot'
+      ? String(campaignRow?.template_id ?? '').trim()
+      : String(body.templateId ?? campaignRow?.template_id ?? '').trim();
+
+  const rawFilter =
+    action === 'create_snapshot'
+      ? savedAudienceFilter
+      : body.audienceFilter && typeof body.audienceFilter === 'object' && !Array.isArray(body.audienceFilter)
+      ? (body.audienceFilter as Record<string, unknown>)
+      : savedAudienceFilter;
+
+  const variableMapping =
+    action === 'create_snapshot'
+      ? coerceStringRecord(savedAudienceFilter.variable_mapping ?? savedAudienceFilter.variableMapping)
+      : coerceStringRecord(
+          body.variableMapping ??
+            rawFilter.variable_mapping ??
+            rawFilter.variableMapping ??
+            savedAudienceFilter.variable_mapping ??
+            savedAudienceFilter.variableMapping
+        );
 
   const rawMode = String(rawFilter.mode ?? 'all');
   const audienceMode: 'all' | 'groups' | 'specific' =
@@ -313,6 +534,27 @@ Deno.serve(async (req: Request) => {
   const blockingReasons: string[] = [];
   const warnings: string[] = [];
 
+  // Probe whether Phase 1 SQL tables (`campaign_runs`) are installed yet (read-only HEAD check)
+  let migrationReady = true;
+  const { error: runsProbeErr } = await adminClient
+    .from('campaign_runs')
+    .select('id', { head: true, count: 'exact' })
+    .eq('business_id', businessId)
+    .limit(1);
+
+  if (runsProbeErr && isMissingSchemaError(runsProbeErr)) {
+    migrationReady = false;
+    const msg =
+      'Phase 1 Campaign Engine SQL installation is still pending (`campaign_runs` table not yet installed). Validation works, but frozen snapshot creation requires applying the reviewed Phase 1 SQL migration first.';
+    checks.push({
+      code: 'MIGRATION_NOT_APPLIED',
+      label: 'Phase 1 Database Tables',
+      status: 'warn',
+      message: msg,
+    });
+    warnings.push(msg);
+  }
+
   // 4. Verify approved Meta template & supported parameters
   let templateRow: Record<string, unknown> | null = null;
   let templateSummary: Record<string, unknown> | null = null;
@@ -330,7 +572,14 @@ Deno.serve(async (req: Request) => {
       .eq('business_id', businessId)
       .maybeSingle();
 
-    if (tplErr || !tpl) {
+    if (tplErr) {
+      if (isColumnMismatchError(tplErr)) {
+        return jsonResponse({ ok: false, code: 'SCHEMA_MISMATCH', error: `Templates schema mismatch: ${tplErr.message}` }, 500);
+      }
+      const msg = `Could not verify template: ${tplErr.message}`;
+      checks.push({ code: 'TEMPLATE_LOOKUP_FAILED', label: 'Approved Meta Template', status: 'fail', message: msg });
+      blockingReasons.push(msg);
+    } else if (!tpl) {
       const msg = 'Selected template does not exist in this business workspace.';
       checks.push({ code: 'TEMPLATE_NOT_FOUND', label: 'Approved Meta Template', status: 'fail', message: msg });
       blockingReasons.push(msg);
@@ -389,21 +638,30 @@ Deno.serve(async (req: Request) => {
     }
   }
 
-  // 5. Inspect WhatsApp account connection & Test Mode
-  const { data: waRows } = await adminClient
+  // 5. Inspect WhatsApp account connection & Test Mode (use select('*') — never guess phone ID column name)
+  const { data: waRows, error: waErr } = await adminClient
     .from('whatsapp_accounts')
-    .select('id, business_id, connection_status, messaging_mode, test_allowlist, meta_phone_number_id, phone_number_e164')
+    .select('*')
     .eq('business_id', businessId)
     .limit(1);
+
+  if (waErr) {
+    if (isMissingSchemaError(waErr)) {
+      return jsonResponse({ ok: false, code: 'MIGRATION_NOT_APPLIED', error: `whatsapp_accounts table unavailable: ${waErr.message}` }, 503);
+    }
+    return jsonResponse({ ok: false, code: 'WHATSAPP_ACCOUNT_LOOKUP_FAILED', error: waErr.message }, 500);
+  }
 
   const wa = ((waRows ?? []) as Array<Record<string, unknown>>)[0] ?? null;
   const whatsappAccountId = wa ? String(wa.id) : null;
   const messagingMode: 'test' | 'live' =
     wa && String(wa.messaging_mode ?? 'test').toLowerCase() === 'live' ? 'live' : 'test';
+  const waPhoneId = extractWhatsAppPhoneId(wa);
+  const waDisplayPhone = extractWhatsAppDisplayPhone(wa);
   const whatsappConnected = Boolean(
     wa &&
       String(wa.connection_status ?? '').toLowerCase() === 'connected' &&
-      String(wa.meta_phone_number_id ?? '').trim().length > 0
+      waPhoneId.length > 0
   );
   const normalizedAllowlist = new Set(
     (Array.isArray(wa?.test_allowlist) ? wa.test_allowlist : [])
@@ -420,11 +678,11 @@ Deno.serve(async (req: Request) => {
       code: 'WHATSAPP_CONNECTED',
       label: 'WhatsApp Cloud API Connection',
       status: 'pass',
-      message: `Connected WhatsApp account (${String(wa?.phone_number_e164 ?? wa?.meta_phone_number_id)}).`,
+      message: `Connected WhatsApp account (${waDisplayPhone || waPhoneId}).`,
     });
   }
 
-  // 6. Database-backed audience resolution, consent, E.164 validation & phone deduplication
+  // 6. Paginated database-backed audience resolution, consent, E.164 validation & phone deduplication
   const groupedExclusions: Record<ExclusionReason, number> = {
     contact_not_in_business: 0,
     invalid_phone: 0,
@@ -441,29 +699,38 @@ Deno.serve(async (req: Request) => {
     invalidTagIds.push(...requestedTagIds.filter((id) => !UUID_REGEX.test(id)));
 
     if (validUuidTags.length > 0) {
-      const { data: ownedTags } = await adminClient
+      const { data: ownedTags, error: tagErr } = await adminClient
         .from('tags')
         .select('id')
         .eq('business_id', businessId)
         .in('id', validUuidTags);
 
+      if (tagErr) {
+        return jsonResponse(
+          {
+            ok: false,
+            code: isMissingSchemaError(tagErr) ? 'MIGRATION_NOT_APPLIED' : 'AUDIENCE_QUERY_FAILED',
+            error: `Failed to verify workspace tags: ${tagErr.message}`,
+          },
+          isMissingSchemaError(tagErr) ? 503 : 500
+        );
+      }
+
       const ownedSet = new Set(((ownedTags ?? []) as Array<Record<string, unknown>>).map((t) => String(t.id)));
       invalidTagIds.push(...validUuidTags.filter((id) => !ownedSet.has(id)));
 
       if (ownedSet.size > 0) {
-        const { data: links } = await adminClient
-          .from('contact_tags')
-          .select('contact_id')
-          .in('tag_id', Array.from(ownedSet));
+        const tagLinksRes = await fetchContactIdsForTagsPaginated(adminClient, Array.from(ownedSet));
+        if (!tagLinksRes.ok) {
+          return jsonResponse({ ok: false, code: tagLinksRes.code, error: tagLinksRes.error }, tagLinksRes.status);
+        }
 
-        const cIds = Array.from(new Set(((links ?? []) as Array<Record<string, unknown>>).map((l) => String(l.contact_id))));
-        if (cIds.length > 0) {
-          const { data: cRows } = await adminClient
-            .from('contacts')
-            .select('id, business_id, full_name, phone_e164, marketing_opt_in, opt_in_status, opted_out_at, created_at')
-            .eq('business_id', businessId)
-            .in('id', cIds);
-          matchedContacts = (cRows ?? []) as Array<Record<string, unknown>>;
+        if (tagLinksRes.contactIds.length > 0) {
+          const contactsRes = await fetchContactsByIdsChunked(adminClient, businessId, tagLinksRes.contactIds);
+          if (!contactsRes.ok) {
+            return jsonResponse({ ok: false, code: contactsRes.code, error: contactsRes.error }, contactsRes.status);
+          }
+          matchedContacts = contactsRes.rows;
         }
       }
     }
@@ -472,21 +739,20 @@ Deno.serve(async (req: Request) => {
     invalidContactIds.push(...requestedContactIds.filter((id) => !UUID_REGEX.test(id)));
 
     if (validUuidContacts.length > 0) {
-      const { data: cRows } = await adminClient
-        .from('contacts')
-        .select('id, business_id, full_name, phone_e164, marketing_opt_in, opt_in_status, opted_out_at, created_at')
-        .eq('business_id', businessId)
-        .in('id', validUuidContacts);
-      matchedContacts = (cRows ?? []) as Array<Record<string, unknown>>;
+      const contactsRes = await fetchContactsByIdsChunked(adminClient, businessId, validUuidContacts);
+      if (!contactsRes.ok) {
+        return jsonResponse({ ok: false, code: contactsRes.code, error: contactsRes.error }, contactsRes.status);
+      }
+      matchedContacts = contactsRes.rows;
       const foundSet = new Set(matchedContacts.map((r) => String(r.id)));
       invalidContactIds.push(...validUuidContacts.filter((id) => !foundSet.has(id)));
     }
   } else {
-    const { data: cRows } = await adminClient
-      .from('contacts')
-      .select('id, business_id, full_name, phone_e164, marketing_opt_in, opt_in_status, opted_out_at, created_at')
-      .eq('business_id', businessId);
-    matchedContacts = (cRows ?? []) as Array<Record<string, unknown>>;
+    const allRes = await fetchAllBusinessContactsPaginated(adminClient, businessId);
+    if (!allRes.ok) {
+      return jsonResponse({ ok: false, code: allRes.code, error: allRes.error }, allRes.status);
+    }
+    matchedContacts = allRes.rows;
   }
 
   matchedContacts.sort((a, b) => {
@@ -619,8 +885,21 @@ Deno.serve(async (req: Request) => {
   }
 
   // 7. Schedule validation
-  const scheduleMode = String(body.scheduleMode ?? 'draft');
-  const scheduledAtRaw = body.scheduledAt ? String(body.scheduledAt) : null;
+  const scheduleMode =
+    action === 'create_snapshot'
+      ? campaignRow?.scheduled_at
+        ? 'scheduled'
+        : 'draft'
+      : String(body.scheduleMode ?? 'draft');
+  const scheduledAtRaw =
+    action === 'create_snapshot'
+      ? campaignRow?.scheduled_at
+        ? String(campaignRow.scheduled_at)
+        : null
+      : body.scheduledAt
+      ? String(body.scheduledAt)
+      : null;
+
   let scheduledIso: string | null = null;
   if (scheduleMode === 'scheduled') {
     const dt = scheduledAtRaw ? new Date(scheduledAtRaw) : null;
@@ -640,6 +919,7 @@ Deno.serve(async (req: Request) => {
     canSaveDraft: Boolean(templateRow),
     canLaunchBulk: false,
     phase1DispatchBlocked: true,
+    migrationReady,
     messagingMode,
     whatsappConnected,
     whatsappAccountId,
@@ -672,7 +952,20 @@ Deno.serve(async (req: Request) => {
     return jsonResponse(guardianReport, 200);
   }
 
-  // action === 'create_snapshot': atomically create a frozen non-dispatching snapshot via RPC
+  // action === 'create_snapshot': refuse if Phase 1 SQL is pending or preflight failed
+  if (!migrationReady) {
+    return jsonResponse(
+      {
+        ok: false,
+        code: 'MIGRATION_NOT_APPLIED',
+        error:
+          'Phase 1 SQL installation is still pending (`campaign_runs` / snapshot RPC not found). Apply the reviewed Phase 1 SQL migration in Supabase before creating snapshots.',
+        guardian: guardianReport,
+      },
+      503
+    );
+  }
+
   const idempotencyKey = String(body.idempotencyKey ?? '').trim();
   if (idempotencyKey.length < 4) {
     return jsonResponse(
@@ -681,7 +974,20 @@ Deno.serve(async (req: Request) => {
     );
   }
 
-  const initialStatus = guardianReport.ok ? 'validated' : 'draft_snapshot';
+  if (!guardianReport.ok) {
+    return jsonResponse(
+      {
+        ok: false,
+        code: 'PREFLIGHT_FAILED',
+        error:
+          blockingReasons.join(' ') ||
+          'Campaign failed preflight validation and cannot create a validated snapshot.',
+        guardian: guardianReport,
+      },
+      422
+    );
+  }
+
   const snapshotRecipients = [
     ...eligibleRecipients.map((r) => ({
       contact_id: r.contactId,
@@ -700,6 +1006,7 @@ Deno.serve(async (req: Request) => {
     })),
   ];
 
+  // Phase 1 snapshot status is ALWAYS 'validated' (never 'queued' or 'running')
   const { data: rpcRes, error: rpcErr } = await adminClient.rpc('create_campaign_run_snapshot', {
     p_business_id: businessId,
     p_campaign_id: campaignId,
@@ -707,13 +1014,14 @@ Deno.serve(async (req: Request) => {
     p_idempotency_key: idempotencyKey,
     p_whatsapp_account_id: whatsappAccountId,
     p_messaging_mode: messagingMode,
-    p_initial_status: initialStatus,
+    p_initial_status: 'validated',
     p_scheduled_at: scheduledIso,
     p_template_snapshot: templateRow ?? {},
     p_audience_filter_snapshot: {
       mode: audienceMode,
       tag_ids: requestedTagIds,
       contact_ids: requestedContactIds,
+      variable_mapping: variableMapping,
     },
     p_variable_mapping_snapshot: variableMapping,
     p_guardian_summary: {
@@ -727,6 +1035,16 @@ Deno.serve(async (req: Request) => {
   });
 
   if (rpcErr) {
+    if (isMissingSchemaError(rpcErr)) {
+      return jsonResponse(
+        {
+          ok: false,
+          code: 'MIGRATION_NOT_APPLIED',
+          error: `Phase 1 snapshot RPC is not installed yet (${rpcErr.code ?? 'PGRST202'}): ${rpcErr.message}`,
+        },
+        503
+      );
+    }
     return jsonResponse(
       {
         ok: false,
@@ -740,7 +1058,7 @@ Deno.serve(async (req: Request) => {
   const rpcObj = (rpcRes ?? {}) as Record<string, unknown>;
   if (!rpcObj.ok) {
     const code = String(rpcObj.code ?? 'SNAPSHOT_REJECTED');
-    const httpStatus = code === 'ADMIN_REQUIRED' ? 403 : code === 'CONCURRENT_RUN_ACTIVE' ? 409 : 400;
+    const httpStatus = code === 'ADMIN_REQUIRED' ? 403 : code === 'CONCURRENT_RUN_ACTIVE' ? 409 : 422;
     return jsonResponse(
       { ok: false, code, error: String(rpcObj.error ?? 'Snapshot rejected.') },
       httpStatus
