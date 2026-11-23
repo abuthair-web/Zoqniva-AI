@@ -30,6 +30,7 @@ import {
 import { useApp } from '@/context/AppContext';
 import {
   EXCLUSION_REASON_LABELS,
+  normalizePhase1PreflightSchedule,
   type CampaignExclusionReason,
   type CampaignGuardianReport,
   type CampaignSnapshotResult,
@@ -181,6 +182,12 @@ export function BroadcastsPage() {
     setPendingSnapshotKey(null);
   }, []);
 
+  const invalidatePreflight = useCallback(() => {
+    validationSeqRef.current += 1;
+    setGuardianReport(null);
+    setPreflightError(null);
+  }, []);
+
   useEffect(() => {
     const state = location.state as { openWizard?: boolean } | null;
     if (state?.openWizard && isAdmin) {
@@ -280,6 +287,7 @@ export function BroadcastsPage() {
     setPreflightError(null);
 
     try {
+      const normalizedSchedule = normalizePhase1PreflightSchedule(scheduleMode, scheduledFor);
       const report = await validateCampaignPreflight({
         campaignId: savedCampaignId && UUID_REGEX.test(savedCampaignId) ? savedCampaignId : undefined,
         templateId: selectedTemplate.id,
@@ -289,14 +297,8 @@ export function BroadcastsPage() {
           contactIds: audienceMode === 'specific' ? selectedContactIds : [],
         },
         variableMapping: varMapping,
-        scheduleMode: wizardStage === 3 ? scheduleMode : 'draft',
-        scheduledAt:
-          wizardStage === 3 && scheduleMode === 'scheduled' && scheduledFor
-            ? (() => {
-                const dt = new Date(scheduledFor);
-                return Number.isNaN(dt.getTime()) ? scheduledFor : dt.toISOString();
-              })()
-            : null,
+        scheduleMode: normalizedSchedule.scheduleMode,
+        scheduledAt: normalizedSchedule.scheduledAt ?? null,
       });
 
       if (seq !== validationSeqRef.current) return;
@@ -329,12 +331,11 @@ export function BroadcastsPage() {
     selectedTagIds,
     selectedContactIds,
     varMapping,
-    wizardStage,
     scheduleMode,
     scheduledFor,
   ]);
 
-  // Automatically re-validate via campaign-preflight whenever Stage 2 or Stage 3 is active or refreshed
+  // Automatically re-validate via campaign-preflight whenever Stage 2 or Stage 3 is active or inputs change
   useEffect(() => {
     if (viewMode !== 'compose' || (wizardStage !== 2 && wizardStage !== 3)) return;
     if (!selectedTemplate?.id) return;
@@ -347,7 +348,10 @@ export function BroadcastsPage() {
   }, [viewMode, wizardStage, selectedTemplate?.id, runDbPreflight]);
 
   const isServerVerifiedAudience = Boolean(
-    guardianReport?.serverVerified === true && guardianReport.audience?.ok === true
+    !validatingPreflight &&
+      guardianReport?.serverVerified === true &&
+      guardianReport.httpStatus === 200 &&
+      guardianReport.audience?.ok === true
   );
 
   const effectiveAudience = useMemo(() => {
@@ -913,6 +917,7 @@ export function BroadcastsPage() {
                               onClick={() => {
                                 setSelectedTemplateId(tpl.id);
                                 markDraftDirty();
+                                invalidatePreflight();
                               }}
                               className={`w-full text-left rounded-lg border p-3.5 transition-colors cursor-pointer ${
                                 selected
@@ -956,6 +961,7 @@ export function BroadcastsPage() {
                                   onChange={(e) => {
                                     setVarMapping((p) => ({ ...p, [key]: e.target.value }));
                                     markDraftDirty();
+                                    invalidatePreflight();
                                   }}
                                   placeholder={`Sample for {{${key}}}`}
                                   className="w-full rounded-lg border border-[#E2E8F0] bg-white px-2.5 py-1.5 text-xs focus:border-[#2563EB] focus:outline-none"
@@ -1039,6 +1045,7 @@ export function BroadcastsPage() {
                       onClick={() => {
                         setAudienceMode(opt.key);
                         markDraftDirty();
+                        invalidatePreflight();
                       }}
                       className={`text-left rounded-lg border p-3.5 transition-colors cursor-pointer ${
                         audienceMode === opt.key
@@ -1072,6 +1079,7 @@ export function BroadcastsPage() {
                                   active ? prev.filter((x) => x !== t.id) : [...prev, t.id]
                                 );
                                 markDraftDirty();
+                                invalidatePreflight();
                               }}
                               className={`px-3 py-1.5 rounded-lg text-xs font-semibold border cursor-pointer ${
                                 active
@@ -1117,6 +1125,7 @@ export function BroadcastsPage() {
                                     checked ? prev.filter((id) => id !== c.id) : [...prev, c.id]
                                   );
                                   markDraftDirty();
+                                  invalidatePreflight();
                                 }}
                                 className="rounded border-slate-300 accent-[#2563EB]"
                               />
@@ -1381,21 +1390,28 @@ export function BroadcastsPage() {
                     <div className="rounded-lg border border-[#E2E8F0] bg-white p-3.5 space-y-2.5">
                       <div className="flex items-center justify-between gap-2">
                         <div className="flex items-center gap-2">
-                          {guardianReport?.serverVerified && guardianReport.ok ? (
+                          {!validatingPreflight &&
+                          guardianReport?.serverVerified &&
+                          guardianReport.httpStatus === 200 &&
+                          guardianReport.ok ? (
                             <ShieldCheck className="h-4 w-4 text-emerald-600 shrink-0" />
                           ) : (
                             <ShieldAlert className="h-4 w-4 text-amber-600 shrink-0" />
                           )}
                           <p className="font-bold text-[#0F172A]">Campaign Guardian Preflight</p>
-                          {guardianReport?.serverVerified ? (
+                          {validatingPreflight ? (
+                            <span className="text-[10px] font-semibold text-[#2563EB]">
+                              · Checking...
+                            </span>
+                          ) : guardianReport?.serverVerified && guardianReport.httpStatus === 200 ? (
                             <span className="text-[10px] font-semibold text-emerald-700">
                               · Verified by campaign-preflight
                             </span>
-                          ) : !validatingPreflight ? (
+                          ) : (
                             <span className="text-[10px] font-semibold text-[#E11D48]">
                               · Not Verified
                             </span>
-                          ) : null}
+                          )}
                         </div>
                         <button
                           type="button"
@@ -1474,8 +1490,11 @@ export function BroadcastsPage() {
                       <button
                         type="button"
                         onClick={() => {
-                          setScheduleMode('immediate');
-                          markDraftDirty();
+                          if (scheduleMode !== 'immediate') {
+                            setScheduleMode('immediate');
+                            markDraftDirty();
+                            invalidatePreflight();
+                          }
                         }}
                         className={`rounded-lg border p-3 text-left cursor-pointer ${
                           scheduleMode === 'immediate'
@@ -1492,8 +1511,11 @@ export function BroadcastsPage() {
                       <button
                         type="button"
                         onClick={() => {
-                          setScheduleMode('scheduled');
-                          markDraftDirty();
+                          if (scheduleMode !== 'scheduled') {
+                            setScheduleMode('scheduled');
+                            markDraftDirty();
+                            invalidatePreflight();
+                          }
                         }}
                         className={`rounded-lg border p-3 text-left cursor-pointer ${
                           scheduleMode === 'scheduled'
@@ -1522,6 +1544,7 @@ export function BroadcastsPage() {
                           onChange={(e) => {
                             setScheduledFor(e.target.value);
                             markDraftDirty();
+                            invalidatePreflight();
                           }}
                           className="rounded-lg border border-[#E2E8F0] px-3 py-2 focus:border-[#2563EB] focus:outline-none"
                         />

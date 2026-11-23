@@ -204,6 +204,7 @@ import {
   createCampaignSnapshotViaEdge,
   evaluateAudienceRows,
   evaluateContactConsent,
+  normalizePhase1PreflightSchedule,
   resolveCampaignAudienceFromDb,
   runCampaignGuardianPreflight,
   validateCampaignViaPreflightEdge,
@@ -1353,5 +1354,150 @@ describe('Campaign Engine V1 — Phase 1 (Local / Mocked Unit & Contract Suite)'
     expect(pagedAudience.ok).toBe(true);
     expect(pagedAudience.totalMatched).toBe(1050);
     expect(pagedAudience.eligibleCount).toBe(1050);
+  });
+
+  // 13. Regression test: Phase 1 scheduleMode normalization (immediate -> draft, scheduled -> ISO 8601)
+  it('normalizes UI scheduleMode immediate to draft and scheduled to ISO 8601 without altering other preflight fields', async () => {
+    // Pure helper contract
+    expect(normalizePhase1PreflightSchedule('immediate', '2026-12-01T10:30')).toEqual({
+      scheduleMode: 'draft',
+      scheduledAt: undefined,
+    });
+    expect(normalizePhase1PreflightSchedule('draft', null)).toEqual({
+      scheduleMode: 'draft',
+      scheduledAt: undefined,
+    });
+    expect(normalizePhase1PreflightSchedule(undefined, null)).toEqual({
+      scheduleMode: 'draft',
+      scheduledAt: undefined,
+    });
+
+    const scheduledNorm = normalizePhase1PreflightSchedule('scheduled', '2026-12-15T14:30:00Z');
+    expect(scheduledNorm).toEqual({
+      scheduleMode: 'scheduled',
+      scheduledAt: '2026-12-15T14:30:00.000Z',
+    });
+    expect(normalizePhase1PreflightSchedule('scheduled', 'not-a-date')).toEqual({
+      scheduleMode: 'scheduled',
+      scheduledAt: undefined,
+    });
+
+    // Wire-level verification against campaign-preflight
+    mockState.nextEdgeResponse = () => ({
+      data: {
+        ok: true,
+        canSaveDraft: true,
+        canLaunchBulk: false,
+        phase1DispatchBlocked: true,
+        migrationReady: true,
+        messagingMode: 'test',
+        whatsappConnected: true,
+        whatsappAccountId: '77777777-7777-4777-8777-777777777701',
+        testAllowlistCount: 1,
+        eligibleInTestAllowlist: 1,
+        eligibleOutsideTestAllowlist: 0,
+        checks: [],
+        blockingReasons: [],
+        warnings: [],
+        templateSummary: null,
+        audience: {
+          ok: true,
+          mode: 'all',
+          totalMatched: 2,
+          eligibleCount: 2,
+          excludedCount: 0,
+          groupedExclusions: {
+            contact_not_in_business: 0,
+            invalid_phone: 0,
+            duplicate_phone: 0,
+            opted_out: 0,
+            no_explicit_consent: 0,
+          },
+          invalidTagIds: [],
+          invalidContactIds: [],
+          validatedAt: '2026-11-23T00:00:00Z',
+        },
+        validatedAt: '2026-11-23T00:00:00Z',
+      },
+      error: null,
+    });
+
+    const immRes = await validateCampaignViaPreflightEdge({
+      businessId: BIZ_A,
+      templateId: TPL_APPROVED,
+      audienceFilter: { mode: 'all', tagIds: [], contactIds: [] },
+      variableMapping: { '1': 'Amina' },
+      scheduleMode: 'immediate',
+      scheduledAt: '2026-12-15T14:30:00Z',
+    });
+    expect(immRes.serverVerified).toBe(true);
+    expect(immRes.httpStatus).toBe(200);
+    expect(immRes.canLaunchBulk).toBe(false);
+
+    const immediateCallBody = mockState.invokedFunctions[mockState.invokedFunctions.length - 1]
+      .body as Record<string, unknown>;
+    expect(immediateCallBody.action).toBe('validate');
+    expect(immediateCallBody.scheduleMode).toBe('draft');
+    expect(immediateCallBody.scheduledAt).toBeUndefined();
+    expect(immediateCallBody.businessId).toBe(BIZ_A);
+    expect(immediateCallBody.templateId).toBe(TPL_APPROVED);
+    expect(immediateCallBody.variableMapping).toEqual({ '1': 'Amina' });
+    expect((immediateCallBody.audienceFilter as Record<string, unknown>).mode).toBe('all');
+
+    const schedRes = await validateCampaignViaPreflightEdge({
+      businessId: BIZ_A,
+      templateId: TPL_APPROVED,
+      audienceFilter: { mode: 'all', tagIds: [], contactIds: [] },
+      variableMapping: { '1': 'Amina' },
+      scheduleMode: 'scheduled',
+      scheduledAt: '2026-12-15T14:30:00Z',
+    });
+    expect(schedRes.serverVerified).toBe(true);
+    expect(schedRes.httpStatus).toBe(200);
+
+    const scheduledCallBody = mockState.invokedFunctions[mockState.invokedFunctions.length - 1]
+      .body as Record<string, unknown>;
+    expect(scheduledCallBody.action).toBe('validate');
+    expect(scheduledCallBody.scheduleMode).toBe('scheduled');
+    expect(scheduledCallBody.scheduledAt).toBe('2026-12-15T14:30:00.000Z');
+    expect(scheduledCallBody.businessId).toBe(BIZ_A);
+    expect(scheduledCallBody.templateId).toBe(TPL_APPROVED);
+    expect(scheduledCallBody.variableMapping).toEqual({ '1': 'Amina' });
+
+    // Server error ("Unsupported schedule mode.") is never marked verified
+    mockState.nextEdgeResponse = () => ({
+      data: null,
+      error: {
+        name: 'FunctionsHttpError',
+        message: 'Edge Function returned a non-2xx status code',
+        context: new Response(
+          JSON.stringify({
+            ok: false,
+            code: 'INVALID_SCHEDULE_MODE',
+            error: 'Unsupported schedule mode.',
+          }),
+          { status: 400, headers: { 'Content-Type': 'application/json' } }
+        ),
+      },
+    });
+    const errRes = await validateCampaignViaPreflightEdge({
+      businessId: BIZ_A,
+      templateId: TPL_APPROVED,
+      audienceFilter: { mode: 'all' },
+      scheduleMode: 'draft',
+    });
+    expect(errRes.serverVerified).toBe(false);
+    expect(errRes.audience.ok).toBe(false);
+    expect(errRes.error).toContain('Unsupported schedule mode.');
+
+    // Verify BroadcastsPage preserves UI label and uses shared normalization for Stage 2 & Stage 3
+    const rootDir = path.resolve(__dirname, '../..');
+    const broadcastsSrc = fs.readFileSync(
+      path.join(rootDir, 'src/pages/BroadcastsPage.tsx'),
+      'utf8'
+    );
+    expect(broadcastsSrc).toContain('Immediate (Phase 1 Draft)');
+    expect(broadcastsSrc).toContain('normalizePhase1PreflightSchedule(scheduleMode, scheduledFor)');
+    expect(broadcastsSrc).not.toContain("scheduleMode: wizardStage === 3 ? scheduleMode : 'draft'");
   });
 });

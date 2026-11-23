@@ -80,6 +80,8 @@ export interface TemplateParameterValidation {
   unsupportedReasons: string[];
 }
 
+export type Phase1PreflightScheduleMode = 'draft' | 'scheduled';
+
 export interface CampaignGuardianPreflightInput {
   businessId: string;
   campaignId?: string | null;
@@ -88,6 +90,28 @@ export interface CampaignGuardianPreflightInput {
   variableMapping?: Record<string, string>;
   scheduleMode?: 'draft' | 'immediate' | 'scheduled';
   scheduledAt?: string | null;
+}
+
+/**
+ * Normalizes UI schedule selection into the exact Phase 1 `campaign-preflight` Edge Function contract:
+ * - UI `'immediate'` (and `'draft'` / omitted) -> `{ scheduleMode: 'draft', scheduledAt: undefined }`
+ * - UI `'scheduled'` -> `{ scheduleMode: 'scheduled', scheduledAt: <valid ISO 8601 string or undefined> }`
+ */
+export function normalizePhase1PreflightSchedule(
+  uiScheduleMode?: 'draft' | 'immediate' | 'scheduled',
+  scheduledAt?: string | null
+): { scheduleMode: Phase1PreflightScheduleMode; scheduledAt?: string } {
+  if (uiScheduleMode === 'scheduled') {
+    const raw = typeof scheduledAt === 'string' ? scheduledAt.trim() : '';
+    if (raw) {
+      const dt = new Date(raw);
+      if (!Number.isNaN(dt.getTime())) {
+        return { scheduleMode: 'scheduled', scheduledAt: dt.toISOString() };
+      }
+    }
+    return { scheduleMode: 'scheduled', scheduledAt: undefined };
+  }
+  return { scheduleMode: 'draft', scheduledAt: undefined };
 }
 
 export interface CampaignGuardianReport {
@@ -1112,6 +1136,11 @@ export async function validateCampaignViaPreflightEdge(
     contactIds: input.audienceFilter.contactIds ?? [],
   };
 
+  const normalizedSchedule = normalizePhase1PreflightSchedule(
+    input.scheduleMode,
+    input.scheduledAt
+  );
+
   try {
     const { data, error } = await supabase.functions.invoke('campaign-preflight', {
       body: {
@@ -1121,14 +1150,15 @@ export async function validateCampaignViaPreflightEdge(
         templateId: input.templateId,
         audienceFilter: cleanAudienceFilter,
         variableMapping: input.variableMapping ?? {},
-        scheduleMode: input.scheduleMode ?? 'draft',
-        scheduledAt: input.scheduledAt ?? undefined,
+        scheduleMode: normalizedSchedule.scheduleMode,
+        scheduledAt: normalizedSchedule.scheduledAt,
       },
     });
 
     if (error) {
       const parsed = await parseEdgeFunctionError(error);
-      // If server returned HTTP 422 with a structured Guardian report, preserve the real server checks!
+      // If server returned HTTP 422 with a structured Guardian report, preserve the real server checks
+      // while keeping serverVerified: false so the UI never displays "Verified" on a failed response.
       const embeddedGuardian =
         parsed.body?.guardian && typeof parsed.body.guardian === 'object'
           ? (parsed.body.guardian as Record<string, unknown>)
@@ -1145,6 +1175,7 @@ export async function validateCampaignViaPreflightEdge(
         return {
           ...normalized,
           ok: false,
+          serverVerified: false,
           errorCode: parsed.code,
           error: parsed.message,
         };
